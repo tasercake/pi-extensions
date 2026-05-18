@@ -1,0 +1,22 @@
+{
+  "name": "pi-extensions",
+  "version": "1.0.0",
+  "description": "Pi extensions by tasercake.",
+  "license": "MIT",
+  "type": "module",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "coding-agent"
+  ],
+  "pi": {
+    "extensions": [
+      "extensions/context-safety/index.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-agent-core": "*",
+    "@earendil-works/pi-coding-agent": "*"
+  }
+}
