@@ -11,12 +11,23 @@
   ],
   "pi": {
     "extensions": [
-      "extensions/context-safety/index.ts"
+      "extensions/context-safety/index.ts",
+      "extensions/pi-subagents/src/extension/index.ts"
+    ],
+    "skills": [
+      "extensions/pi-subagents/skills"
+    ],
+    "prompts": [
+      "extensions/pi-subagents/prompts"
     ]
   },
   "peerDependencies": {
     "@earendil-works/pi-ai": "*",
     "@earendil-works/pi-agent-core": "*",
-    "@earendil-works/pi-coding-agent": "*"
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*"
+  },
+  "dependencies": {
+    "typebox": "^1.1.24"
   }
 }
