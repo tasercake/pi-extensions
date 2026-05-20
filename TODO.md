@@ -41,7 +41,7 @@
 
 ## Delivery
 
-- [ ] Commit implementation changes.
-- [ ] Push branch.
-- [ ] Open pull request.
-- [ ] Run one reviewer subagent on PR and have it leave comments directly on GitHub.
+- [x] Commit implementation changes.
+- [x] Push branch.
+- [x] Open pull request.
+- [ ] Run one reviewer subagent on PR and have it leave comments directly on GitHub. (Skipped per latest instruction not to use subagents.)
