@@ -1,585 +1,383 @@
-/**
- * Subagent Tool
- *
- * Full-featured subagent with sync and async modes.
- * - Sync (default): Streams output, renders markdown, tracks usage
- * - Async: Background execution, emits events when done
- *
- * Modes: single (agent + task), parallel (tasks[]), chain (chain[] with {previous})
- * Toggle: async parameter (default: false, configurable via config.json)
- *
- * Config file: ~/.pi/agent/extensions/subagent/config.json
- *   { "asyncByDefault": true, "forceTopLevelAsync": true, "maxSubagentDepth": 1, "intercomBridge": { "mode": "always", "instructionFile": "./intercom-bridge.md" }, "worktreeSetupHook": "./scripts/setup-worktree.mjs" }
- */
+/** Minimal recursive Pi subagent extension surface. */
 
+import { spawn, type ChildProcess } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
-import { type ExtensionAPI, type ExtensionContext, type ToolDefinition } from "@earendil-works/pi-coding-agent";
-import { Box, Container, Spacer, Text, truncateToWidth, visibleWidth, wrapTextWithAnsi, type Component } from "@earendil-works/pi-tui";
-import { discoverAgents } from "../agents/agents.ts";
-import { cleanupAllArtifactDirs, cleanupOldArtifacts, getArtifactsDir } from "../shared/artifacts.ts";
+import type { ExtensionAPI, ExtensionContext, ToolDefinition } from "@earendil-works/pi-coding-agent";
+import { Text } from "@earendil-works/pi-tui";
+import { createForkContextResolver } from "../shared/fork-context.ts";
 import { resolveCurrentSessionId } from "../shared/session-identity.ts";
-import { cleanupOldChainDirs } from "../shared/settings.ts";
-import { renderWidget, renderSubagentResult, stopResultAnimations, stopWidgetAnimation, syncResultAnimation } from "../tui/render.ts";
-import { SubagentParams } from "./schemas.ts";
-import { createSubagentExecutor, type SubagentParamsLike } from "../runs/foreground/subagent-executor.ts";
-import { createAsyncJobTracker } from "../runs/background/async-job-tracker.ts";
-import { createResultWatcher } from "../runs/background/result-watcher.ts";
-import { registerSlashCommands } from "../slash/slash-commands.ts";
-import { registerPromptTemplateDelegationBridge } from "../slash/prompt-template-bridge.ts";
-import { registerSlashSubagentBridge } from "../slash/slash-bridge.ts";
-import { clearSlashSnapshots, getSlashRenderableSnapshot, resolveSlashMessageDetails, restoreSlashFinalSnapshots, type SlashMessageDetails } from "../slash/slash-live-state.ts";
-import { inspectSubagentStatus } from "../runs/background/run-status.ts";
-import registerSubagentNotify, { type SubagentNotifyDetails } from "../runs/background/notify.ts";
-import { SUBAGENT_CHILD_ENV } from "../runs/shared/pi-args.ts";
-import { formatDuration, shortenPath } from "../shared/formatters.ts";
+import { checkSubagentDepth, getSubagentDepthEnv, resolveCurrentMaxSubagentDepth } from "../shared/types.ts";
+import { getPiSpawnCommand } from "../runs/shared/pi-spawn.ts";
+import { buildPiArgs, cleanupTempDir } from "../runs/shared/pi-args.ts";
 import {
-	type Details,
-	type ExtensionConfig,
-	type SubagentState,
-	ASYNC_DIR,
-	DEFAULT_ARTIFACT_CONFIG,
-	RESULTS_DIR,
-	SLASH_RESULT_TYPE,
-	SUBAGENT_ASYNC_COMPLETE_EVENT,
-	SUBAGENT_ASYNC_STARTED_EVENT,
-	SUBAGENT_CONTROL_EVENT,
-	WIDGET_KEY,
-} from "../shared/types.ts";
-import {
-	clearPendingForegroundControlNotices,
-	formatSubagentControlNotice,
-	handleSubagentControlNotice,
-	SUBAGENT_CONTROL_MESSAGE_TYPE,
-	type SubagentControlMessageDetails,
-} from "./control-notices.ts";
+	GetSubagentStatusParams,
+	ListSubagentsParams,
+	SpawnSubagentParams,
+	SteerSubagentParams,
+	type GetSubagentStatusParamsLike,
+	type SpawnSubagentParamsLike,
+	type SteerSubagentParamsLike,
+} from "./schemas.ts";
 
-/**
- * Derive subagent session base directory from parent session file.
- * If parent session is ~/.pi/agent/sessions/abc123.jsonl,
- * returns ~/.pi/agent/sessions/abc123/ as the base.
- * Callers add runId to create the actual session root: abc123/{runId}/
- * Falls back to a unique temp directory if no parent session.
- */
-function getSubagentSessionRoot(parentSessionFile: string | null): string {
-	if (parentSessionFile) {
-		const baseName = path.basename(parentSessionFile, ".jsonl");
-		const sessionsDir = path.dirname(parentSessionFile);
-		return path.join(sessionsDir, baseName);
-	}
-	return fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagent-session-"));
+interface ToolDetails {
+	id?: string;
+	running?: boolean;
+	result?: string;
+	error?: string;
+	subagents?: Array<{ id: string; running: boolean }>;
 }
 
-function loadConfig(): ExtensionConfig {
-	const configPath = path.join(os.homedir(), ".pi", "agent", "extensions", "subagent", "config.json");
+type OutputMode = "inline" | "file";
+
+interface PersistedSubagentRecord {
+	id: string;
+	parentSessionId: string;
+	cwd: string;
+	taskPreview: string;
+	keepContext: boolean;
+	outputMode: OutputMode;
+	model?: string;
+	running: boolean;
+	pid?: number;
+	sessionFile?: string;
+	outputFile?: string;
+	stdoutFile: string;
+	stderrFile: string;
+	result?: string;
+	error?: string;
+	createdAt: number;
+	updatedAt: number;
+	completedAt?: number;
+	notifiedCompletion?: boolean;
+	cohortFinalNotified?: boolean;
+}
+
+interface StoreFile {
+	records: PersistedSubagentRecord[];
+}
+
+const STORE_ROOT = path.join(os.homedir(), ".pi", "agent", "subagents-minimal");
+const runningChildren = new Map<string, ChildProcess>();
+
+function safeName(value: string): string {
+	return value.replace(/[^a-zA-Z0-9_.-]/g, "_").slice(0, 160) || "session";
+}
+
+function parentSessionId(ctx: ExtensionContext): string {
+	return resolveCurrentSessionId(ctx.sessionManager)
+		?? (ctx.sessionManager.getSessionFile?.() ? path.basename(ctx.sessionManager.getSessionFile()!, ".jsonl") : undefined)
+		?? "unknown-parent";
+}
+
+function parentDir(parentId: string): string {
+	return path.join(STORE_ROOT, safeName(parentId));
+}
+
+function storePath(parentId: string): string {
+	return path.join(parentDir(parentId), "subagents.json");
+}
+
+function readStore(parentId: string): StoreFile {
+	const file = storePath(parentId);
 	try {
-		if (fs.existsSync(configPath)) {
-			return JSON.parse(fs.readFileSync(configPath, "utf-8")) as ExtensionConfig;
-		}
-	} catch (error) {
-		console.error(`Failed to load subagent config from '${configPath}':`, error);
-	}
-	return {};
-}
-
-function expandTilde(p: string): string {
-	return p.startsWith("~/") ? path.join(os.homedir(), p.slice(2)) : p;
-}
-
-/**
- * Create a directory and verify it is actually accessible.
- * On Windows with Azure AD/Entra ID, directories created shortly after
- * wake-from-sleep can end up with broken NTFS ACLs (null DACL) when the
- * cloud SID cannot be resolved without network connectivity. This leaves
- * the directory completely inaccessible to the creating user.
- */
-function ensureAccessibleDir(dirPath: string): void {
-	fs.mkdirSync(dirPath, { recursive: true });
-	try {
-		fs.accessSync(dirPath, fs.constants.R_OK | fs.constants.W_OK);
+		return JSON.parse(fs.readFileSync(file, "utf-8")) as StoreFile;
 	} catch {
+		return { records: [] };
+	}
+}
+
+function writeStore(parentId: string, store: StoreFile): void {
+	const file = storePath(parentId);
+	fs.mkdirSync(path.dirname(file), { recursive: true });
+	const tmp = `${file}.${process.pid}.${Date.now()}.tmp`;
+	fs.writeFileSync(tmp, `${JSON.stringify(store, null, 2)}\n`, { mode: 0o600 });
+	fs.renameSync(tmp, file);
+}
+
+function upsertRecord(record: PersistedSubagentRecord): void {
+	const store = readStore(record.parentSessionId);
+	const idx = store.records.findIndex((r) => r.id === record.id);
+	if (idx === -1) store.records.push(record);
+	else store.records[idx] = record;
+	writeStore(record.parentSessionId, store);
+}
+
+function findRecord(parentId: string, id: string): PersistedSubagentRecord | undefined {
+	return readStore(parentId).records.find((r) => r.id === id || r.id.startsWith(id));
+}
+
+function isPidRunning(pid: number | undefined): boolean {
+	if (!pid) return false;
+	try {
+		process.kill(pid, 0);
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+function extractTextFromMessageContent(content: unknown): string {
+	if (typeof content === "string") return content;
+	if (!Array.isArray(content)) return "";
+	return content.map((part) => {
+		const p = part as { text?: unknown; content?: unknown; type?: unknown };
+		if (typeof p.text === "string") return p.text;
+		if (typeof p.content === "string") return p.content;
+		return "";
+	}).filter(Boolean).join("\n");
+}
+
+function extractFinalOutput(stdout: string): string {
+	const rawLines: string[] = [];
+	let lastAssistant = "";
+	for (const line of stdout.split("\n")) {
+		if (!line.trim()) continue;
 		try {
-			fs.rmSync(dirPath, { recursive: true, force: true });
+			const event = JSON.parse(line) as { type?: string; message?: { role?: string; content?: unknown; errorMessage?: string } };
+			if (event.message?.role === "assistant") {
+				const text = extractTextFromMessageContent(event.message.content);
+				if (text.trim()) lastAssistant = text.trim();
+			}
 		} catch {
-			// Best effort: retry mkdir/access even if cleanup fails.
-		}
-		fs.mkdirSync(dirPath, { recursive: true });
-		fs.accessSync(dirPath, fs.constants.R_OK | fs.constants.W_OK);
-	}
-}
-
-function isSlashResultRunning(result: { details?: Details }): boolean {
-	return result.details?.progress?.some((entry) => entry.status === "running")
-		|| result.details?.results.some((entry) => entry.progress?.status === "running")
-		|| false;
-}
-
-function isSlashResultError(result: { details?: Details }): boolean {
-	return result.details?.results.some((entry) => entry.exitCode !== 0 && entry.progress?.status !== "running") || false;
-}
-
-function isStaleExtensionContextError(error: unknown): boolean {
-	return error instanceof Error && error.message.includes("Extension context no longer active");
-}
-
-function rebuildSlashResultContainer(
-	container: Container,
-	result: AgentToolResult<Details>,
-	options: { expanded: boolean },
-	theme: ExtensionContext["ui"]["theme"],
-): void {
-	container.clear();
-	container.addChild(new Spacer(1));
-	const boxTheme = isSlashResultRunning(result) ? "toolPendingBg" : isSlashResultError(result) ? "toolErrorBg" : "toolSuccessBg";
-	const box = new Box(1, 1, (text: string) => theme.bg(boxTheme, text));
-	box.addChild(renderSubagentResult(result, options, theme));
-	container.addChild(box);
-}
-
-function createSlashResultComponent(
-	details: SlashMessageDetails,
-	options: { expanded: boolean },
-	theme: ExtensionContext["ui"]["theme"],
-	requestRender: () => void,
-): Container {
-	const container = new Container();
-	const animationState: { subagentResultAnimationTimer?: ReturnType<typeof setInterval> } = {};
-	let lastVersion = -1;
-	container.render = (width: number): string[] => {
-		const snapshot = getSlashRenderableSnapshot(details);
-		syncResultAnimation(snapshot.result, { state: animationState, invalidate: requestRender });
-		if (snapshot.version !== lastVersion || isSlashResultRunning(snapshot.result)) {
-			lastVersion = snapshot.version;
-			rebuildSlashResultContainer(container, snapshot.result, options, theme);
-		}
-		return Container.prototype.render.call(container, width);
-	};
-	return container;
-}
-
-function parseSubagentNotifyContent(content: string): SubagentNotifyDetails | undefined {
-	const lines = content.split("\n");
-	const header = lines[0] ?? "";
-	const match = header.match(/^Background task (completed|failed|paused): \*\*(.+?)\*\*(?:\s+(\([^)]*\)))?$/);
-	if (!match) return undefined;
-	const body = lines.slice(2);
-	let sessionIndex = -1;
-	for (let i = body.length - 1; i >= 1; i--) {
-		if (body[i - 1]?.trim() === "" && /^(Session|Session file|Session share error):\s+/.test(body[i]!)) {
-			sessionIndex = i;
-			break;
+			rawLines.push(line);
 		}
 	}
-	const sessionLine = sessionIndex >= 0 ? body[sessionIndex] : undefined;
-	const resultLines = sessionIndex >= 0 ? body.slice(0, sessionIndex) : body;
-	const resultPreview = resultLines.join("\n").trim() || "(no output)";
-	let sessionLabel: string | undefined;
-	let sessionValue: string | undefined;
-	if (sessionLine) {
-		const separator = sessionLine.indexOf(":");
-		sessionLabel = sessionLine.slice(0, separator).toLowerCase();
-		sessionValue = sessionLine.slice(separator + 1).trim();
+	return lastAssistant || rawLines.join("\n").trim();
+}
+
+function refreshRecordFromDisk(record: PersistedSubagentRecord): PersistedSubagentRecord {
+	if (record.running && !isPidRunning(record.pid)) {
+		const stdout = fs.existsSync(record.stdoutFile) ? fs.readFileSync(record.stdoutFile, "utf-8") : "";
+		const stderr = fs.existsSync(record.stderrFile) ? fs.readFileSync(record.stderrFile, "utf-8") : "";
+		const finalOutput = extractFinalOutput(stdout);
+		record.running = false;
+		record.updatedAt = Date.now();
+		record.completedAt ??= Date.now();
+		if (stderr.trim() && !finalOutput) record.error = stderr.trim();
+		if (record.outputMode === "file") {
+			if (finalOutput && record.outputFile) fs.writeFileSync(record.outputFile, `${finalOutput}\n`, { mode: 0o600 });
+			record.result = record.outputFile;
+		} else {
+			record.result = finalOutput;
+		}
+		upsertRecord(record);
 	}
+	return record;
+}
+
+function resultForRecord(record: PersistedSubagentRecord): string | undefined {
+	return record.outputMode === "file" ? record.outputFile : record.result;
+}
+
+function formatStatus(record: PersistedSubagentRecord): AgentToolResult<ToolDetails> {
+	const refreshed = refreshRecordFromDisk(record);
+	const result = resultForRecord(refreshed);
 	return {
-		agent: match[2]!,
-		status: match[1] as SubagentNotifyDetails["status"],
-		...(match[3] ? { taskInfo: match[3] } : {}),
-		resultPreview,
-		...(sessionLabel && sessionValue ? { sessionLabel, sessionValue } : {}),
+		content: [{ type: "text", text: JSON.stringify({ id: refreshed.id, running: refreshed.running, ...(result ? { result } : {}), ...(refreshed.error ? { error: refreshed.error } : {}) }, null, 2) }],
+		details: { id: refreshed.id, running: refreshed.running, ...(result ? { result } : {}), ...(refreshed.error ? { error: refreshed.error } : {}) },
 	};
 }
 
-class SubagentControlNoticeComponent implements Component {
-	constructor(
-		private readonly details: SubagentControlMessageDetails,
-		private readonly theme: ExtensionContext["ui"]["theme"],
-	) {}
+function childDir(parentId: string, id: string): string {
+	return path.join(parentDir(parentId), id);
+}
 
-	invalidate(): void {}
+function makeRecord(ctx: ExtensionContext, params: SpawnSubagentParamsLike, id: string): PersistedSubagentRecord {
+	const parentId = parentSessionId(ctx);
+	const dir = childDir(parentId, id);
+	fs.mkdirSync(dir, { recursive: true });
+	return {
+		id,
+		parentSessionId: parentId,
+		cwd: params.cwd ? path.resolve(ctx.cwd, params.cwd) : ctx.cwd,
+		taskPreview: params.task.slice(0, 500),
+		keepContext: params.keepContext,
+		outputMode: params.outputMode,
+		...(params.model ? { model: params.model } : {}),
+		running: false,
+		sessionFile: path.join(dir, "session.jsonl"),
+		outputFile: path.join(dir, "result.md"),
+		stdoutFile: path.join(dir, "stdout.log"),
+		stderrFile: path.join(dir, "stderr.log"),
+		createdAt: Date.now(),
+		updatedAt: Date.now(),
+	};
+}
 
-	render(width: number): string[] {
-		const eventLabel = this.details.event.type.replaceAll("_", " ");
-		if (width < 3) return [truncateToWidth(`Subagent ${eventLabel}`, width)];
-		const bodyWidth = Math.max(1, width - 2);
-		const borderChar = "─";
-		const header = ` ⚠ Subagent ${eventLabel}: ${this.details.event.agent} `;
-		const headerText = truncateToWidth(header, bodyWidth, "");
-		const headerPadding = Math.max(0, bodyWidth - visibleWidth(headerText));
-		const lines = [this.theme.fg("accent", `╭${headerText}${borderChar.repeat(headerPadding)}╮`)];
-
-		for (const line of wrapTextWithAnsi(formatSubagentControlNotice(this.details), bodyWidth)) {
-			const text = truncateToWidth(line, bodyWidth, "");
-			const padding = Math.max(0, bodyWidth - visibleWidth(text));
-			lines.push(this.theme.fg("accent", `│${text}${" ".repeat(padding)}│`));
-		}
-		lines.push(this.theme.fg("accent", `╰${borderChar.repeat(bodyWidth)}╯`));
-		return lines;
+function buildArgsForRecord(ctx: ExtensionContext, record: PersistedSubagentRecord, task: string): { args: string[]; env: Record<string, string | undefined>; tempDir?: string } {
+	let sessionFile = record.sessionFile;
+	if (record.keepContext) {
+		const resolver = createForkContextResolver(ctx.sessionManager, "fork");
+		sessionFile = resolver.sessionFileForIndex(0) ?? sessionFile;
+		record.sessionFile = sessionFile;
 	}
+	return buildPiArgs({
+		baseArgs: [],
+		task,
+		sessionEnabled: true,
+		sessionFile,
+		model: record.model,
+		intercomSessionName: `subagent-${record.id}`,
+		runId: record.id,
+	});
+}
+
+function notifyCompletion(pi: ExtensionAPI, record: PersistedSubagentRecord): void {
+	const parentId = record.parentSessionId;
+	const store = readStore(parentId);
+	const cohort = store.records.filter((r) => r.createdAt >= record.createdAt - 60_000 && !r.cohortFinalNotified);
+	const active = cohort.filter((r) => refreshRecordFromDisk(r).running);
+	const completed = cohort.filter((r) => !refreshRecordFromDisk(r).running);
+	const parts = [
+		`Subagent ${record.id} completed.`,
+		`Call get_subagent_status({ id: "${record.id}" }) to retrieve the result.`,
+	];
+	if (active.length > 0) {
+		parts.splice(1, 0, `${completed.length} out of ${cohort.length} subagents have completed. You will be notified when all complete.`);
+	} else if (cohort.length > 1) {
+		parts.splice(1, 0, `All ${cohort.length} subagents have completed.`);
+		for (const r of cohort) {
+			r.cohortFinalNotified = true;
+			r.updatedAt = Date.now();
+			upsertRecord(r);
+		}
+	}
+	pi.sendMessage({ customType: "subagent-notify", content: parts.join("\n"), display: true }, { triggerTurn: true });
+}
+
+async function runChild(pi: ExtensionAPI, ctx: ExtensionContext, record: PersistedSubagentRecord, task: string, notify = false): Promise<PersistedSubagentRecord> {
+	const depth = checkSubagentDepth();
+	if (depth.blocked) throw new Error(`Subagent recursion depth exceeded: depth ${depth.depth} >= max ${depth.maxDepth}.`);
+	const built = buildArgsForRecord(ctx, record, task);
+	upsertRecord(record);
+	const spawnSpec = getPiSpawnCommand(built.args);
+	const stdoutStream = fs.createWriteStream(record.stdoutFile, { flags: "a" });
+	const stderrStream = fs.createWriteStream(record.stderrFile, { flags: "a" });
+	const env = { ...process.env, ...built.env, ...getSubagentDepthEnv(resolveCurrentMaxSubagentDepth()) };
+	const child = spawn(spawnSpec.command, spawnSpec.args, { cwd: record.cwd, stdio: ["ignore", "pipe", "pipe"], env });
+	record.pid = child.pid;
+	record.running = true;
+	record.updatedAt = Date.now();
+	upsertRecord(record);
+	runningChildren.set(record.id, child);
+	child.stdout.pipe(stdoutStream);
+	child.stderr.pipe(stderrStream);
+	const finished = await new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve) => {
+		child.on("close", (code, signal) => resolve({ code, signal }));
+		child.on("error", (error) => {
+			record.error = error instanceof Error ? error.message : String(error);
+			resolve({ code: 1, signal: null });
+		});
+	});
+	stdoutStream.end();
+	stderrStream.end();
+	runningChildren.delete(record.id);
+	cleanupTempDir(built.tempDir);
+	const stdout = fs.existsSync(record.stdoutFile) ? fs.readFileSync(record.stdoutFile, "utf-8") : "";
+	const stderr = fs.existsSync(record.stderrFile) ? fs.readFileSync(record.stderrFile, "utf-8") : "";
+	const finalOutput = extractFinalOutput(stdout);
+	record.running = false;
+	record.completedAt = Date.now();
+	record.updatedAt = Date.now();
+	if (finished.code !== 0 && !record.error) record.error = stderr.trim() || `Subagent exited with code ${finished.code}${finished.signal ? ` (${finished.signal})` : ""}`;
+	if (record.outputMode === "file") {
+		fs.writeFileSync(record.outputFile!, `${finalOutput}\n`, { mode: 0o600 });
+		record.result = record.outputFile;
+	} else {
+		record.result = finalOutput;
+	}
+	upsertRecord(record);
+	if (notify) notifyCompletion(pi, record);
+	return record;
 }
 
 export default function registerSubagentExtension(pi: ExtensionAPI): void {
-	if (process.env[SUBAGENT_CHILD_ENV] === "1") return;
-	const globalStore = globalThis as Record<string, unknown>;
-	const runtimeCleanupStoreKey = "__piSubagentRuntimeCleanup";
-	const previousRuntimeCleanup = globalStore[runtimeCleanupStoreKey];
-	if (typeof previousRuntimeCleanup === "function") {
-		try {
-			previousRuntimeCleanup();
-		} catch {
-			// Best effort cleanup for stale timers from an older reload.
-		}
-	}
-
-	ensureAccessibleDir(RESULTS_DIR);
-	ensureAccessibleDir(ASYNC_DIR);
-	cleanupOldChainDirs();
-
-	const config = loadConfig();
-	const asyncByDefault = config.asyncByDefault === true;
-	const tempArtifactsDir = getArtifactsDir(null);
-	cleanupAllArtifactDirs(DEFAULT_ARTIFACT_CONFIG.cleanupDays);
-
-	const state: SubagentState = {
-		baseCwd: "",
-		currentSessionId: null,
-		asyncJobs: new Map(),
-		foregroundRuns: new Map(),
-		foregroundControls: new Map(),
-		lastForegroundControlId: null,
-		pendingForegroundControlNotices: new Map(),
-		cleanupTimers: new Map(),
-		lastUiContext: null,
-		poller: null,
-		completionSeen: new Map(),
-		watcher: null,
-		watcherRestartTimer: null,
-		resultFileCoalescer: {
-			schedule: () => false,
-			clear: () => {},
-		},
-	};
-
-	const { startResultWatcher, primeExistingResults, stopResultWatcher } = createResultWatcher(
-		pi,
-		state,
-		RESULTS_DIR,
-		10 * 60 * 1000,
-	);
-	startResultWatcher();
-	primeExistingResults();
-
-	const runtimeCleanup = () => {
-		stopWidgetAnimation();
-		stopResultAnimations();
-		stopResultWatcher();
-		clearPendingForegroundControlNotices(state);
-		if (state.poller) {
-			clearInterval(state.poller);
-			state.poller = null;
-		}
-	};
-	globalStore[runtimeCleanupStoreKey] = runtimeCleanup;
-
-	const { ensurePoller, handleStarted, handleComplete, resetJobs } = createAsyncJobTracker(pi, state, ASYNC_DIR);
-	const executor = createSubagentExecutor({
-		pi,
-		state,
-		config,
-		asyncByDefault,
-		tempArtifactsDir,
-		getSubagentSessionRoot,
-		expandTilde,
-		discoverAgents,
-	});
-
-	pi.registerMessageRenderer<SlashMessageDetails>(SLASH_RESULT_TYPE, (message, options, theme) => {
-		const details = resolveSlashMessageDetails(message.details);
-		if (!details) return undefined;
-		return createSlashResultComponent(details, options, theme, () => state.lastUiContext?.ui.requestRender?.());
-	});
-
-	pi.registerMessageRenderer<SubagentNotifyDetails>("subagent-notify", (message, options, theme) => {
-		const content = typeof message.content === "string" ? message.content : "";
-		const details = (message.details as SubagentNotifyDetails | undefined) ?? parseSubagentNotifyContent(content);
-		if (!details) return new Text(content, 0, 0);
-		const icon = details.status === "completed"
-			? theme.fg("success", "✓")
-			: details.status === "paused"
-				? theme.fg("warning", "■")
-				: theme.fg("error", "✗");
-		const parts: string[] = [];
-		if (details.taskInfo) parts.push(details.taskInfo);
-		if (details.durationMs !== undefined) parts.push(formatDuration(details.durationMs));
-		let text = `${icon} ${theme.bold(details.agent)} ${theme.fg("dim", details.status)}`;
-		if (parts.length > 0) text += ` ${theme.fg("dim", "·")} ${parts.map((part) => theme.fg("dim", part)).join(` ${theme.fg("dim", "·")} `)}`;
-		const trimmedPreview = details.resultPreview.trim();
-		const previewLines = options.expanded
-			? trimmedPreview.split("\n").filter((line) => line.trim())
-			: [trimmedPreview.split("\n", 1)[0] ?? ""].filter((line) => line.trim());
-		for (const line of previewLines.length > 0 ? previewLines : ["(no output)"]) {
-			text += `\n  ${theme.fg("dim", `⎿  ${line}`)}`;
-		}
-		if (!options.expanded && trimmedPreview.includes("\n")) {
-			text += `\n  ${theme.fg("dim", "Ctrl+O full notification")}`;
-		}
-		if (details.sessionLabel && details.sessionValue) {
-			text += `\n  ${theme.fg("muted", `${details.sessionLabel}: ${shortenPath(details.sessionValue)}`)}`;
-		}
-		return new Text(text, 0, 0);
-	});
-
-	pi.registerMessageRenderer<SubagentControlMessageDetails>(SUBAGENT_CONTROL_MESSAGE_TYPE, (message, _options, theme) => {
-		const details = message.details as SubagentControlMessageDetails | undefined;
-		if (!details?.event) return undefined;
-		const content = typeof message.content === "string" ? message.content : undefined;
-		return new SubagentControlNoticeComponent({ ...details, noticeText: formatSubagentControlNotice(details, content) }, theme);
-	});
-
-	const executeSubagentCollapsed = (id: string, params: SubagentParamsLike, signal: AbortSignal, onUpdate: ((result: AgentToolResult<Details>) => void) | undefined, ctx: ExtensionContext) => {
-		if (ctx.hasUI) ctx.ui.setToolsExpanded(false);
-		return executor.execute(id, params, signal, onUpdate, ctx);
-	};
-
-	const slashBridge = registerSlashSubagentBridge({
-		events: pi.events,
-		getContext: () => state.lastUiContext,
-		execute: (id, params, signal, onUpdate, ctx) =>
-			executeSubagentCollapsed(id, params, signal, onUpdate, ctx),
-	});
-
-	const promptTemplateBridge = registerPromptTemplateDelegationBridge({
-		events: pi.events,
-		getContext: () => state.lastUiContext,
-		execute: async (requestId, request, signal, ctx, onUpdate) => {
-			if (request.tasks && request.tasks.length > 0) {
-				return executeSubagentCollapsed(
-					requestId,
-					{
-						tasks: request.tasks,
-						context: request.context,
-						cwd: request.cwd,
-						worktree: request.worktree,
-						async: false,
-						clarify: false,
-					},
-					signal,
-					onUpdate,
-					ctx,
-				);
+	const spawnTool: ToolDefinition<typeof SpawnSubagentParams, ToolDetails> = {
+		name: "spawn_subagent",
+		label: "Spawn subagent",
+		description: "Spawn a child Pi subagent for one task. When async is true, this returns immediately, allowing the parent to spawn multiple concurrent subagents by calling spawn_subagent multiple times.",
+		parameters: SpawnSubagentParams,
+		async execute(id, params: SpawnSubagentParamsLike, _signal: AbortSignal, _onUpdate: ((result: AgentToolResult<ToolDetails>) => void) | undefined, ctx: ExtensionContext) {
+			const record = makeRecord(ctx, params, id);
+			if (params.async) {
+				void runChild(pi, ctx, record, params.task, true).catch((error) => {
+					record.running = false;
+					record.error = error instanceof Error ? error.message : String(error);
+					record.updatedAt = Date.now();
+					record.completedAt = Date.now();
+					upsertRecord(record);
+					notifyCompletion(pi, record);
+				});
+				return { content: [{ type: "text", text: `Spawned subagent ${record.id}. Use get_subagent_status({ id: "${record.id}" }) to retrieve the result.` }], details: { id: record.id, running: true } };
 			}
-			return executeSubagentCollapsed(
-				requestId,
-				{
-					agent: request.agent,
-					task: request.task,
-					context: request.context,
-					cwd: request.cwd,
-					model: request.model,
-					async: false,
-					clarify: false,
-				},
-				signal,
-				onUpdate,
-				ctx,
-			);
+			const completed = await runChild(pi, ctx, record, params.task, false);
+			return formatStatus(completed);
 		},
-	});
-
-	function effectiveParallelTaskCount(tasks: Array<{ count?: unknown }> | undefined): number {
-		if (!tasks || tasks.length === 0) return 0;
-		return tasks.reduce((total, task) => {
-			const count = typeof task.count === "number" && Number.isInteger(task.count) && task.count >= 1 ? task.count : 1;
-			return total + count;
-		}, 0);
-	}
-
-	const tool: ToolDefinition<typeof SubagentParams, Details> = {
-		name: "subagent",
-		label: "Subagent",
-		description: `Delegate to subagents or manage agent definitions.
-
-EXECUTION (use exactly ONE mode):
-• Before executing, use { action: "list" } to inspect configured agents/chains. Only execute agents listed as executable/non-disabled.
-• SINGLE: { agent, task? } - one task; omit task for self-contained agents
-• CHAIN: { chain: [{agent:"agent-a"}, {parallel:[{agent:"agent-b",count:3}]}] } - sequential pipeline with optional parallel fan-out
-• PARALLEL: { tasks: [{agent,task,count?,output?,reads?,progress?}, ...], concurrency?: number, worktree?: true } - concurrent execution (worktree: isolate each task in a git worktree)
-• Optional context: { context: "fresh" | "fork" } (default: if any requested agent has defaultContext: "fork", the whole invocation uses fork; otherwise "fresh"; inspect agent defaults via { action: "list" })
-
-CHAIN TEMPLATE VARIABLES (use in task strings):
-• {task} - The original task/request from the user
-• {previous} - Text response from the previous step (empty for first step)
-• {chain_dir} - Shared directory for chain files (e.g., <tmpdir>/pi-subagents-<scope>/chain-runs/abc123/)
-
-Example: { chain: [{agent:"agent-a", task:"Analyze {task}"}, {agent:"agent-b", task:"Plan based on {previous}"}] }
-
-MANAGEMENT (use action field, omit agent/task/chain/tasks):
-• { action: "list" } - discover executable agents/chains
-• { action: "get", agent: "name" } - full detail; packaged agents use dotted runtime names like "package.agent"
-• { action: "create", config: { name: "custom-agent", package: "code-analysis", systemPrompt, systemPromptMode, inheritProjectContext, inheritSkills, defaultContext, ... } }
-• { action: "update", agent: "code-analysis.custom-agent", config: { package: "analysis", ... } } - merge
-• { action: "delete", agent: "code-analysis.custom-agent" }
-• Use chainName for chain operations; packaged chains also use dotted runtime names
-
-CONTROL:
-• { action: "status", id: "..." } - inspect an async/background run by id or prefix
-• { action: "interrupt", id?: "..." } - soft-interrupt the current child turn and leave the run paused
-• { action: "resume", id: "...", message: "...", index?: 0 } - follow up with a live async child or revive a completed async/foreground child from its session
-
-DIAGNOSTICS:
-• { action: "doctor" } - read-only report for runtime paths, discovery, sessions, and intercom`,
-		parameters: SubagentParams,
-
-		execute(id, params, signal, onUpdate, ctx) {
-			return executeSubagentCollapsed(id, params, signal, onUpdate, ctx);
-		},
-
 		renderCall(args, theme) {
-			if (args.action) {
-				const target = args.agent || args.chainName || "";
-				return new Text(
-					`${theme.fg("toolTitle", theme.bold("subagent "))}${args.action}${target ? ` ${theme.fg("accent", target)}` : ""}`,
-					0, 0,
-				);
-			}
-			const isParallel = (args.tasks?.length ?? 0) > 0;
-			const parallelCount = effectiveParallelTaskCount(args.tasks as Array<{ count?: unknown }> | undefined);
-			const asyncLabel = args.async === true && args.clarify !== true && !isParallel ? theme.fg("warning", " [async]") : "";
-			if (args.chain?.length)
-				return new Text(
-					`${theme.fg("toolTitle", theme.bold("subagent "))}chain (${args.chain.length})${asyncLabel}`,
-					0,
-					0,
-				);
-			if (isParallel)
-				return new Text(
-					`${theme.fg("toolTitle", theme.bold("subagent "))}parallel (${parallelCount})`,
-					0,
-					0,
-				);
-			return new Text(
-				`${theme.fg("toolTitle", theme.bold("subagent "))}${theme.fg("accent", args.agent || "?")}${asyncLabel}`,
-				0,
-				0,
-			);
+			return new Text(`${theme.fg("toolTitle", theme.bold("spawn_subagent "))}${args.async ? theme.fg("warning", "async") : "blocking"} ${theme.fg("accent", args.outputMode ?? "inline")}`, 0, 0);
 		},
+	};
 
-		renderResult(result, options, theme, context) {
-			syncResultAnimation(result, context);
-			return renderSubagentResult(result, options, theme);
+	const steerTool: ToolDefinition<typeof SteerSubagentParams, ToolDetails> = {
+		name: "steer_subagent",
+		label: "Steer subagent",
+		description: "Send a message to a subagent. If it is running, the message is queued for the child session; if stopped, it is resumed with the new message.",
+		parameters: SteerSubagentParams,
+		async execute(_toolCallId: string, params: SteerSubagentParamsLike, _signal: AbortSignal, _onUpdate: ((result: AgentToolResult<ToolDetails>) => void) | undefined, ctx: ExtensionContext) {
+			const record = findRecord(parentSessionId(ctx), params.id);
+			if (!record) throw new Error(`Unknown subagent id: ${params.id}`);
+			const pendingPath = path.join(childDir(record.parentSessionId, record.id), "steering.md");
+			fs.appendFileSync(pendingPath, `\n\n## ${new Date().toISOString()}\n\n${params.message}\n`, { mode: 0o600 });
+			const child = runningChildren.get(record.id);
+			if (child && !child.killed) {
+				child.kill("SIGUSR2");
+				return { content: [{ type: "text", text: `Queued steering message for running subagent ${record.id}.` }], details: { id: record.id, running: true } };
+			}
+			const followUp = `Previous run follow-up from parent:\n\n${params.message}`;
+			record.running = true;
+			record.updatedAt = Date.now();
+			void runChild(pi, ctx, record, followUp, true).catch((error) => {
+				record.running = false;
+				record.error = error instanceof Error ? error.message : String(error);
+				record.updatedAt = Date.now();
+				upsertRecord(record);
+			});
+			return { content: [{ type: "text", text: `Resumed subagent ${record.id} with steering message.` }], details: { id: record.id, running: true } };
 		},
-
+		renderCall(args, theme) { return new Text(`${theme.fg("toolTitle", theme.bold("steer_subagent "))}${theme.fg("accent", args.id)}`, 0, 0); },
 	};
 
-	pi.registerTool(tool);
-	registerSlashCommands(pi, state);
-
-	const eventUnsubscribeStoreKey = "__piSubagentEventUnsubscribes";
-	const controlNoticeSeenStoreKey = "__piSubagentVisibleControlNotices";
-	const previousEventUnsubscribes = globalStore[eventUnsubscribeStoreKey];
-	if (Array.isArray(previousEventUnsubscribes)) {
-		for (const unsubscribe of previousEventUnsubscribes) {
-			if (typeof unsubscribe !== "function") continue;
-			try {
-				unsubscribe();
-			} catch {
-				// Best effort cleanup for stale handlers from an older reload.
-			}
-		}
-	}
-	registerSubagentNotify(pi);
-
-	const existingVisibleControlNotices = globalStore[controlNoticeSeenStoreKey];
-	const visibleControlNotices = existingVisibleControlNotices instanceof Set ? existingVisibleControlNotices as Set<string> : new Set<string>();
-	globalStore[controlNoticeSeenStoreKey] = visibleControlNotices;
-	const controlEventHandler = (payload: unknown) => {
-		handleSubagentControlNotice({
-			pi,
-			state,
-			visibleControlNotices,
-			details: payload as SubagentControlMessageDetails,
-		});
-	};
-	const eventUnsubscribes = [
-		pi.events.on(SUBAGENT_ASYNC_STARTED_EVENT, handleStarted),
-		pi.events.on(SUBAGENT_ASYNC_COMPLETE_EVENT, handleComplete),
-		pi.events.on(SUBAGENT_CONTROL_EVENT, controlEventHandler),
-	];
-	globalStore[eventUnsubscribeStoreKey] = eventUnsubscribes;
-
-	pi.on("tool_result", (event, ctx) => {
-		if (event.toolName !== "subagent") return;
-		if (!ctx.hasUI) return;
-		state.lastUiContext = ctx;
-		if (state.asyncJobs.size > 0) {
-			renderWidget(ctx, Array.from(state.asyncJobs.values()));
-			ensurePoller();
-		}
-	});
-
-	const cleanupSessionArtifacts = (ctx: ExtensionContext) => {
-		try {
-			const sessionFile = ctx.sessionManager.getSessionFile();
-			if (sessionFile) {
-				cleanupOldArtifacts(getArtifactsDir(sessionFile), DEFAULT_ARTIFACT_CONFIG.cleanupDays);
-			}
-		} catch {
-			// Cleanup failures should not block session lifecycle events.
-		}
+	const statusTool: ToolDefinition<typeof GetSubagentStatusParams, ToolDetails> = {
+		name: "get_subagent_status",
+		label: "Get subagent status",
+		description: "Get the status and result (or result file path) for a subagent.",
+		parameters: GetSubagentStatusParams,
+		execute(_toolCallId: string, params: GetSubagentStatusParamsLike, _signal: AbortSignal, _onUpdate: ((result: AgentToolResult<ToolDetails>) => void) | undefined, ctx: ExtensionContext) {
+			const record = findRecord(parentSessionId(ctx), params.id);
+			if (!record) throw new Error(`Unknown subagent id: ${params.id}`);
+			return formatStatus(record);
+		},
+		renderCall(args, theme) { return new Text(`${theme.fg("toolTitle", theme.bold("get_subagent_status "))}${theme.fg("accent", args.id)}`, 0, 0); },
 	};
 
-	const resetSessionState = (ctx: ExtensionContext) => {
-		state.baseCwd = ctx.cwd;
-		state.currentSessionId = resolveCurrentSessionId(ctx.sessionManager);
-		state.lastUiContext = ctx;
-		cleanupSessionArtifacts(ctx);
-		clearPendingForegroundControlNotices(state);
-		resetJobs(ctx);
-		restoreSlashFinalSnapshots(ctx.sessionManager.getEntries());
-		primeExistingResults();
+	const listTool: ToolDefinition<typeof ListSubagentsParams, ToolDetails> = {
+		name: "list_subagents",
+		label: "List subagents",
+		description: "List subagents for the current parent session. Data is persisted on disk across session restarts.",
+		parameters: ListSubagentsParams,
+		execute(_toolCallId: string, _params: Record<string, never>, _signal: AbortSignal, _onUpdate: ((result: AgentToolResult<ToolDetails>) => void) | undefined, ctx: ExtensionContext) {
+			const records = readStore(parentSessionId(ctx)).records.map((r) => refreshRecordFromDisk(r));
+			const subagents = records.map((r) => ({ id: r.id, running: r.running }));
+			return { content: [{ type: "text", text: JSON.stringify(subagents, null, 2) }], details: { subagents } };
+		},
+		renderCall(_args, theme) { return new Text(theme.fg("toolTitle", theme.bold("list_subagents")), 0, 0); },
 	};
 
-	pi.on("session_start", (_event, ctx) => {
-		resetSessionState(ctx);
-	});
-
-	pi.on("session_shutdown", () => {
-		for (const unsubscribe of eventUnsubscribes) {
-			try {
-				unsubscribe();
-			} catch {
-				// Best effort cleanup during shutdown.
-			}
-		}
-		if (globalStore[eventUnsubscribeStoreKey] === eventUnsubscribes) {
-			delete globalStore[eventUnsubscribeStoreKey];
-		}
-		stopResultWatcher();
-		if (state.poller) clearInterval(state.poller);
-		state.poller = null;
-		clearPendingForegroundControlNotices(state);
-		for (const timer of state.cleanupTimers.values()) {
-			clearTimeout(timer);
-		}
-		state.cleanupTimers.clear();
-		state.asyncJobs.clear();
-		clearSlashSnapshots();
-		slashBridge.cancelAll();
-		slashBridge.dispose();
-		promptTemplateBridge.cancelAll();
-		promptTemplateBridge.dispose();
-		stopWidgetAnimation();
-		stopResultAnimations();
-		if (globalStore[runtimeCleanupStoreKey] === runtimeCleanup) {
-			delete globalStore[runtimeCleanupStoreKey];
-		}
-		try {
-			if (state.lastUiContext?.hasUI) {
-				state.lastUiContext.ui.setWidget(WIDGET_KEY, undefined);
-			}
-		} catch (error) {
-			if (!isStaleExtensionContextError(error)) throw error;
-		}
-	});
+	pi.registerTool(spawnTool);
+	pi.registerTool(steerTool);
+	pi.registerTool(statusTool);
+	pi.registerTool(listTool);
 }

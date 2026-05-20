@@ -22,7 +22,7 @@ const isHelp = args.includes("--help") || args.includes("-h");
 
 if (isHelp) {
 	console.log(`
-pi-subagents - Pi extension for delegating tasks to subagents
+pi-subagents - Minimal recursive Pi child-subagent spawner
 
 Usage:
   npx pi-subagents          Install the extension
@@ -85,8 +85,11 @@ if (fs.existsSync(EXTENSION_DIR)) {
 }
 
 console.log(`
-The extension is now available in pi. Tool added:
-  • subagent - Delegate tasks to agents and inspect run status
+The extension is now available in pi. Tools added:
+  • spawn_subagent - Spawn one child Pi task (blocking or async)
+  • steer_subagent - Send a follow-up message to a child
+  • get_subagent_status - Retrieve child status/result
+  • list_subagents - List persisted children for this session
 
 Documentation: ${EXTENSION_DIR}/README.md
 `);

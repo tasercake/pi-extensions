@@ -16,9 +16,6 @@
     ],
     "skills": [
       "extensions/pi-subagents/skills"
-    ],
-    "prompts": [
-      "extensions/pi-subagents/prompts"
     ]
   },
   "peerDependencies": {

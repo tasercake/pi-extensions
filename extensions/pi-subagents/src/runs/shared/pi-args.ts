@@ -3,14 +3,10 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 
-const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh"];
 const TASK_ARG_LIMIT = 8000;
 const PROMPT_RUNTIME_EXTENSION_PATH = path.join(path.dirname(fileURLToPath(import.meta.url)), "subagent-prompt-runtime.ts");
-export const SUBAGENT_CHILD_ENV = "PI_SUBAGENT_CHILD";
 export const SUBAGENT_ORCHESTRATOR_TARGET_ENV = "PI_SUBAGENT_ORCHESTRATOR_TARGET";
 export const SUBAGENT_RUN_ID_ENV = "PI_SUBAGENT_RUN_ID";
-export const SUBAGENT_CHILD_AGENT_ENV = "PI_SUBAGENT_CHILD_AGENT";
-export const SUBAGENT_CHILD_INDEX_ENV = "PI_SUBAGENT_CHILD_INDEX";
 
 interface BuildPiArgsInput {
 	baseArgs: string[];
@@ -19,20 +15,9 @@ interface BuildPiArgsInput {
 	sessionDir?: string;
 	sessionFile?: string;
 	model?: string;
-	thinking?: string;
-	systemPromptMode?: "append" | "replace";
-	inheritProjectContext: boolean;
-	inheritSkills: boolean;
-	tools?: string[];
-	extensions?: string[];
-	systemPrompt?: string | null;
-	mcpDirectTools?: string[];
-	promptFileStem?: string;
 	intercomSessionName?: string;
 	orchestratorIntercomTarget?: string;
 	runId?: string;
-	childAgentName?: string;
-	childIndex?: number;
 }
 
 interface BuildPiArgsResult {
@@ -41,11 +26,8 @@ interface BuildPiArgsResult {
 	tempDir?: string;
 }
 
-export function applyThinkingSuffix(model: string | undefined, thinking: string | undefined): string | undefined {
-	if (!model || !thinking || thinking === "off") return model;
-	const colonIdx = model.lastIndexOf(":");
-	if (colonIdx !== -1 && THINKING_LEVELS.includes(model.substring(colonIdx + 1))) return model;
-	return `${model}:${thinking}`;
+export function applyThinkingSuffix(model: string | undefined): string | undefined {
+	return model;
 }
 
 export function buildPiArgs(input: BuildPiArgsInput): BuildPiArgsResult {
@@ -55,64 +37,22 @@ export function buildPiArgs(input: BuildPiArgsInput): BuildPiArgsResult {
 		fs.mkdirSync(path.dirname(input.sessionFile), { recursive: true });
 		args.push("--session", input.sessionFile);
 	} else {
-		if (!input.sessionEnabled) {
-			args.push("--no-session");
-		}
+		if (!input.sessionEnabled) args.push("--no-session");
 		if (input.sessionDir) {
 			fs.mkdirSync(input.sessionDir, { recursive: true });
 			args.push("--session-dir", input.sessionDir);
 		}
 	}
 
-	const modelArg = applyThinkingSuffix(input.model, input.thinking);
-	if (modelArg) {
-		args.push("--model", modelArg);
-	}
+	if (input.model) args.push("--model", input.model);
 
-	const toolExtensionPaths: string[] = [];
-	if (input.tools?.length) {
-		const builtinTools: string[] = [];
-		for (const tool of input.tools) {
-			if (tool.includes("/") || tool.endsWith(".ts") || tool.endsWith(".js")) {
-				toolExtensionPaths.push(tool);
-			} else {
-				builtinTools.push(tool);
-			}
-		}
-		if (builtinTools.length > 0) {
-			args.push("--tools", builtinTools.join(","));
-		}
-	}
-
-	const runtimeExtensions = [PROMPT_RUNTIME_EXTENSION_PATH];
-	if (input.extensions !== undefined) {
-		args.push("--no-extensions");
-		for (const extPath of [...new Set([...runtimeExtensions, ...toolExtensionPaths, ...input.extensions])]) {
-			args.push("--extension", extPath);
-		}
-	} else {
-		for (const extPath of [...new Set([...runtimeExtensions, ...toolExtensionPaths])]) {
-			args.push("--extension", extPath);
-		}
-	}
-
-	if (!input.inheritSkills) {
-		args.push("--no-skills");
-	}
+	// Add only the minimal runtime extension. Do not disable normal extensions,
+	// skills, tools, MCP direct tools, or project context.
+	args.push("--extension", PROMPT_RUNTIME_EXTENSION_PATH);
 
 	let tempDir: string | undefined;
-	if (input.systemPrompt !== undefined && input.systemPrompt !== null) {
-		tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagent-"));
-		const stem = (input.promptFileStem ?? "prompt").replace(/[^\w.-]/g, "_");
-		const promptPath = path.join(tempDir, `${stem}.md`);
-		fs.writeFileSync(promptPath, input.systemPrompt, { mode: 0o600 });
-		args.push(input.systemPromptMode === "replace" ? "--system-prompt" : "--append-system-prompt", promptPath);
-	}
-
 	if (input.task.length > TASK_ARG_LIMIT) {
-		if (!tempDir) {
-			tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagent-"));
-		}
+		tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagent-"));
 		const taskFilePath = path.join(tempDir, "task.md");
 		fs.writeFileSync(taskFilePath, `Task: ${input.task}`, { mode: 0o600 });
 		args.push(`@${taskFilePath}`);
@@ -121,30 +61,9 @@ export function buildPiArgs(input: BuildPiArgsInput): BuildPiArgsResult {
 	}
 
 	const env: Record<string, string | undefined> = {};
-	env[SUBAGENT_CHILD_ENV] = "1";
-	env.PI_SUBAGENT_INHERIT_PROJECT_CONTEXT = input.inheritProjectContext ? "1" : "0";
-	env.PI_SUBAGENT_INHERIT_SKILLS = input.inheritSkills ? "1" : "0";
-	if (input.intercomSessionName) {
-		env.PI_SUBAGENT_INTERCOM_SESSION_NAME = input.intercomSessionName;
-	}
-	if (input.orchestratorIntercomTarget) {
-		env[SUBAGENT_ORCHESTRATOR_TARGET_ENV] = input.orchestratorIntercomTarget;
-	}
-	if (input.runId) {
-		env[SUBAGENT_RUN_ID_ENV] = input.runId;
-	}
-	if (input.childAgentName) {
-		env[SUBAGENT_CHILD_AGENT_ENV] = input.childAgentName;
-	}
-	if (input.childIndex !== undefined) {
-		env[SUBAGENT_CHILD_INDEX_ENV] = String(input.childIndex);
-	}
-	if (input.mcpDirectTools?.length) {
-		env.MCP_DIRECT_TOOLS = input.mcpDirectTools.join(",");
-	} else {
-		env.MCP_DIRECT_TOOLS = "__none__";
-	}
-
+	if (input.intercomSessionName) env.PI_SUBAGENT_INTERCOM_SESSION_NAME = input.intercomSessionName;
+	if (input.orchestratorIntercomTarget) env[SUBAGENT_ORCHESTRATOR_TARGET_ENV] = input.orchestratorIntercomTarget;
+	if (input.runId) env[SUBAGENT_RUN_ID_ENV] = input.runId;
 	return { args, env, tempDir };
 }
 
