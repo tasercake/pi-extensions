@@ -23,22 +23,32 @@ spawn_subagent({
   task: "You are a focused reviewer. Inspect ... Return ...",
   async: false,
   keepContext: false,
-  outputMode: "inline"
-})
+  outputMode: "inline",
+});
 ```
 
 Async/concurrent:
 
 ```ts
-spawn_subagent({ task: "Worker A full instructions...", async: true, keepContext: false, outputMode: "inline" })
-spawn_subagent({ task: "Worker B full instructions...", async: true, keepContext: false, outputMode: "inline" })
+spawn_subagent({
+  task: "Worker A full instructions...",
+  async: true,
+  keepContext: false,
+  outputMode: "inline",
+});
+spawn_subagent({
+  task: "Worker B full instructions...",
+  async: true,
+  keepContext: false,
+  outputMode: "inline",
+});
 ```
 
 Retrieve results:
 
 ```ts
-get_subagent_status({ id: "..." })
-list_subagents({})
+get_subagent_status({ id: "..." });
+list_subagents({});
 ```
 
 ## Rules

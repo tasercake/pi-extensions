@@ -5,11 +5,19 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
-import type { ExtensionAPI, ExtensionContext, ToolDefinition } from "@earendil-works/pi-coding-agent";
+import type {
+	ExtensionAPI,
+	ExtensionContext,
+	ToolDefinition,
+} from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { createForkContextResolver } from "../shared/fork-context.ts";
 import { resolveCurrentSessionId } from "../shared/session-identity.ts";
-import { checkSubagentDepth, getSubagentDepthEnv, resolveCurrentMaxSubagentDepth } from "../shared/types.ts";
+import {
+	checkSubagentDepth,
+	getSubagentDepthEnv,
+	resolveCurrentMaxSubagentDepth,
+} from "../shared/types.ts";
 import { getPiSpawnCommand } from "../runs/shared/pi-spawn.ts";
 import { buildPiArgs, cleanupTempDir } from "../runs/shared/pi-args.ts";
 import {
@@ -67,9 +75,13 @@ function safeName(value: string): string {
 }
 
 function parentSessionId(ctx: ExtensionContext): string {
-	return resolveCurrentSessionId(ctx.sessionManager)
-		?? (ctx.sessionManager.getSessionFile?.() ? path.basename(ctx.sessionManager.getSessionFile()!, ".jsonl") : undefined)
-		?? "unknown-parent";
+	return (
+		resolveCurrentSessionId(ctx.sessionManager) ??
+		(ctx.sessionManager.getSessionFile?.()
+			? path.basename(ctx.sessionManager.getSessionFile()!, ".jsonl")
+			: undefined) ??
+		"unknown-parent"
+	);
 }
 
 function parentDir(parentId: string): string {
@@ -105,8 +117,13 @@ function upsertRecord(record: PersistedSubagentRecord): void {
 	writeStore(record.parentSessionId, store);
 }
 
-function findRecord(parentId: string, id: string): PersistedSubagentRecord | undefined {
-	return readStore(parentId).records.find((r) => r.id === id || r.id.startsWith(id));
+function findRecord(
+	parentId: string,
+	id: string,
+): PersistedSubagentRecord | undefined {
+	return readStore(parentId).records.find(
+		(r) => r.id === id || r.id.startsWith(id),
+	);
 }
 
 function isPidRunning(pid: number | undefined): boolean {
@@ -122,12 +139,15 @@ function isPidRunning(pid: number | undefined): boolean {
 function extractTextFromMessageContent(content: unknown): string {
 	if (typeof content === "string") return content;
 	if (!Array.isArray(content)) return "";
-	return content.map((part) => {
-		const p = part as { text?: unknown; content?: unknown; type?: unknown };
-		if (typeof p.text === "string") return p.text;
-		if (typeof p.content === "string") return p.content;
-		return "";
-	}).filter(Boolean).join("\n");
+	return content
+		.map((part) => {
+			const p = part as { text?: unknown; content?: unknown; type?: unknown };
+			if (typeof p.text === "string") return p.text;
+			if (typeof p.content === "string") return p.content;
+			return "";
+		})
+		.filter(Boolean)
+		.join("\n");
 }
 
 function extractFinalOutput(stdout: string): string {
@@ -136,7 +156,10 @@ function extractFinalOutput(stdout: string): string {
 	for (const line of stdout.split("\n")) {
 		if (!line.trim()) continue;
 		try {
-			const event = JSON.parse(line) as { type?: string; message?: { role?: string; content?: unknown; errorMessage?: string } };
+			const event = JSON.parse(line) as {
+				type?: string;
+				message?: { role?: string; content?: unknown; errorMessage?: string };
+			};
 			if (event.message?.role === "assistant") {
 				const text = extractTextFromMessageContent(event.message.content);
 				if (text.trim()) lastAssistant = text.trim();
@@ -148,17 +171,26 @@ function extractFinalOutput(stdout: string): string {
 	return lastAssistant || rawLines.join("\n").trim();
 }
 
-function refreshRecordFromDisk(record: PersistedSubagentRecord): PersistedSubagentRecord {
+function refreshRecordFromDisk(
+	record: PersistedSubagentRecord,
+): PersistedSubagentRecord {
 	if (record.running && !isPidRunning(record.pid)) {
-		const stdout = fs.existsSync(record.stdoutFile) ? fs.readFileSync(record.stdoutFile, "utf-8") : "";
-		const stderr = fs.existsSync(record.stderrFile) ? fs.readFileSync(record.stderrFile, "utf-8") : "";
+		const stdout = fs.existsSync(record.stdoutFile)
+			? fs.readFileSync(record.stdoutFile, "utf-8")
+			: "";
+		const stderr = fs.existsSync(record.stderrFile)
+			? fs.readFileSync(record.stderrFile, "utf-8")
+			: "";
 		const finalOutput = extractFinalOutput(stdout);
 		record.running = false;
 		record.updatedAt = Date.now();
 		record.completedAt ??= Date.now();
 		if (stderr.trim() && !finalOutput) record.error = stderr.trim();
 		if (record.outputMode === "file") {
-			if (finalOutput && record.outputFile) fs.writeFileSync(record.outputFile, `${finalOutput}\n`, { mode: 0o600 });
+			if (finalOutput && record.outputFile)
+				fs.writeFileSync(record.outputFile, `${finalOutput}\n`, {
+					mode: 0o600,
+				});
 			record.result = record.outputFile;
 		} else {
 			record.result = finalOutput;
@@ -172,12 +204,33 @@ function resultForRecord(record: PersistedSubagentRecord): string | undefined {
 	return record.outputMode === "file" ? record.outputFile : record.result;
 }
 
-function formatStatus(record: PersistedSubagentRecord): AgentToolResult<ToolDetails> {
+function formatStatus(
+	record: PersistedSubagentRecord,
+): AgentToolResult<ToolDetails> {
 	const refreshed = refreshRecordFromDisk(record);
 	const result = resultForRecord(refreshed);
 	return {
-		content: [{ type: "text", text: JSON.stringify({ id: refreshed.id, running: refreshed.running, ...(result ? { result } : {}), ...(refreshed.error ? { error: refreshed.error } : {}) }, null, 2) }],
-		details: { id: refreshed.id, running: refreshed.running, ...(result ? { result } : {}), ...(refreshed.error ? { error: refreshed.error } : {}) },
+		content: [
+			{
+				type: "text",
+				text: JSON.stringify(
+					{
+						id: refreshed.id,
+						running: refreshed.running,
+						...(result ? { result } : {}),
+						...(refreshed.error ? { error: refreshed.error } : {}),
+					},
+					null,
+					2,
+				),
+			},
+		],
+		details: {
+			id: refreshed.id,
+			running: refreshed.running,
+			...(result ? { result } : {}),
+			...(refreshed.error ? { error: refreshed.error } : {}),
+		},
 	};
 }
 
@@ -185,7 +238,11 @@ function childDir(parentId: string, id: string): string {
 	return path.join(parentDir(parentId), id);
 }
 
-function makeRecord(ctx: ExtensionContext, params: SpawnSubagentParamsLike, id: string): PersistedSubagentRecord {
+function makeRecord(
+	ctx: ExtensionContext,
+	params: SpawnSubagentParamsLike,
+	id: string,
+): PersistedSubagentRecord {
 	const parentId = parentSessionId(ctx);
 	const dir = childDir(parentId, id);
 	fs.mkdirSync(dir, { recursive: true });
@@ -207,7 +264,15 @@ function makeRecord(ctx: ExtensionContext, params: SpawnSubagentParamsLike, id: 
 	};
 }
 
-function buildArgsForRecord(ctx: ExtensionContext, record: PersistedSubagentRecord, task: string): { args: string[]; env: Record<string, string | undefined>; tempDir?: string } {
+function buildArgsForRecord(
+	ctx: ExtensionContext,
+	record: PersistedSubagentRecord,
+	task: string,
+): {
+	args: string[];
+	env: Record<string, string | undefined>;
+	tempDir?: string;
+} {
 	let sessionFile = record.sessionFile;
 	if (record.keepContext) {
 		const resolver = createForkContextResolver(ctx.sessionManager, "fork");
@@ -225,10 +290,15 @@ function buildArgsForRecord(ctx: ExtensionContext, record: PersistedSubagentReco
 	});
 }
 
-function notifyCompletion(pi: ExtensionAPI, record: PersistedSubagentRecord): void {
+function notifyCompletion(
+	pi: ExtensionAPI,
+	record: PersistedSubagentRecord,
+): void {
 	const parentId = record.parentSessionId;
 	const store = readStore(parentId);
-	const cohort = store.records.filter((r) => r.createdAt >= record.createdAt - 60_000 && !r.cohortFinalNotified);
+	const cohort = store.records.filter(
+		(r) => r.createdAt >= record.createdAt - 60_000 && !r.cohortFinalNotified,
+	);
 	const active = cohort.filter((r) => refreshRecordFromDisk(r).running);
 	const completed = cohort.filter((r) => !refreshRecordFromDisk(r).running);
 	const parts = [
@@ -236,7 +306,11 @@ function notifyCompletion(pi: ExtensionAPI, record: PersistedSubagentRecord): vo
 		`Call get_subagent_status({ id: "${record.id}" }) to retrieve the result.`,
 	];
 	if (active.length > 0) {
-		parts.splice(1, 0, `${completed.length} out of ${cohort.length} subagents have completed. You will be notified when all complete.`);
+		parts.splice(
+			1,
+			0,
+			`${completed.length} out of ${cohort.length} subagents have completed. You will be notified when all complete.`,
+		);
 	} else if (cohort.length > 1) {
 		parts.splice(1, 0, `All ${cohort.length} subagents have completed.`);
 		for (const r of cohort) {
@@ -245,19 +319,39 @@ function notifyCompletion(pi: ExtensionAPI, record: PersistedSubagentRecord): vo
 			upsertRecord(r);
 		}
 	}
-	pi.sendMessage({ customType: "subagent-notify", content: parts.join("\n"), display: true }, { triggerTurn: true });
+	pi.sendMessage(
+		{ customType: "subagent-notify", content: parts.join("\n"), display: true },
+		{ triggerTurn: true },
+	);
 }
 
-async function runChild(pi: ExtensionAPI, ctx: ExtensionContext, record: PersistedSubagentRecord, task: string, notify = false): Promise<PersistedSubagentRecord> {
+async function runChild(
+	pi: ExtensionAPI,
+	ctx: ExtensionContext,
+	record: PersistedSubagentRecord,
+	task: string,
+	notify = false,
+): Promise<PersistedSubagentRecord> {
 	const depth = checkSubagentDepth();
-	if (depth.blocked) throw new Error(`Subagent recursion depth exceeded: depth ${depth.depth} >= max ${depth.maxDepth}.`);
+	if (depth.blocked)
+		throw new Error(
+			`Subagent recursion depth exceeded: depth ${depth.depth} >= max ${depth.maxDepth}.`,
+		);
 	const built = buildArgsForRecord(ctx, record, task);
 	upsertRecord(record);
 	const spawnSpec = getPiSpawnCommand(built.args);
 	const stdoutStream = fs.createWriteStream(record.stdoutFile, { flags: "a" });
 	const stderrStream = fs.createWriteStream(record.stderrFile, { flags: "a" });
-	const env = { ...process.env, ...built.env, ...getSubagentDepthEnv(resolveCurrentMaxSubagentDepth()) };
-	const child = spawn(spawnSpec.command, spawnSpec.args, { cwd: record.cwd, stdio: ["ignore", "pipe", "pipe"], env });
+	const env = {
+		...process.env,
+		...built.env,
+		...getSubagentDepthEnv(resolveCurrentMaxSubagentDepth()),
+	};
+	const child = spawn(spawnSpec.command, spawnSpec.args, {
+		cwd: record.cwd,
+		stdio: ["ignore", "pipe", "pipe"],
+		env,
+	});
 	record.pid = child.pid;
 	record.running = true;
 	record.updatedAt = Date.now();
@@ -265,7 +359,10 @@ async function runChild(pi: ExtensionAPI, ctx: ExtensionContext, record: Persist
 	runningChildren.set(record.id, child);
 	child.stdout.pipe(stdoutStream);
 	child.stderr.pipe(stderrStream);
-	const finished = await new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve) => {
+	const finished = await new Promise<{
+		code: number | null;
+		signal: NodeJS.Signals | null;
+	}>((resolve) => {
 		child.on("close", (code, signal) => resolve({ code, signal }));
 		child.on("error", (error) => {
 			record.error = error instanceof Error ? error.message : String(error);
@@ -276,13 +373,20 @@ async function runChild(pi: ExtensionAPI, ctx: ExtensionContext, record: Persist
 	stderrStream.end();
 	runningChildren.delete(record.id);
 	cleanupTempDir(built.tempDir);
-	const stdout = fs.existsSync(record.stdoutFile) ? fs.readFileSync(record.stdoutFile, "utf-8") : "";
-	const stderr = fs.existsSync(record.stderrFile) ? fs.readFileSync(record.stderrFile, "utf-8") : "";
+	const stdout = fs.existsSync(record.stdoutFile)
+		? fs.readFileSync(record.stdoutFile, "utf-8")
+		: "";
+	const stderr = fs.existsSync(record.stderrFile)
+		? fs.readFileSync(record.stderrFile, "utf-8")
+		: "";
 	const finalOutput = extractFinalOutput(stdout);
 	record.running = false;
 	record.completedAt = Date.now();
 	record.updatedAt = Date.now();
-	if (finished.code !== 0 && !record.error) record.error = stderr.trim() || `Subagent exited with code ${finished.code}${finished.signal ? ` (${finished.signal})` : ""}`;
+	if (finished.code !== 0 && !record.error)
+		record.error =
+			stderr.trim() ||
+			`Subagent exited with code ${finished.code}${finished.signal ? ` (${finished.signal})` : ""}`;
 	if (record.outputMode === "file") {
 		fs.writeFileSync(record.outputFile!, `${finalOutput}\n`, { mode: 0o600 });
 		record.result = record.outputFile;
@@ -298,9 +402,16 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 	const spawnTool: ToolDefinition<typeof SpawnSubagentParams, ToolDetails> = {
 		name: "spawn_subagent",
 		label: "Spawn subagent",
-		description: "Spawn a child Pi subagent for one task. When async is true, this returns immediately, allowing the parent to spawn multiple concurrent subagents by calling spawn_subagent multiple times.",
+		description:
+			"Spawn a child Pi subagent for one task. When async is true, this returns immediately, allowing the parent to spawn multiple concurrent subagents by calling spawn_subagent multiple times.",
 		parameters: SpawnSubagentParams,
-		async execute(id, params: SpawnSubagentParamsLike, _signal: AbortSignal, _onUpdate: ((result: AgentToolResult<ToolDetails>) => void) | undefined, ctx: ExtensionContext) {
+		async execute(
+			id,
+			params: SpawnSubagentParamsLike,
+			_signal: AbortSignal,
+			_onUpdate: ((result: AgentToolResult<ToolDetails>) => void) | undefined,
+			ctx: ExtensionContext,
+		) {
 			const record = makeRecord(ctx, params, id);
 			if (params.async) {
 				void runChild(pi, ctx, record, params.task, true).catch((error) => {
@@ -311,30 +422,64 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 					upsertRecord(record);
 					notifyCompletion(pi, record);
 				});
-				return { content: [{ type: "text", text: `Spawned subagent ${record.id}. Use get_subagent_status({ id: "${record.id}" }) to retrieve the result.` }], details: { id: record.id, running: true } };
+				return {
+					content: [
+						{
+							type: "text",
+							text: `Spawned subagent ${record.id}. Use get_subagent_status({ id: "${record.id}" }) to retrieve the result.`,
+						},
+					],
+					details: { id: record.id, running: true },
+				};
 			}
 			const completed = await runChild(pi, ctx, record, params.task, false);
 			return formatStatus(completed);
 		},
 		renderCall(args, theme) {
-			return new Text(`${theme.fg("toolTitle", theme.bold("spawn_subagent "))}${args.async ? theme.fg("warning", "async") : "blocking"} ${theme.fg("accent", args.outputMode ?? "inline")}`, 0, 0);
+			return new Text(
+				`${theme.fg("toolTitle", theme.bold("spawn_subagent "))}${args.async ? theme.fg("warning", "async") : "blocking"} ${theme.fg("accent", args.outputMode ?? "inline")}`,
+				0,
+				0,
+			);
 		},
 	};
 
 	const steerTool: ToolDefinition<typeof SteerSubagentParams, ToolDetails> = {
 		name: "steer_subagent",
 		label: "Steer subagent",
-		description: "Send a message to a subagent. If it is running, the message is queued for the child session; if stopped, it is resumed with the new message.",
+		description:
+			"Send a message to a subagent. If it is running, the message is queued for the child session; if stopped, it is resumed with the new message.",
 		parameters: SteerSubagentParams,
-		async execute(_toolCallId: string, params: SteerSubagentParamsLike, _signal: AbortSignal, _onUpdate: ((result: AgentToolResult<ToolDetails>) => void) | undefined, ctx: ExtensionContext) {
+		async execute(
+			_toolCallId: string,
+			params: SteerSubagentParamsLike,
+			_signal: AbortSignal,
+			_onUpdate: ((result: AgentToolResult<ToolDetails>) => void) | undefined,
+			ctx: ExtensionContext,
+		) {
 			const record = findRecord(parentSessionId(ctx), params.id);
 			if (!record) throw new Error(`Unknown subagent id: ${params.id}`);
-			const pendingPath = path.join(childDir(record.parentSessionId, record.id), "steering.md");
-			fs.appendFileSync(pendingPath, `\n\n## ${new Date().toISOString()}\n\n${params.message}\n`, { mode: 0o600 });
+			const pendingPath = path.join(
+				childDir(record.parentSessionId, record.id),
+				"steering.md",
+			);
+			fs.appendFileSync(
+				pendingPath,
+				`\n\n## ${new Date().toISOString()}\n\n${params.message}\n`,
+				{ mode: 0o600 },
+			);
 			const child = runningChildren.get(record.id);
 			if (child && !child.killed) {
 				child.kill("SIGUSR2");
-				return { content: [{ type: "text", text: `Queued steering message for running subagent ${record.id}.` }], details: { id: record.id, running: true } };
+				return {
+					content: [
+						{
+							type: "text",
+							text: `Queued steering message for running subagent ${record.id}.`,
+						},
+					],
+					details: { id: record.id, running: true },
+				};
 			}
 			const followUp = `Previous run follow-up from parent:\n\n${params.message}`;
 			record.running = true;
@@ -345,35 +490,83 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 				record.updatedAt = Date.now();
 				upsertRecord(record);
 			});
-			return { content: [{ type: "text", text: `Resumed subagent ${record.id} with steering message.` }], details: { id: record.id, running: true } };
+			return {
+				content: [
+					{
+						type: "text",
+						text: `Resumed subagent ${record.id} with steering message.`,
+					},
+				],
+				details: { id: record.id, running: true },
+			};
 		},
-		renderCall(args, theme) { return new Text(`${theme.fg("toolTitle", theme.bold("steer_subagent "))}${theme.fg("accent", args.id)}`, 0, 0); },
+		renderCall(args, theme) {
+			return new Text(
+				`${theme.fg("toolTitle", theme.bold("steer_subagent "))}${theme.fg("accent", args.id)}`,
+				0,
+				0,
+			);
+		},
 	};
 
-	const statusTool: ToolDefinition<typeof GetSubagentStatusParams, ToolDetails> = {
+	const statusTool: ToolDefinition<
+		typeof GetSubagentStatusParams,
+		ToolDetails
+	> = {
 		name: "get_subagent_status",
 		label: "Get subagent status",
-		description: "Get the status and result (or result file path) for a subagent.",
+		description:
+			"Get the status and result (or result file path) for a subagent.",
 		parameters: GetSubagentStatusParams,
-		execute(_toolCallId: string, params: GetSubagentStatusParamsLike, _signal: AbortSignal, _onUpdate: ((result: AgentToolResult<ToolDetails>) => void) | undefined, ctx: ExtensionContext) {
+		execute(
+			_toolCallId: string,
+			params: GetSubagentStatusParamsLike,
+			_signal: AbortSignal,
+			_onUpdate: ((result: AgentToolResult<ToolDetails>) => void) | undefined,
+			ctx: ExtensionContext,
+		) {
 			const record = findRecord(parentSessionId(ctx), params.id);
 			if (!record) throw new Error(`Unknown subagent id: ${params.id}`);
 			return formatStatus(record);
 		},
-		renderCall(args, theme) { return new Text(`${theme.fg("toolTitle", theme.bold("get_subagent_status "))}${theme.fg("accent", args.id)}`, 0, 0); },
+		renderCall(args, theme) {
+			return new Text(
+				`${theme.fg("toolTitle", theme.bold("get_subagent_status "))}${theme.fg("accent", args.id)}`,
+				0,
+				0,
+			);
+		},
 	};
 
 	const listTool: ToolDefinition<typeof ListSubagentsParams, ToolDetails> = {
 		name: "list_subagents",
 		label: "List subagents",
-		description: "List subagents for the current parent session. Data is persisted on disk across session restarts.",
+		description:
+			"List subagents for the current parent session. Data is persisted on disk across session restarts.",
 		parameters: ListSubagentsParams,
-		execute(_toolCallId: string, _params: Record<string, never>, _signal: AbortSignal, _onUpdate: ((result: AgentToolResult<ToolDetails>) => void) | undefined, ctx: ExtensionContext) {
-			const records = readStore(parentSessionId(ctx)).records.map((r) => refreshRecordFromDisk(r));
+		execute(
+			_toolCallId: string,
+			_params: Record<string, never>,
+			_signal: AbortSignal,
+			_onUpdate: ((result: AgentToolResult<ToolDetails>) => void) | undefined,
+			ctx: ExtensionContext,
+		) {
+			const records = readStore(parentSessionId(ctx)).records.map((r) =>
+				refreshRecordFromDisk(r),
+			);
 			const subagents = records.map((r) => ({ id: r.id, running: r.running }));
-			return { content: [{ type: "text", text: JSON.stringify(subagents, null, 2) }], details: { subagents } };
+			return {
+				content: [{ type: "text", text: JSON.stringify(subagents, null, 2) }],
+				details: { subagents },
+			};
 		},
-		renderCall(_args, theme) { return new Text(theme.fg("toolTitle", theme.bold("list_subagents")), 0, 0); },
+		renderCall(_args, theme) {
+			return new Text(
+				theme.fg("toolTitle", theme.bold("list_subagents")),
+				0,
+				0,
+			);
+		},
 	};
 
 	pi.registerTool(spawnTool);

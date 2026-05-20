@@ -31,7 +31,7 @@ spawn_subagent({
 ### `steer_subagent`
 
 ```ts
-steer_subagent({ id: string, message: string })
+steer_subagent({ id: string, message: string });
 ```
 
 Queues a message for a running subagent or resumes a stopped subagent with the message.
@@ -39,7 +39,7 @@ Queues a message for a running subagent or resumes a stopped subagent with the m
 ### `get_subagent_status`
 
 ```ts
-get_subagent_status({ id: string })
+get_subagent_status({ id: string });
 ```
 
 Returns:
@@ -53,7 +53,7 @@ Returns:
 ### `list_subagents`
 
 ```ts
-list_subagents({})
+list_subagents({});
 ```
 
 Lists subagents for the current parent session. Records are persisted on disk across parent session restarts.

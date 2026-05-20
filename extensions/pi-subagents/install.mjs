@@ -2,7 +2,7 @@
 
 /**
  * pi-subagents installer
- * 
+ *
  * Usage:
  *   npx pi-subagents          # Install to ~/.pi/agent/extensions/subagent
  *   npx pi-subagents --remove # Remove the extension
@@ -13,7 +13,13 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
 
-const EXTENSION_DIR = path.join(os.homedir(), ".pi", "agent", "extensions", "subagent");
+const EXTENSION_DIR = path.join(
+	os.homedir(),
+	".pi",
+	"agent",
+	"extensions",
+	"subagent",
+);
 const REPO_URL = "https://github.com/nicobailon/pi-subagents.git";
 
 const args = process.argv.slice(2);

@@ -4,8 +4,12 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const TASK_ARG_LIMIT = 8000;
-const PROMPT_RUNTIME_EXTENSION_PATH = path.join(path.dirname(fileURLToPath(import.meta.url)), "subagent-prompt-runtime.ts");
-export const SUBAGENT_ORCHESTRATOR_TARGET_ENV = "PI_SUBAGENT_ORCHESTRATOR_TARGET";
+const PROMPT_RUNTIME_EXTENSION_PATH = path.join(
+	path.dirname(fileURLToPath(import.meta.url)),
+	"subagent-prompt-runtime.ts",
+);
+export const SUBAGENT_ORCHESTRATOR_TARGET_ENV =
+	"PI_SUBAGENT_ORCHESTRATOR_TARGET";
 export const SUBAGENT_RUN_ID_ENV = "PI_SUBAGENT_RUN_ID";
 
 interface BuildPiArgsInput {
@@ -26,7 +30,9 @@ interface BuildPiArgsResult {
 	tempDir?: string;
 }
 
-export function applyThinkingSuffix(model: string | undefined): string | undefined {
+export function applyThinkingSuffix(
+	model: string | undefined,
+): string | undefined {
 	return model;
 }
 
@@ -61,8 +67,10 @@ export function buildPiArgs(input: BuildPiArgsInput): BuildPiArgsResult {
 	}
 
 	const env: Record<string, string | undefined> = {};
-	if (input.intercomSessionName) env.PI_SUBAGENT_INTERCOM_SESSION_NAME = input.intercomSessionName;
-	if (input.orchestratorIntercomTarget) env[SUBAGENT_ORCHESTRATOR_TARGET_ENV] = input.orchestratorIntercomTarget;
+	if (input.intercomSessionName)
+		env.PI_SUBAGENT_INTERCOM_SESSION_NAME = input.intercomSessionName;
+	if (input.orchestratorIntercomTarget)
+		env[SUBAGENT_ORCHESTRATOR_TARGET_ENV] = input.orchestratorIntercomTarget;
 	if (input.runId) env[SUBAGENT_RUN_ID_ENV] = input.runId;
 	return { args, env, tempDir };
 }
