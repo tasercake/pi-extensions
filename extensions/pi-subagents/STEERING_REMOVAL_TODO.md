@@ -95,22 +95,22 @@
 
 ## PR
 
-- [ ] Review working tree and confirm only intended implementation/test/docs/package files changed plus this TODO file.
-- [ ] Confirm `STEERING_REMOVAL_SCOPE.md` was not modified.
-- [ ] Confirm no unrelated implementation source or docs were modified beyond the steering-removal scope.
-- [ ] Prepare concise commit message describing removal of steering tool surface.
-- [ ] Open PR with summary of removed `steer_subagent` API surface.
-- [ ] Include validation commands and pass/fail results in PR description.
-- [ ] Note breaking compatibility: callers using `steer_subagent` must stop using it; no shim is provided.
-- [ ] Note package tarball excludes `CHANGELOG.md` to avoid shipping historical removed-interaction wording.
+- [x] Review working tree and confirm only intended implementation/test/docs/package files changed plus this TODO file.
+- [x] Confirm `STEERING_REMOVAL_SCOPE.md` was not modified.
+- [x] Confirm no unrelated implementation source or docs were modified beyond the steering-removal scope.
+- [x] Prepare concise commit message describing removal of steering tool surface.
+- [x] Open PR with summary of removed `steer_subagent` API surface: https://github.com/tasercake/pi-extensions/pull/2.
+- [x] Include validation commands and pass/fail results in PR description.
+- [x] Note breaking compatibility: callers using `steer_subagent` must stop using it; no shim is provided.
+- [x] Note package tarball excludes `CHANGELOG.md` to avoid shipping historical removed-interaction wording.
 
 ## PR review
 
-- [ ] Request PR review focused on exact three-tool model-visible surface.
-- [ ] Request PR review focused on absence of steering/follow-up/resume/pause/interrupt/message-queue wording in shipped surfaces.
-- [ ] Request PR review focused on no behavioral drift for spawn/status/list.
-- [ ] Request PR review focused on tarball contents and package metadata.
-- [ ] Address PR review comments with minimal scoped commits.
-- [ ] Re-run full validation after PR review fixes.
-- [ ] Update PR description with final validation results if fixes changed code.
-- [ ] Merge only after tests, searches, pack inspection, and review are complete.
+- [x] Request PR review focused on exact three-tool model-visible surface.
+- [x] Request PR review focused on absence of steering/follow-up/resume/pause/interrupt/message-queue wording in shipped surfaces.
+- [x] Request PR review focused on no behavioral drift for spawn/status/list.
+- [x] Request PR review focused on tarball contents and package metadata.
+- [x] Address PR review comments with minimal scoped commits; PR review report found no blocking issues, so no code fixes were required.
+- [x] Re-run full validation after PR review fixes; no fixes were required, and review report confirms validation stayed passing.
+- [x] Update PR description with final validation results if fixes changed code; no fixes changed code.
+- [x] Merge deferred until user approval and CI/repository checks; PR review is complete and PR was not merged.
