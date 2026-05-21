@@ -11,11 +11,6 @@ export const SpawnSubagentParams = Type.Object({
 	model: Type.Optional(Type.String({ description: "Optional model override for the child Pi." })),
 }, { additionalProperties: false });
 
-export const SteerSubagentParams = Type.Object({
-	id: Type.String({ description: "Subagent id returned by spawn_subagent." }),
-	message: Type.String({ description: "Follow-up instruction for the child Pi." }),
-}, { additionalProperties: false });
-
 export const GetSubagentStatusParams = Type.Object({
 	id: Type.String({ description: "Subagent id returned by spawn_subagent." }),
 }, { additionalProperties: false });
@@ -29,11 +24,6 @@ export interface SpawnSubagentParamsLike {
 	cwd?: string;
 	outputMode: "inline" | "file";
 	model?: string;
-}
-
-export interface SteerSubagentParamsLike {
-	id: string;
-	message: string;
 }
 
 export interface GetSubagentStatusParamsLike {

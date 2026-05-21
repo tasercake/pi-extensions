@@ -28,14 +28,6 @@ spawn_subagent({
 - `outputMode: "inline"` stores/returns the child result text.
 - `outputMode: "file"` writes the child result to a generated file and returns the file path.
 
-### `steer_subagent`
-
-```ts
-steer_subagent({ id: string, message: string });
-```
-
-Queues a message for a running subagent or resumes a stopped subagent with the message.
-
 ### `get_subagent_status`
 
 ```ts
@@ -57,6 +49,8 @@ list_subagents({});
 ```
 
 Lists subagents for the current parent session. Records are persisted on disk across parent session restarts.
+
+Completed children are final. Running children continue their original task until completion or failure. The extension exposes only spawn, status, and list tools.
 
 ## Child environment
 

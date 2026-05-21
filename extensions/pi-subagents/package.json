@@ -1,7 +1,7 @@
 {
   "name": "pi-subagents",
   "version": "0.24.3",
-  "description": "Minimal recursive Pi child-subagent spawner with four tools",
+  "description": "Minimal recursive Pi child-subagent spawner with spawn, status, and list tools",
   "author": "Nico Bailon",
   "license": "MIT",
   "type": "module",
@@ -29,8 +29,7 @@
     "src/**/*.ts",
     "*.mjs",
     "skills/**/*",
-    "README.md",
-    "CHANGELOG.md"
+    "README.md"
   ],
   "scripts": {
     "test": "npm run test:unit",

@@ -93,7 +93,6 @@ if (fs.existsSync(EXTENSION_DIR)) {
 console.log(`
 The extension is now available in pi. Tools added:
   • spawn_subagent - Spawn one child Pi task (blocking or async)
-  • steer_subagent - Send a follow-up message to a child
   • get_subagent_status - Retrieve child status/result
   • list_subagents - List persisted children for this session
 
