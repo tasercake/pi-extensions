@@ -1,0 +1,50 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  extension-tests:
+    name: Extension tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Run tests in all extension packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+
+          found=0
+          for pkg in extensions/*/package.json; do
+            dir="$(dirname "$pkg")"
+            if ! node -e "const p=require('./$pkg'); process.exit(p.scripts && p.scripts.test ? 0 : 1)"; then
+              echo "Skipping $dir: no npm test script"
+              continue
+            fi
+
+            found=1
+            echo "::group::$dir"
+            pushd "$dir" >/dev/null
+            if [ -f package-lock.json ]; then
+              npm ci
+            else
+              npm install
+            fi
+            npm test
+            popd >/dev/null
+            echo "::endgroup::"
+          done
+
+          if [ "$found" -eq 0 ]; then
+            echo "No extension packages with npm test scripts found."
+          fi
