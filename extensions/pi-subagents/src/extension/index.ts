@@ -24,10 +24,8 @@ import {
 	GetSubagentStatusParams,
 	ListSubagentsParams,
 	SpawnSubagentParams,
-	SteerSubagentParams,
 	type GetSubagentStatusParamsLike,
 	type SpawnSubagentParamsLike,
-	type SteerSubagentParamsLike,
 } from "./schemas.ts";
 
 interface ToolDetails {
@@ -444,71 +442,6 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 		},
 	};
 
-	const steerTool: ToolDefinition<typeof SteerSubagentParams, ToolDetails> = {
-		name: "steer_subagent",
-		label: "Steer subagent",
-		description:
-			"Send a message to a subagent. If it is running, the message is queued for the child session; if stopped, it is resumed with the new message.",
-		parameters: SteerSubagentParams,
-		async execute(
-			_toolCallId: string,
-			params: SteerSubagentParamsLike,
-			_signal: AbortSignal,
-			_onUpdate: ((result: AgentToolResult<ToolDetails>) => void) | undefined,
-			ctx: ExtensionContext,
-		) {
-			const record = findRecord(parentSessionId(ctx), params.id);
-			if (!record) throw new Error(`Unknown subagent id: ${params.id}`);
-			const pendingPath = path.join(
-				childDir(record.parentSessionId, record.id),
-				"steering.md",
-			);
-			fs.appendFileSync(
-				pendingPath,
-				`\n\n## ${new Date().toISOString()}\n\n${params.message}\n`,
-				{ mode: 0o600 },
-			);
-			const child = runningChildren.get(record.id);
-			if (child && !child.killed) {
-				child.kill("SIGUSR2");
-				return {
-					content: [
-						{
-							type: "text",
-							text: `Queued steering message for running subagent ${record.id}.`,
-						},
-					],
-					details: { id: record.id, running: true },
-				};
-			}
-			const followUp = `Previous run follow-up from parent:\n\n${params.message}`;
-			record.running = true;
-			record.updatedAt = Date.now();
-			void runChild(pi, ctx, record, followUp, true).catch((error) => {
-				record.running = false;
-				record.error = error instanceof Error ? error.message : String(error);
-				record.updatedAt = Date.now();
-				upsertRecord(record);
-			});
-			return {
-				content: [
-					{
-						type: "text",
-						text: `Resumed subagent ${record.id} with steering message.`,
-					},
-				],
-				details: { id: record.id, running: true },
-			};
-		},
-		renderCall(args, theme) {
-			return new Text(
-				`${theme.fg("toolTitle", theme.bold("steer_subagent "))}${theme.fg("accent", args.id)}`,
-				0,
-				0,
-			);
-		},
-	};
-
 	const statusTool: ToolDefinition<
 		typeof GetSubagentStatusParams,
 		ToolDetails
@@ -570,7 +503,6 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 	};
 
 	pi.registerTool(spawnTool);
-	pi.registerTool(steerTool);
 	pi.registerTool(statusTool);
 	pi.registerTool(listTool);
 }

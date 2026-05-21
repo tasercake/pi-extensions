@@ -10,7 +10,6 @@ Use these tools to launch unrestricted child Pi sessions. The caller must includ
 ## Tools
 
 - `spawn_subagent({ task, async, keepContext, cwd?, outputMode, model? })`
-- `steer_subagent({ id, message })`
 - `get_subagent_status({ id })`
 - `list_subagents({})`
 
@@ -53,6 +52,7 @@ list_subagents({});
 
 ## Rules
 
+- Available subagent tools are exactly the three listed above.
 - No subagent types exist.
 - No chain or parallel-list mode exists.
 - Child Pi receives normal tools, skills, extensions, and project context.
