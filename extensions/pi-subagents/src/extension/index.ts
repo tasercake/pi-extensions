@@ -288,10 +288,16 @@ function buildArgsForRecord(
 	});
 }
 
+function isStaleExtensionContextError(error: unknown): boolean {
+	return error instanceof Error
+		? error.message.includes("This extension ctx is stale after session replacement or reload")
+		: String(error).includes("This extension ctx is stale after session replacement or reload");
+}
+
 function notifyCompletion(
 	pi: ExtensionAPI,
 	record: PersistedSubagentRecord,
-): void {
+): boolean {
 	const parentId = record.parentSessionId;
 	const store = readStore(parentId);
 	const cohort = store.records.filter(
@@ -303,24 +309,33 @@ function notifyCompletion(
 		`Subagent ${record.id} completed.`,
 		`Call get_subagent_status({ id: "${record.id}" }) to retrieve the result.`,
 	];
+	const finalCohort = active.length === 0 && cohort.length > 1;
 	if (active.length > 0) {
 		parts.splice(
 			1,
 			0,
 			`${completed.length} out of ${cohort.length} subagents have completed. You will be notified when all complete.`,
 		);
-	} else if (cohort.length > 1) {
+	} else if (finalCohort) {
 		parts.splice(1, 0, `All ${cohort.length} subagents have completed.`);
+	}
+	try {
+		pi.sendMessage(
+			{ customType: "subagent-notify", content: parts.join("\n"), display: true },
+			{ triggerTurn: true },
+		);
+	} catch (error) {
+		if (isStaleExtensionContextError(error)) return false;
+		throw error;
+	}
+	if (finalCohort) {
 		for (const r of cohort) {
 			r.cohortFinalNotified = true;
 			r.updatedAt = Date.now();
 			upsertRecord(r);
 		}
 	}
-	pi.sendMessage(
-		{ customType: "subagent-notify", content: parts.join("\n"), display: true },
-		{ triggerTurn: true },
-	);
+	return true;
 }
 
 async function runChild(
