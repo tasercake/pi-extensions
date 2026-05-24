@@ -13,6 +13,57 @@ import { buildPiArgs } from '../../src/runs/shared/pi-args.ts';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const projectRoot = path.resolve(__dirname, '..', '..');
 
+function makeTestCtx(prefix: string) {
+  const sessionId = `${prefix}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  return {
+    sessionId,
+    ctx: {
+      cwd: fs.mkdtempSync(path.join(os.tmpdir(), `${prefix}-`)),
+      sessionManager: {
+        getSessionFile: () => sessionId,
+        getSessionId: () => sessionId,
+      },
+    },
+  };
+}
+
+function cleanupTestCtx(ctx: { cwd: string }, sessionId: string) {
+  fs.rmSync(ctx.cwd, { recursive: true, force: true });
+  fs.rmSync(path.join(os.homedir(), '.pi', 'agent', 'subagents-minimal', sessionId), { recursive: true, force: true });
+}
+
+function registerTestTools(sendMessage: (...args: unknown[]) => void) {
+  const registered = new Map<string, any>();
+  const fakePi = {
+    registerTool(tool: { name: string }) {
+      registered.set(tool.name, tool);
+    },
+    sendMessage,
+  };
+  registerSubagentExtension(fakePi as never);
+  return {
+    spawnTool: registered.get('spawn_subagent'),
+    statusTool: registered.get('get_subagent_status'),
+    listTool: registered.get('list_subagents'),
+  };
+}
+
+async function waitForStatus(statusTool: any, id: string, ctx: unknown) {
+  let status: any;
+  for (let i = 0; i < 100; i++) {
+    status = await statusTool.execute(
+      `status-${id}-${i}`,
+      { id },
+      new AbortController().signal,
+      undefined,
+      ctx,
+    );
+    if (!status.details.running) return status;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  return status;
+}
+
 test('schemas expose minimal three-tool parameter shapes', async () => {
   assert.equal(SpawnSubagentParams.additionalProperties, false);
   assert.deepEqual(Object.keys(SpawnSubagentParams.properties).sort(), ['async', 'cwd', 'keepContext', 'model', 'outputMode', 'task'].sort());
@@ -109,34 +160,19 @@ test('child pi args do not restrict tools skills extensions or MCP', () => {
   assert(built.args.includes('--extension'));
 });
 
-test('async completion ignores stale extension context notification failure', async () => {
+test('async completion persists success when stale extension context rejects notification', async () => {
   const mockPi = createMockPi();
   mockPi.install();
   mockPi.onCall({ output: 'done', exitCode: 0 });
 
-  const registered = new Map<string, any>();
-  const fakePi = {
-    registerTool(tool: { name: string }) {
-      registered.set(tool.name, tool);
-    },
-    sendMessage() {
-      throw new Error('This extension ctx is stale after session replacement or reload.');
-    },
-  };
-  const sessionId = `stale-notify-test-${Date.now()}-${Math.random().toString(16).slice(2)}`;
-  const ctx = {
-    cwd: fs.mkdtempSync(path.join(os.tmpdir(), 'pi-subagents-stale-')),
-    sessionManager: {
-      getSessionFile: () => sessionId,
-      getSessionId: () => sessionId,
-    },
-  };
+  const { sessionId, ctx } = makeTestCtx('pi-subagents-stale');
+  let notifyAttempts = 0;
+  const { spawnTool, statusTool } = registerTestTools(() => {
+    notifyAttempts += 1;
+    throw new Error('This extension ctx is stale after session replacement or reload.');
+  });
 
   try {
-    registerSubagentExtension(fakePi as never);
-    const spawnTool = registered.get('spawn_subagent');
-    const statusTool = registered.get('get_subagent_status');
-
     await spawnTool.execute(
       'stale-notify-child',
       { task: 'finish', async: true, keepContext: false, outputMode: 'inline' },
@@ -145,25 +181,65 @@ test('async completion ignores stale extension context notification failure', as
       ctx,
     );
 
-    let status: any;
-    for (let i = 0; i < 50; i++) {
-      status = await statusTool.execute(
-        'status-call',
-        { id: 'stale-notify-child' },
-        new AbortController().signal,
-        undefined,
-        ctx,
-      );
-      if (!status.details.running) break;
-      await new Promise((resolve) => setTimeout(resolve, 20));
-    }
+    const status = await waitForStatus(statusTool, 'stale-notify-child', ctx);
 
     assert.equal(status.details.running, false);
     assert.equal(status.details.result, 'done');
     assert.equal(status.details.error, undefined);
+    assert.equal(notifyAttempts, 1);
   } finally {
     mockPi.uninstall();
-    fs.rmSync(ctx.cwd, { recursive: true, force: true });
-    fs.rmSync(path.join(os.homedir(), '.pi', 'agent', 'subagents-minimal', sessionId), { recursive: true, force: true });
+    cleanupTestCtx(ctx, sessionId);
+  }
+});
+
+test('stale cohort notification failure does not suppress later final notification', async () => {
+  const mockPi = createMockPi();
+  mockPi.install();
+  mockPi.onCall({ output: 'first', exitCode: 0, delay: 20 });
+  mockPi.onCall({ output: 'second', exitCode: 0, delay: 120 });
+
+  const { sessionId, ctx } = makeTestCtx('pi-subagents-stale-cohort');
+  const sentMessages: string[] = [];
+  let notifyAttempts = 0;
+  const { spawnTool, statusTool } = registerTestTools((message) => {
+    notifyAttempts += 1;
+    if (notifyAttempts === 1) {
+      throw new Error('This extension ctx is stale after session replacement or reload.');
+    }
+    const content = (message as { content?: unknown }).content;
+    if (typeof content === 'string') sentMessages.push(content);
+  });
+
+  try {
+    await spawnTool.execute(
+      'stale-cohort-first',
+      { task: 'finish first', async: true, keepContext: false, outputMode: 'inline' },
+      new AbortController().signal,
+      undefined,
+      ctx,
+    );
+    await spawnTool.execute(
+      'stale-cohort-second',
+      { task: 'finish second', async: true, keepContext: false, outputMode: 'inline' },
+      new AbortController().signal,
+      undefined,
+      ctx,
+    );
+
+    const firstStatus = await waitForStatus(statusTool, 'stale-cohort-first', ctx);
+    const secondStatus = await waitForStatus(statusTool, 'stale-cohort-second', ctx);
+
+    assert.equal(firstStatus.details.result, 'first');
+    assert.equal(secondStatus.details.result, 'second');
+    assert.equal(firstStatus.details.error, undefined);
+    assert.equal(secondStatus.details.error, undefined);
+    assert.equal(notifyAttempts, 2);
+    assert.equal(sentMessages.length, 1);
+    assert.match(sentMessages[0], /All 2 subagents have completed\./);
+    assert.match(sentMessages[0], /stale-cohort-second/);
+  } finally {
+    mockPi.uninstall();
+    cleanupTestCtx(ctx, sessionId);
   }
 });
