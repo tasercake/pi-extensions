@@ -216,11 +216,13 @@ describe("ensureTool force-reinstall", () => {
 	});
 
 	it("skips cache layers and reaches installTool", async () => {
-		// Pre-populate probe cache with a stale PATH entry
+		// Use an npm-managed tool so reaching installTool is observable via the
+		// child_process spawn mock. GitHub-managed tools such as rust-analyzer may
+		// install from a bare .gz asset without spawning tar/unzip on Linux.
 		mockFsReadFile.mockResolvedValue(
 			JSON.stringify({
-				"rust-analyzer": {
-					path: "/fake/cached/rust-analyzer",
+				stylelint: {
+					path: "/fake/cached/stylelint",
 					mtimeMs: Date.now(),
 					cachedAt: Date.now(),
 				},
@@ -231,11 +233,15 @@ describe("ensureTool force-reinstall", () => {
 
 		spawnCalls.length = 0;
 
-		const result = await ensureTool("rust-analyzer", {
+		const result = await ensureTool("stylelint", {
 			forceReinstall: true,
 		});
 
-		expect(result).not.toBe("/fake/cached/rust-analyzer");
-		expect(spawnCalls.length).toBeGreaterThan(0);
+		expect(result).not.toBe("/fake/cached/stylelint");
+		expect(
+			spawnCalls.some((call) =>
+				["npm", "npm.cmd", "bun", "bun.exe"].includes(call.cmd),
+			),
+		).toBe(true);
 	});
 });
