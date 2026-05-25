@@ -41,8 +41,10 @@ export interface StartupScanOptions {
 
 export function findNearestProjectRoot(startDir: string): string | null {
 	let current = path.resolve(startDir);
+	const tempDir = path.resolve(os.tmpdir());
 	while (true) {
 		if (
+			current !== tempDir &&
 			PROJECT_ROOT_MARKERS.some((marker) =>
 				fs.existsSync(path.join(current, marker)),
 			)

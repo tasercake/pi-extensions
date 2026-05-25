@@ -1866,7 +1866,7 @@ export const CssServer: LSPServerInfo = {
 	extensions: KIND_EXTENSIONS["css"],
 	root: RootWithFallback(
 		IgnoreHomeRoot(
-			PriorityRoot([
+			WorkspacePriorityRoot([
 				[
 					"package.json",
 					"postcss.config.js",
