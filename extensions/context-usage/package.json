@@ -1,0 +1,66 @@
+{
+  "name": "pi-context-usage",
+  "version": "1.8.0-pi.0",
+  "description": "Pi context usage extension — model-callable get_context_usage tool adapted from @mrclrchtr/supi-context 1.8.0",
+  "license": "MIT",
+  "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mrclrchtr/supi.git",
+    "directory": "packages/supi-context"
+  },
+  "keywords": [
+    "pi-package",
+    "pi",
+    "pi-coding-agent",
+    "context",
+    "tokens"
+  ],
+  "files": [
+    "src/**/*.ts",
+    "test/**/*.ts",
+    "scripts/**/*.mjs",
+    "README.md"
+  ],
+  "scripts": {
+    "postinstall": "node ./scripts/patch-supi-core.mjs",
+    "test": "node --experimental-strip-types --test test/*.test.ts",
+    "coverage": "node --experimental-strip-types --experimental-test-coverage --test-coverage-include='src/analysis.ts' --test-coverage-include='src/context.ts' --test-coverage-include='src/prompt-inference.ts' --test-coverage-include='src/utils.ts' --test test/*.test.ts"
+  },
+  "dependencies": {
+    "@mrclrchtr/supi-core": "1.8.0",
+    "typebox": "^1.1.24"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-agent-core": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*"
+  },
+  "peerDependenciesMeta": {
+    "@earendil-works/pi-agent-core": {
+      "optional": true
+    },
+    "@earendil-works/pi-coding-agent": {
+      "optional": true
+    },
+    "@earendil-works/pi-tui": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@earendil-works/pi-agent-core": "^0.74.0",
+    "@earendil-works/pi-coding-agent": "^0.74.0",
+    "@earendil-works/pi-tui": "^0.74.0"
+  },
+  "pi": {
+    "extensions": [
+      "./src/extension.ts"
+    ]
+  },
+  "main": "src/api.ts",
+  "exports": {
+    "./api": "./src/api.ts",
+    "./extension": "./src/extension.ts",
+    "./package.json": "./package.json"
+  }
+}
