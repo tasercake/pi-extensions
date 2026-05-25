@@ -23,6 +23,7 @@ import type { LSPServerInfo } from "./server.js";
 import { isDirectLspCommandTemporarilyUnavailable } from "./server.js";
 import { getStrategy } from "./server-strategies.js";
 import { raceToCompletion } from "./aggregation.js";
+import { stopLSP } from "./launch.js";
 
 // --- Types ---
 
@@ -73,8 +74,22 @@ const EARLY_UNBLOCK_GRACE_MS = Math.max(
 	) || 400,
 );
 const CASCADE_DIAGNOSTICS_TTL_MS = 240_000;
+const LSP_SHUTDOWN_IN_FLIGHT_WAIT_MS = 1500;
 const SESSIONSTART_LOG_DIR = path.join(os.homedir(), ".pi-lens");
 const SESSIONSTART_LOG = path.join(SESSIONSTART_LOG_DIR, "sessionstart.log");
+
+function waitWithTimeout<T>(
+	promise: Promise<T>,
+	timeoutMs: number,
+): Promise<T | undefined> {
+	return new Promise((resolve) => {
+		const timer = setTimeout(() => resolve(undefined), timeoutMs);
+		promise
+			.then((value) => resolve(value))
+			.catch(() => resolve(undefined))
+			.finally(() => clearTimeout(timer));
+	});
+}
 
 function logSessionStart(msg: string): void {
 	if (
@@ -352,6 +367,7 @@ export class LSPService {
 	async getClientsForFile(
 		filePath: string,
 	): Promise<{ clients: SpawnedServer[]; serverCountAttempted: number }> {
+		if (this.checkDestroyed()) return { clients: [], serverCountAttempted: 0 };
 		const servers = getServersForFileWithConfig(filePath);
 		if (servers.length === 0) return { clients: [], serverCountAttempted: 0 };
 
@@ -397,6 +413,7 @@ export class LSPService {
 		server: LSPServerInfo,
 	): Promise<SpawnedServer | undefined> {
 		const root = await server.root(filePath);
+		if (this.checkDestroyed()) return undefined;
 		if (!root) return undefined;
 		const allowInstall = this.shouldAllowInstall(filePath, root);
 
@@ -526,6 +543,7 @@ export class LSPService {
 		filePath: string,
 		allowInstall: boolean,
 	): Promise<SpawnedServer | undefined> {
+		if (this.checkDestroyed()) return undefined;
 		const isOptionalServer = OPTIONAL_LSP_SERVER_IDS.has(server.id); // NOSONAR: set intentionally empty — no optional servers configured yet
 		const startedAt = Date.now();
 		logSessionStart(
@@ -534,6 +552,15 @@ export class LSPService {
 		recordLsp(server.id, root, "spawn_start");
 		try {
 			const spawned = await server.spawn(root, { allowInstall });
+			if (this.isDestroyed) {
+				if (spawned) {
+					await waitWithTimeout(
+						stopLSP(spawned.process).catch(() => undefined),
+						LSP_SHUTDOWN_IN_FLIGHT_WAIT_MS,
+					);
+				}
+				return undefined;
+			}
 			if (!spawned) {
 				logSessionStart(
 					`lsp spawn ${server.id}: unavailable (${Date.now() - startedAt}ms)`,
@@ -562,6 +589,10 @@ export class LSPService {
 				initialization: spawned.initialization,
 				initializeTimeoutMs: server.initializeTimeoutMs,
 			});
+			if (this.isDestroyed) {
+				await client.shutdown().catch(() => {});
+				return undefined;
+			}
 			const wsDiag =
 				typeof client.getWorkspaceDiagnosticsSupport === "function"
 					? client.getWorkspaceDiagnosticsSupport()
@@ -1293,8 +1324,15 @@ export class LSPService {
 	async shutdown(): Promise<void> {
 		if (this.checkDestroyed()) return;
 		this.isDestroyed = true;
-		// Cancel any in-flight spawns
+		const inFlight = Array.from(this.state.inFlight.values());
 		this.state.inFlight.clear();
+
+		if (inFlight.length > 0) {
+			await waitWithTimeout(
+				Promise.allSettled(inFlight),
+				LSP_SHUTDOWN_IN_FLIGHT_WAIT_MS,
+			);
+		}
 
 		for (const [_key, client] of this.state.clients) {
 			try {

@@ -186,6 +186,78 @@ describe("index.ts integration", () => {
 		expect(ensureToolMock).toHaveBeenCalledWith("typescript-language-server");
 	}, 15_000);
 
+	it("agent_end shuts down LSP clients without recreating the singleton", async () => {
+		const handleAgentEndMock = vi.fn().mockResolvedValue(undefined);
+		const resetLSPServiceMock = vi.fn();
+		const getLSPServiceMock = vi.fn(() => ({ getAliveClientCount: () => 1 }));
+
+		vi.doMock("../clients/runtime-agent-end.js", () => ({
+			handleAgentEnd: handleAgentEndMock,
+		}));
+		vi.doMock("../clients/lsp/index.js", () => ({
+			getLSPService: getLSPServiceMock,
+			resetLSPService: resetLSPServiceMock,
+		}));
+
+		const { default: registerExtension } = await import("../index.ts");
+		const { pi, handlers } = createMockPi();
+		registerExtension(pi as any);
+
+		const agentEnd = handlers.agent_end?.[0];
+		expect(agentEnd).toBeTypeOf("function");
+
+		const ui = {
+			notify: vi.fn(),
+			setStatus: vi.fn(),
+			theme: { fg: vi.fn((_color: string, text: string) => `fg:${text}`) },
+		};
+
+		await agentEnd?.({}, { cwd: tmpDir, ui });
+
+		expect(handleAgentEndMock).toHaveBeenCalledTimes(1);
+		expect(resetLSPServiceMock).toHaveBeenCalledTimes(1);
+		expect(ui.theme.fg).toHaveBeenCalledWith("error", "LSP Inactive");
+		expect(ui.setStatus).toHaveBeenCalledWith("pi-lens-lsp", "fg:LSP Inactive");
+		expect(getLSPServiceMock).not.toHaveBeenCalled();
+	}, 15_000);
+
+	it("agent_end still shuts down LSP clients when handleAgentEnd throws", async () => {
+		const handleAgentEndMock = vi
+			.fn()
+			.mockRejectedValue(new Error("deferred formatting failed"));
+		const resetLSPServiceMock = vi.fn();
+		const getLSPServiceMock = vi.fn(() => ({ getAliveClientCount: () => 1 }));
+
+		vi.doMock("../clients/runtime-agent-end.js", () => ({
+			handleAgentEnd: handleAgentEndMock,
+		}));
+		vi.doMock("../clients/lsp/index.js", () => ({
+			getLSPService: getLSPServiceMock,
+			resetLSPService: resetLSPServiceMock,
+		}));
+
+		const { default: registerExtension } = await import("../index.ts");
+		const { pi, handlers } = createMockPi();
+		registerExtension(pi as any);
+
+		const agentEnd = handlers.agent_end?.[0];
+		expect(agentEnd).toBeTypeOf("function");
+
+		const ui = {
+			notify: vi.fn(),
+			setStatus: vi.fn(),
+			theme: { fg: vi.fn((_color: string, text: string) => `fg:${text}`) },
+		};
+
+		await expect(agentEnd?.({}, { cwd: tmpDir, ui })).resolves.toBeUndefined();
+
+		expect(handleAgentEndMock).toHaveBeenCalledTimes(1);
+		expect(resetLSPServiceMock).toHaveBeenCalledTimes(1);
+		expect(ui.theme.fg).toHaveBeenCalledWith("error", "LSP Inactive");
+		expect(ui.setStatus).toHaveBeenCalledWith("pi-lens-lsp", "fg:LSP Inactive");
+		expect(getLSPServiceMock).not.toHaveBeenCalled();
+	}, 15_000);
+
 	it("context handler prepends injected guidance before the user prompt", async () => {
 		const { default: registerExtension } = await import("../index.ts");
 		const { pi, handlers } = createMockPi();
