@@ -1822,10 +1822,18 @@ export default function (pi: ExtensionAPI) {
 				getFormatService: () =>
 					getFormatService(runtime.telemetrySessionId, true),
 			});
-			ctx.ui && updateLspStatus(ctx.ui.setStatus, ctx.ui.theme);
 		} catch (agentEndErr) {
 			dbg(`agent_end crashed: ${agentEndErr}`);
 			dbg(`agent_end crash stack: ${(agentEndErr as Error).stack}`);
+		} finally {
+			cancelLSPIdleReset();
+			resetLSPService();
+			if (ctx.ui) {
+				ctx.ui.setStatus(
+					"pi-lens-lsp",
+					ctx.ui.theme.fg("error", "LSP Inactive"),
+				);
+			}
 		}
 	});
 
