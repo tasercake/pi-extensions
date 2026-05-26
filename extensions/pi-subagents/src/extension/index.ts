@@ -58,6 +58,9 @@ interface PersistedSubagentRecord {
 	updatedAt: number;
 	completedAt?: number;
 	notifiedCompletion?: boolean;
+	pendingCompletionNotice?: boolean;
+	notifyError?: string;
+	notifiedAt?: number;
 	cohortFinalNotified?: boolean;
 }
 
@@ -121,6 +124,47 @@ function findRecord(
 ): PersistedSubagentRecord | undefined {
 	return readStore(parentId).records.find(
 		(r) => r.id === id || r.id.startsWith(id),
+	);
+}
+
+function updateRecordFields(
+	parentId: string,
+	id: string,
+	mutate: (record: PersistedSubagentRecord) => void,
+): PersistedSubagentRecord | undefined {
+	const store = readStore(parentId);
+	const idx = store.records.findIndex((r) => r.id === id);
+	if (idx === -1) return undefined;
+	const record = store.records[idx];
+	mutate(record);
+	record.updatedAt = Date.now();
+	writeStore(parentId, store);
+	return record;
+}
+
+function markCompletionNoticePending(
+	record: PersistedSubagentRecord,
+	error?: unknown,
+): PersistedSubagentRecord {
+	return (
+		updateRecordFields(record.parentSessionId, record.id, (latest) => {
+			latest.pendingCompletionNotice = true;
+			if (error !== undefined)
+				latest.notifyError = error instanceof Error ? error.message : String(error);
+		}) ?? record
+	);
+}
+
+function markCompletionNoticeSent(
+	record: PersistedSubagentRecord,
+): PersistedSubagentRecord {
+	return (
+		updateRecordFields(record.parentSessionId, record.id, (latest) => {
+			latest.notifiedCompletion = true;
+			latest.pendingCompletionNotice = false;
+			delete latest.notifyError;
+			latest.notifiedAt = Date.now();
+		}) ?? record
 	);
 }
 
@@ -288,26 +332,24 @@ function buildArgsForRecord(
 	});
 }
 
-function isStaleExtensionContextError(error: unknown): boolean {
-	return error instanceof Error
-		? error.message.includes("This extension ctx is stale after session replacement or reload")
-		: String(error).includes("This extension ctx is stale after session replacement or reload");
-}
-
 function notifyCompletion(
 	pi: ExtensionAPI,
 	record: PersistedSubagentRecord,
+	options: { markPendingBeforeSend?: boolean } = {},
 ): boolean {
-	const parentId = record.parentSessionId;
+	const pendingRecord = options.markPendingBeforeSend === false
+		? record
+		: markCompletionNoticePending(record);
+	const parentId = pendingRecord.parentSessionId;
 	const store = readStore(parentId);
 	const cohort = store.records.filter(
-		(r) => r.createdAt >= record.createdAt - 60_000 && !r.cohortFinalNotified,
+		(r) => r.createdAt >= pendingRecord.createdAt - 60_000 && !r.cohortFinalNotified,
 	);
 	const active = cohort.filter((r) => refreshRecordFromDisk(r).running);
 	const completed = cohort.filter((r) => !refreshRecordFromDisk(r).running);
 	const parts = [
-		`Subagent ${record.id} completed.`,
-		`Call get_subagent_status({ id: "${record.id}" }) to retrieve the result.`,
+		`Subagent ${pendingRecord.id} completed.`,
+		`Call get_subagent_status({ id: "${pendingRecord.id}" }) to retrieve the result.`,
 	];
 	const finalCohort = active.length === 0 && cohort.length > 1;
 	if (active.length > 0) {
@@ -325,17 +367,53 @@ function notifyCompletion(
 			{ triggerTurn: true },
 		);
 	} catch (error) {
-		if (isStaleExtensionContextError(error)) return false;
-		throw error;
+		markCompletionNoticePending(pendingRecord, error);
+		return false;
 	}
+	markCompletionNoticeSent(pendingRecord);
 	if (finalCohort) {
 		for (const r of cohort) {
-			r.cohortFinalNotified = true;
-			r.updatedAt = Date.now();
-			upsertRecord(r);
+			updateRecordFields(parentId, r.id, (latest) => {
+				latest.cohortFinalNotified = true;
+			});
 		}
 	}
 	return true;
+}
+
+function notifyCompletionBestEffort(
+	pi: ExtensionAPI,
+	record: PersistedSubagentRecord,
+	options: { markPendingBeforeSend?: boolean } = {},
+): boolean {
+	try {
+		return notifyCompletion(pi, record, options);
+	} catch (error) {
+		try {
+			markCompletionNoticePending(record, error);
+		} catch {
+			// Notification bookkeeping is best-effort; never turn child success
+			// into child failure because the parent notification path failed.
+		}
+		return false;
+	}
+}
+
+function retryPendingCompletionNotices(
+	pi: ExtensionAPI,
+	parentId: string,
+): void {
+	const records = readStore(parentId).records;
+	for (const record of records) {
+		const refreshed = refreshRecordFromDisk(record);
+		if (
+			!refreshed.running &&
+			refreshed.pendingCompletionNotice &&
+			!refreshed.notifiedCompletion
+		) {
+			notifyCompletionBestEffort(pi, refreshed);
+		}
+	}
 }
 
 async function runChild(
@@ -407,7 +485,7 @@ async function runChild(
 		record.result = finalOutput;
 	}
 	upsertRecord(record);
-	if (notify) notifyCompletion(pi, record);
+	if (notify) notifyCompletionBestEffort(pi, record);
 	return record;
 }
 
@@ -425,6 +503,7 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 			_onUpdate: ((result: AgentToolResult<ToolDetails>) => void) | undefined,
 			ctx: ExtensionContext,
 		) {
+			retryPendingCompletionNotices(pi, parentSessionId(ctx));
 			const record = makeRecord(ctx, params, id);
 			if (params.async) {
 				void runChild(pi, ctx, record, params.task, true).catch((error) => {
@@ -433,7 +512,7 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 					record.updatedAt = Date.now();
 					record.completedAt = Date.now();
 					upsertRecord(record);
-					notifyCompletion(pi, record);
+					notifyCompletionBestEffort(pi, record, { markPendingBeforeSend: false });
 				});
 				return {
 					content: [
@@ -473,7 +552,9 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 			_onUpdate: ((result: AgentToolResult<ToolDetails>) => void) | undefined,
 			ctx: ExtensionContext,
 		) {
-			const record = findRecord(parentSessionId(ctx), params.id);
+			const parentId = parentSessionId(ctx);
+			retryPendingCompletionNotices(pi, parentId);
+			const record = findRecord(parentId, params.id);
 			if (!record) throw new Error(`Unknown subagent id: ${params.id}`);
 			return formatStatus(record);
 		},
@@ -499,7 +580,9 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 			_onUpdate: ((result: AgentToolResult<ToolDetails>) => void) | undefined,
 			ctx: ExtensionContext,
 		) {
-			const records = readStore(parentSessionId(ctx)).records.map((r) =>
+			const parentId = parentSessionId(ctx);
+			retryPendingCompletionNotices(pi, parentId);
+			const records = readStore(parentId).records.map((r) =>
 				refreshRecordFromDisk(r),
 			);
 			const subagents = records.map((r) => ({ id: r.id, running: r.running }));
