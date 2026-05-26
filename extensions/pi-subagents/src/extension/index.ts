@@ -367,16 +367,22 @@ function notifyCompletion(
 			{ triggerTurn: true },
 		);
 	} catch (error) {
-		markCompletionNoticePending(pendingRecord, error);
+		if (finalCohort) {
+			for (const r of cohort) markCompletionNoticePending(r, error);
+		} else {
+			markCompletionNoticePending(pendingRecord, error);
+		}
 		return false;
 	}
-	markCompletionNoticeSent(pendingRecord);
 	if (finalCohort) {
+		for (const r of cohort) markCompletionNoticeSent(r);
 		for (const r of cohort) {
 			updateRecordFields(parentId, r.id, (latest) => {
 				latest.cohortFinalNotified = true;
 			});
 		}
+	} else {
+		markCompletionNoticeSent(pendingRecord);
 	}
 	return true;
 }
