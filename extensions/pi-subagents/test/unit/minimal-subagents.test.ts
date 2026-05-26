@@ -376,11 +376,102 @@ test('notification failures do not overwrite successful child result', async () 
   }
 });
 
+test('stale final cohort notification failure leaves cohort pending until retry succeeds', async () => {
+  const mockPi = createMockPi();
+  mockPi.install();
+  mockPi.onCall({ output: 'done', exitCode: 0, delay: 20 });
+  mockPi.onCall({ output: 'done', exitCode: 0, delay: 120 });
+
+  const { sessionId, ctx } = makeTestCtx('pi-subagents-stale-final-cohort');
+  const sentMessages: string[] = [];
+  let notifyAttempts = 0;
+  const { spawnTool, statusTool } = registerTestTools((message) => {
+    notifyAttempts += 1;
+    const content = (message as { content?: unknown }).content;
+    if (notifyAttempts === 2) {
+      assert.equal(typeof content, 'string');
+      assert.match(content as string, /All 2 subagents have completed\./);
+      throw new Error('This extension ctx is stale after session replacement or reload.');
+    }
+    if (typeof content === 'string') sentMessages.push(content);
+  });
+
+  try {
+    await spawnTool.execute(
+      'stale-final-cohort-first',
+      { task: 'finish first', async: true, keepContext: false, outputMode: 'inline' },
+      new AbortController().signal,
+      undefined,
+      ctx,
+    );
+    await spawnTool.execute(
+      'stale-final-cohort-second',
+      { task: 'finish second', async: true, keepContext: false, outputMode: 'inline' },
+      new AbortController().signal,
+      undefined,
+      ctx,
+    );
+
+    await waitForPersistedRecord(
+      sessionId,
+      'stale-final-cohort-first',
+      (candidate) => !candidate.running && candidate.result === 'done',
+    );
+    await waitForPersistedRecord(
+      sessionId,
+      'stale-final-cohort-second',
+      (candidate) => !candidate.running && candidate.result === 'done',
+    );
+    for (let i = 0; i < 100 && notifyAttempts < 2; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+
+    const firstAfterFailure = readPersistedRecord(sessionId, 'stale-final-cohort-first');
+    const secondAfterFailure = readPersistedRecord(sessionId, 'stale-final-cohort-second');
+
+    assert.equal(firstAfterFailure.result, 'done');
+    assert.equal(secondAfterFailure.result, 'done');
+    assert.equal(firstAfterFailure.error, undefined);
+    assert.equal(secondAfterFailure.error, undefined);
+    assert.equal(firstAfterFailure.pendingCompletionNotice, true);
+    assert.equal(secondAfterFailure.pendingCompletionNotice, true);
+    assert.match(firstAfterFailure.notifyError, /stale after session replacement or reload/);
+    assert.match(secondAfterFailure.notifyError, /stale after session replacement or reload/);
+    assert.equal(firstAfterFailure.cohortFinalNotified, undefined);
+    assert.equal(secondAfterFailure.cohortFinalNotified, undefined);
+    assert.equal(notifyAttempts, 2);
+
+    const status = await statusTool.execute(
+      'stale-final-cohort-retry-status',
+      { id: 'stale-final-cohort-second' },
+      new AbortController().signal,
+      undefined,
+      ctx,
+    );
+
+    const firstAfterRetry = readPersistedRecord(sessionId, 'stale-final-cohort-first');
+    const secondAfterRetry = readPersistedRecord(sessionId, 'stale-final-cohort-second');
+
+    assert.equal(status.details.result, 'done');
+    assert.equal(status.details.error, undefined);
+    assert.equal(firstAfterRetry.pendingCompletionNotice, false);
+    assert.equal(secondAfterRetry.pendingCompletionNotice, false);
+    assert.equal(firstAfterRetry.notifyError, undefined);
+    assert.equal(secondAfterRetry.notifyError, undefined);
+    assert.equal(firstAfterRetry.cohortFinalNotified, true);
+    assert.equal(secondAfterRetry.cohortFinalNotified, true);
+    assert(sentMessages.some((message) => /All 2 subagents have completed\./.test(message)));
+  } finally {
+    mockPi.uninstall();
+    cleanupTestCtx(ctx, sessionId);
+  }
+});
+
 test('stale cohort notification failure does not suppress later final notification', async () => {
   const mockPi = createMockPi();
   mockPi.install();
-  mockPi.onCall({ output: 'first', exitCode: 0, delay: 20 });
-  mockPi.onCall({ output: 'second', exitCode: 0, delay: 120 });
+  mockPi.onCall({ output: 'done', exitCode: 0, delay: 20 });
+  mockPi.onCall({ output: 'done', exitCode: 0, delay: 120 });
 
   const { sessionId, ctx } = makeTestCtx('pi-subagents-stale-cohort');
   const sentMessages: string[] = [];
@@ -428,14 +519,12 @@ test('stale cohort notification failure does not suppress later final notificati
       ctx,
     );
 
-    assert.equal(firstStatus.details.result, 'first');
-    assert.equal(secondStatus.details.result, 'second');
+    assert.equal(firstStatus.details.result, 'done');
+    assert.equal(secondStatus.details.result, 'done');
     assert.equal(firstStatus.details.error, undefined);
     assert.equal(secondStatus.details.error, undefined);
-    assert.equal(sentMessages.length, 2);
+    assert.equal(sentMessages.length, 1);
     assert(sentMessages.some((message) => /All 2 subagents have completed\./.test(message)));
-    assert(sentMessages.some((message) => /stale-cohort-second/.test(message)));
-    assert(sentMessages.some((message) => /stale-cohort-first/.test(message)));
 
     const firstRecord = readPersistedRecord(sessionId, 'stale-cohort-first');
     const secondRecord = readPersistedRecord(sessionId, 'stale-cohort-second');
