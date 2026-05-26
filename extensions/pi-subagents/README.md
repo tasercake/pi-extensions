@@ -14,6 +14,7 @@ Spawn one child Pi process.
 spawn_subagent({
   task: string,
   async: boolean,
+  timeout?: number,
   keepContext: boolean,
   cwd?: string,
   outputMode: "inline" | "file",
@@ -23,6 +24,8 @@ spawn_subagent({
 
 - `async: false` blocks until the child finishes.
 - `async: true` returns immediately with an ID. Spawn multiple concurrent subagents by calling `spawn_subagent` multiple times.
+- `timeout` is optional (default 3600s = 1 hour) and measured in seconds. When reached, the parent is informed that the child is still running; the child is **not killed**.
+- Give `timeout` a healthy margin above expected runtime because child execution time can be wildly unpredictable.
 - `keepContext: true` forks the current Pi session.
 - `keepContext: false` starts a fresh child session.
 - `outputMode: "inline"` stores/returns the child result text.
@@ -39,6 +42,8 @@ Returns:
 ```ts
 { id: string, running: boolean, result?: string, error?: string }
 ```
+
+If the subagent is still running, the response includes a strong instruction not to poll.
 
 `result` is either raw text or a result-file path, depending on `outputMode`.
 

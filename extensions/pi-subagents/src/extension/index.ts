@@ -44,6 +44,7 @@ interface PersistedSubagentRecord {
 	cwd: string;
 	taskPreview: string;
 	keepContext: boolean;
+	timeout: number;
 	outputMode: OutputMode;
 	model?: string;
 	running: boolean;
@@ -57,6 +58,9 @@ interface PersistedSubagentRecord {
 	createdAt: number;
 	updatedAt: number;
 	completedAt?: number;
+	timeoutAt?: number;
+	timeoutNotified?: boolean;
+	completionNotificationPending?: boolean;
 	notifiedCompletion?: boolean;
 	pendingCompletionNotice?: boolean;
 	notifyError?: string;
@@ -69,6 +73,7 @@ interface StoreFile {
 }
 
 const STORE_ROOT = path.join(os.homedir(), ".pi", "agent", "subagents-minimal");
+const DEFAULT_TIMEOUT_SECONDS = 3600;
 const runningChildren = new Map<string, ChildProcess>();
 
 function safeName(value: string): string {
@@ -149,6 +154,7 @@ function markCompletionNoticePending(
 	return (
 		updateRecordFields(record.parentSessionId, record.id, (latest) => {
 			latest.pendingCompletionNotice = true;
+			latest.completionNotificationPending = true;
 			if (error !== undefined)
 				latest.notifyError = error instanceof Error ? error.message : String(error);
 		}) ?? record
@@ -162,6 +168,7 @@ function markCompletionNoticeSent(
 		updateRecordFields(record.parentSessionId, record.id, (latest) => {
 			latest.notifiedCompletion = true;
 			latest.pendingCompletionNotice = false;
+			latest.completionNotificationPending = false;
 			delete latest.notifyError;
 			latest.notifiedAt = Date.now();
 		}) ?? record
@@ -246,11 +253,40 @@ function resultForRecord(record: PersistedSubagentRecord): string | undefined {
 	return record.outputMode === "file" ? record.outputFile : record.result;
 }
 
+function subagentSessionId(record: PersistedSubagentRecord): string | undefined {
+	if (!record.sessionFile || !fs.existsSync(record.sessionFile)) return undefined;
+	for (const line of fs.readFileSync(record.sessionFile, "utf-8").split("\n")) {
+		if (!line.trim()) continue;
+		try {
+			const event = JSON.parse(line) as { type?: string; id?: unknown };
+			if (event.type === "session" && typeof event.id === "string") return event.id;
+		} catch {
+			continue;
+		}
+	}
+	return undefined;
+}
+
+function timeoutMessage(record: PersistedSubagentRecord): string {
+	const details = [
+		`Subagent ${record.id} timed out after ${record.timeout}s; still running; not killed`,
+	];
+	const sessionId = subagentSessionId(record);
+	if (sessionId) details.push(`sessionId=${sessionId}`);
+	if (record.pid) details.push(`pid=${record.pid}`);
+	return `${details.join("; ")}.`;
+}
+
 function formatStatus(
 	record: PersistedSubagentRecord,
 ): AgentToolResult<ToolDetails> {
 	const refreshed = refreshRecordFromDisk(record);
 	const result = resultForRecord(refreshed);
+	const timedOut = Boolean(refreshed.timeoutAt);
+	const timedOutMessage = timedOut ? timeoutMessage(refreshed) : undefined;
+	const doNotPollNotice = refreshed.running
+		? "Do not poll for the result. You will be notified when the subagent completes."
+		: undefined;
 	return {
 		content: [
 			{
@@ -260,17 +296,26 @@ function formatStatus(
 						id: refreshed.id,
 						running: refreshed.running,
 						...(result ? { result } : {}),
+						...(timedOut
+							? { timedOut: true, timeoutAt: refreshed.timeoutAt, timeoutMessage: timedOutMessage }
+							: {}),
 						...(refreshed.error ? { error: refreshed.error } : {}),
 					},
 					null,
 					2,
 				),
 			},
+			...(doNotPollNotice
+				? [{ type: "text" as const, text: doNotPollNotice }]
+				: []),
 		],
 		details: {
 			id: refreshed.id,
 			running: refreshed.running,
 			...(result ? { result } : {}),
+			...(timedOut
+				? { timedOut: true, timeoutAt: refreshed.timeoutAt, timeoutMessage: timedOutMessage }
+				: {}),
 			...(refreshed.error ? { error: refreshed.error } : {}),
 		},
 	};
@@ -294,6 +339,7 @@ function makeRecord(
 		cwd: params.cwd ? path.resolve(ctx.cwd, params.cwd) : ctx.cwd,
 		taskPreview: params.task.slice(0, 500),
 		keepContext: params.keepContext,
+		timeout: params.timeout ?? DEFAULT_TIMEOUT_SECONDS,
 		outputMode: params.outputMode,
 		...(params.model ? { model: params.model } : {}),
 		running: false,
@@ -332,6 +378,13 @@ function buildArgsForRecord(
 	});
 }
 
+function completionMessage(record: PersistedSubagentRecord): string {
+	return [
+		`Subagent ${record.id} completed.`,
+		`Call get_subagent_status({ id: "${record.id}" }) to retrieve the result.`,
+	].join("\n");
+}
+
 function notifyCompletion(
 	pi: ExtensionAPI,
 	record: PersistedSubagentRecord,
@@ -347,10 +400,7 @@ function notifyCompletion(
 	);
 	const active = cohort.filter((r) => refreshRecordFromDisk(r).running);
 	const completed = cohort.filter((r) => !refreshRecordFromDisk(r).running);
-	const parts = [
-		`Subagent ${pendingRecord.id} completed.`,
-		`Call get_subagent_status({ id: "${pendingRecord.id}" }) to retrieve the result.`,
-	];
+	const parts = completionMessage(pendingRecord).split("\n");
 	const finalCohort = active.length === 0 && cohort.length > 1;
 	if (active.length > 0) {
 		parts.splice(
@@ -414,12 +464,55 @@ function retryPendingCompletionNotices(
 		const refreshed = refreshRecordFromDisk(record);
 		if (
 			!refreshed.running &&
-			refreshed.pendingCompletionNotice &&
+			(refreshed.pendingCompletionNotice || refreshed.completionNotificationPending) &&
 			!refreshed.notifiedCompletion
 		) {
 			notifyCompletionBestEffort(pi, refreshed);
 		}
 	}
+}
+
+function markTimedOut(record: PersistedSubagentRecord): PersistedSubagentRecord {
+	const latest = findRecord(record.parentSessionId, record.id) ?? record;
+	const refreshed = refreshRecordFromDisk(latest);
+	if (!refreshed.running || refreshed.timeoutNotified) return refreshed;
+	refreshed.timeoutAt = Date.now();
+	refreshed.timeoutNotified = true;
+	refreshed.updatedAt = Date.now();
+	upsertRecord(refreshed);
+	return refreshed;
+}
+
+function notifyTimeout(
+	pi: ExtensionAPI,
+	record: PersistedSubagentRecord,
+): boolean {
+	const timedOut = markTimedOut(record);
+	if (!timedOut.running || !timedOut.timeoutNotified) return false;
+	try {
+		pi.sendMessage(
+			{
+				customType: "subagent-notify",
+				content: timeoutMessage(timedOut),
+				display: true,
+			},
+			{ triggerTurn: true },
+		);
+	} catch {
+		return false;
+	}
+	return true;
+}
+
+function startTimeoutTimer(
+	pi: ExtensionAPI,
+	record: PersistedSubagentRecord,
+	notify: boolean,
+): NodeJS.Timeout {
+	return setTimeout(() => {
+		if (notify) notifyTimeout(pi, record);
+		else markTimedOut(record);
+	}, record.timeout * 1000);
 }
 
 async function runChild(
@@ -477,6 +570,9 @@ async function runChild(
 		? fs.readFileSync(record.stderrFile, "utf-8")
 		: "";
 	const finalOutput = extractFinalOutput(stdout);
+	const latest = findRecord(record.parentSessionId, record.id);
+	if (latest?.timeoutAt) record.timeoutAt = latest.timeoutAt;
+	if (latest?.timeoutNotified) record.timeoutNotified = latest.timeoutNotified;
 	record.running = false;
 	record.completedAt = Date.now();
 	record.updatedAt = Date.now();
@@ -500,7 +596,7 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 		name: "spawn_subagent",
 		label: "Spawn subagent",
 		description:
-			"Spawn a child Pi subagent for one task. When async is true, this returns immediately, allowing the parent to spawn multiple concurrent subagents by calling spawn_subagent multiple times.",
+			"Spawn a child Pi subagent for one task. timeout is optional and measured in seconds (default 3600 = 1 hour). When async is true, this returns immediately, allowing the parent to spawn multiple concurrent subagents by calling spawn_subagent multiple times. Do not kill subagents autonomously to enforce timeout; the parent will be informed when timeout expires. Give a healthy timeout margin above expected runtime because subagent execution may be wildly unpredictable.",
 		parameters: SpawnSubagentParams,
 		async execute(
 			id,
@@ -512,25 +608,39 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 			retryPendingCompletionNotices(pi, parentSessionId(ctx));
 			const record = makeRecord(ctx, params, id);
 			if (params.async) {
-				void runChild(pi, ctx, record, params.task, true).catch((error) => {
-					record.running = false;
-					record.error = error instanceof Error ? error.message : String(error);
-					record.updatedAt = Date.now();
-					record.completedAt = Date.now();
-					upsertRecord(record);
-					notifyCompletionBestEffort(pi, record, { markPendingBeforeSend: false });
-				});
+				const childPromise = runChild(pi, ctx, record, params.task, true);
+				const timeoutTimer = startTimeoutTimer(pi, record, true);
+				void childPromise
+					.catch((error) => {
+						record.running = false;
+						record.error = error instanceof Error ? error.message : String(error);
+						record.updatedAt = Date.now();
+						record.completedAt = Date.now();
+						upsertRecord(record);
+						notifyCompletionBestEffort(pi, record, { markPendingBeforeSend: false });
+					})
+					.finally(() => clearTimeout(timeoutTimer));
 				return {
 					content: [
 						{
 							type: "text",
-							text: `Spawned subagent ${record.id}. Use get_subagent_status({ id: "${record.id}" }) to retrieve the result.`,
+							text: `Spawned subagent ${record.id}. You will be notified when this subagent completes. You can also call get_subagent_status({ id: "${record.id}" }) to retrieve the result.`,
 						},
 					],
 					details: { id: record.id, running: true },
 				};
 			}
-			const completed = await runChild(pi, ctx, record, params.task, false);
+			let timeoutTimer: NodeJS.Timeout | undefined;
+			const childPromise = runChild(pi, ctx, record, params.task, false).finally(() => {
+				if (timeoutTimer) clearTimeout(timeoutTimer);
+			});
+			const timeoutPromise = new Promise<PersistedSubagentRecord>((resolve) => {
+				timeoutTimer = setTimeout(
+					() => resolve(markTimedOut(record)),
+					record.timeout * 1000,
+				);
+			});
+			const completed = await Promise.race([childPromise, timeoutPromise]);
 			return formatStatus(completed);
 		},
 		renderCall(args, theme) {
@@ -549,7 +659,7 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 		name: "get_subagent_status",
 		label: "Get subagent status",
 		description:
-			"Get the status and result (or result file path) for a subagent.",
+			"Get the status and result (or result file path) for a subagent. If the subagent is still running, the response will instruct you not to poll.",
 		parameters: GetSubagentStatusParams,
 		execute(
 			_toolCallId: string,
