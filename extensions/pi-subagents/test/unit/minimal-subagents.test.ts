@@ -27,9 +27,42 @@ function makeTestCtx(prefix: string) {
   };
 }
 
+function storeDir(sessionId: string) {
+  return path.join(os.homedir(), '.pi', 'agent', 'subagents-minimal', sessionId);
+}
+
+function storeFile(sessionId: string) {
+  return path.join(storeDir(sessionId), 'subagents.json');
+}
+
 function cleanupTestCtx(ctx: { cwd: string }, sessionId: string) {
   fs.rmSync(ctx.cwd, { recursive: true, force: true });
-  fs.rmSync(path.join(os.homedir(), '.pi', 'agent', 'subagents-minimal', sessionId), { recursive: true, force: true });
+  fs.rmSync(storeDir(sessionId), { recursive: true, force: true });
+}
+
+function readPersistedRecord(sessionId: string, id: string) {
+  const store = JSON.parse(fs.readFileSync(storeFile(sessionId), 'utf-8')) as {
+    records: Array<Record<string, any>>;
+  };
+  const record = store.records.find((candidate) => candidate.id === id);
+  assert(record, `expected persisted record ${id}`);
+  return record;
+}
+
+async function waitForPersistedRecord(
+  sessionId: string,
+  id: string,
+  ready: (record: Record<string, any>) => boolean = (record) => !record.running,
+) {
+  let record: Record<string, any> | undefined;
+  for (let i = 0; i < 100; i++) {
+    try {
+      record = readPersistedRecord(sessionId, id);
+      if (ready(record)) return record;
+    } catch {}
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  return record ?? readPersistedRecord(sessionId, id);
 }
 
 function registerTestTools(sendMessage: (...args: unknown[]) => void) {
@@ -160,14 +193,14 @@ test('child pi args do not restrict tools skills extensions or MCP', () => {
   assert(built.args.includes('--extension'));
 });
 
-test('async completion persists success when stale extension context rejects notification', async () => {
+test('async completion persists success and pending metadata when stale notification fails', async () => {
   const mockPi = createMockPi();
   mockPi.install();
   mockPi.onCall({ output: 'done', exitCode: 0 });
 
   const { sessionId, ctx } = makeTestCtx('pi-subagents-stale');
   let notifyAttempts = 0;
-  const { spawnTool, statusTool } = registerTestTools(() => {
+  const { spawnTool } = registerTestTools(() => {
     notifyAttempts += 1;
     throw new Error('This extension ctx is stale after session replacement or reload.');
   });
@@ -181,12 +214,162 @@ test('async completion persists success when stale extension context rejects not
       ctx,
     );
 
-    const status = await waitForStatus(statusTool, 'stale-notify-child', ctx);
+    const record = await waitForPersistedRecord(
+      sessionId,
+      'stale-notify-child',
+      (candidate) => !candidate.running && candidate.pendingCompletionNotice === true,
+    );
 
-    assert.equal(status.details.running, false);
+    assert.equal(record.running, false);
+    assert.equal(record.result, 'done');
+    assert.equal(record.error, undefined);
+    assert.equal(record.pendingCompletionNotice, true);
+    assert.match(record.notifyError, /stale after session replacement or reload/);
+    assert.equal(record.notifiedCompletion, undefined);
+    assert.equal(notifyAttempts, 1);
+  } finally {
+    mockPi.uninstall();
+    cleanupTestCtx(ctx, sessionId);
+  }
+});
+
+test('get_subagent_status retries and clears a pending completion notice', async () => {
+  const mockPi = createMockPi();
+  mockPi.install();
+  mockPi.onCall({ output: 'done', exitCode: 0 });
+
+  const { sessionId, ctx } = makeTestCtx('pi-subagents-retry-status');
+  const sentMessages: string[] = [];
+  let notifyAttempts = 0;
+  const { spawnTool, statusTool } = registerTestTools((message) => {
+    notifyAttempts += 1;
+    if (notifyAttempts === 1) {
+      throw new Error('This extension ctx is stale after session replacement or reload.');
+    }
+    const content = (message as { content?: unknown }).content;
+    if (typeof content === 'string') sentMessages.push(content);
+  });
+
+  try {
+    await spawnTool.execute(
+      'retry-status-child',
+      { task: 'finish', async: true, keepContext: false, outputMode: 'inline' },
+      new AbortController().signal,
+      undefined,
+      ctx,
+    );
+    await waitForPersistedRecord(
+      sessionId,
+      'retry-status-child',
+      (candidate) => !candidate.running && candidate.pendingCompletionNotice === true,
+    );
+
+    const status = await statusTool.execute(
+      'retry-status-call',
+      { id: 'retry-status-child' },
+      new AbortController().signal,
+      undefined,
+      ctx,
+    );
+    const record = readPersistedRecord(sessionId, 'retry-status-child');
+
     assert.equal(status.details.result, 'done');
     assert.equal(status.details.error, undefined);
-    assert.equal(notifyAttempts, 1);
+    assert.equal(notifyAttempts, 2);
+    assert.equal(sentMessages.length, 1);
+    assert.equal(record.pendingCompletionNotice, false);
+    assert.equal(record.notifyError, undefined);
+    assert.equal(record.notifiedCompletion, true);
+    assert.equal(typeof record.notifiedAt, 'number');
+  } finally {
+    mockPi.uninstall();
+    cleanupTestCtx(ctx, sessionId);
+  }
+});
+
+test('list_subagents retries pending completion notices best-effort', async () => {
+  const mockPi = createMockPi();
+  mockPi.install();
+  mockPi.onCall({ output: 'done', exitCode: 0 });
+
+  const { sessionId, ctx } = makeTestCtx('pi-subagents-retry-list');
+  const sentMessages: string[] = [];
+  let notifyAttempts = 0;
+  const { spawnTool, listTool } = registerTestTools((message) => {
+    notifyAttempts += 1;
+    if (notifyAttempts === 1) {
+      throw new Error('This extension ctx is stale after session replacement or reload.');
+    }
+    const content = (message as { content?: unknown }).content;
+    if (typeof content === 'string') sentMessages.push(content);
+  });
+
+  try {
+    await spawnTool.execute(
+      'retry-list-child',
+      { task: 'finish', async: true, keepContext: false, outputMode: 'inline' },
+      new AbortController().signal,
+      undefined,
+      ctx,
+    );
+    await waitForPersistedRecord(
+      sessionId,
+      'retry-list-child',
+      (candidate) => !candidate.running && candidate.pendingCompletionNotice === true,
+    );
+
+    const listed = await listTool.execute(
+      'retry-list-call',
+      {},
+      new AbortController().signal,
+      undefined,
+      ctx,
+    );
+    const record = readPersistedRecord(sessionId, 'retry-list-child');
+
+    assert.deepEqual(listed.details.subagents, [{ id: 'retry-list-child', running: false }]);
+    assert.equal(notifyAttempts, 2);
+    assert.equal(sentMessages.length, 1);
+    assert.equal(record.pendingCompletionNotice, false);
+    assert.equal(record.notifiedCompletion, true);
+  } finally {
+    mockPi.uninstall();
+    cleanupTestCtx(ctx, sessionId);
+  }
+});
+
+test('notification failures do not overwrite successful child result', async () => {
+  const mockPi = createMockPi();
+  mockPi.install();
+  mockPi.onCall({ output: 'done despite notify failure', exitCode: 0 });
+
+  const { sessionId, ctx } = makeTestCtx('pi-subagents-notify-failure');
+  let notifyAttempts = 0;
+  const { spawnTool, statusTool } = registerTestTools(() => {
+    notifyAttempts += 1;
+    throw new Error('transport unavailable');
+  });
+
+  try {
+    await spawnTool.execute(
+      'notify-failure-child',
+      { task: 'finish', async: true, keepContext: false, outputMode: 'inline' },
+      new AbortController().signal,
+      undefined,
+      ctx,
+    );
+
+    const status = await waitForStatus(statusTool, 'notify-failure-child', ctx);
+    const record = readPersistedRecord(sessionId, 'notify-failure-child');
+
+    assert.equal(status.details.running, false);
+    assert.equal(status.details.result, 'done despite notify failure');
+    assert.equal(status.details.error, undefined);
+    assert.equal(record.result, 'done despite notify failure');
+    assert.equal(record.error, undefined);
+    assert.equal(record.pendingCompletionNotice, true);
+    assert.match(record.notifyError, /transport unavailable/);
+    assert(notifyAttempts >= 1);
   } finally {
     mockPi.uninstall();
     cleanupTestCtx(ctx, sessionId);
@@ -227,17 +410,39 @@ test('stale cohort notification failure does not suppress later final notificati
       ctx,
     );
 
-    const firstStatus = await waitForStatus(statusTool, 'stale-cohort-first', ctx);
-    const secondStatus = await waitForStatus(statusTool, 'stale-cohort-second', ctx);
+    await waitForPersistedRecord(sessionId, 'stale-cohort-first');
+    await waitForPersistedRecord(sessionId, 'stale-cohort-second');
+
+    const firstStatus = await statusTool.execute(
+      'stale-cohort-first-status',
+      { id: 'stale-cohort-first' },
+      new AbortController().signal,
+      undefined,
+      ctx,
+    );
+    const secondStatus = await statusTool.execute(
+      'stale-cohort-second-status',
+      { id: 'stale-cohort-second' },
+      new AbortController().signal,
+      undefined,
+      ctx,
+    );
 
     assert.equal(firstStatus.details.result, 'first');
     assert.equal(secondStatus.details.result, 'second');
     assert.equal(firstStatus.details.error, undefined);
     assert.equal(secondStatus.details.error, undefined);
-    assert.equal(notifyAttempts, 2);
-    assert.equal(sentMessages.length, 1);
-    assert.match(sentMessages[0], /All 2 subagents have completed\./);
-    assert.match(sentMessages[0], /stale-cohort-second/);
+    assert.equal(sentMessages.length, 2);
+    assert(sentMessages.some((message) => /All 2 subagents have completed\./.test(message)));
+    assert(sentMessages.some((message) => /stale-cohort-second/.test(message)));
+    assert(sentMessages.some((message) => /stale-cohort-first/.test(message)));
+
+    const firstRecord = readPersistedRecord(sessionId, 'stale-cohort-first');
+    const secondRecord = readPersistedRecord(sessionId, 'stale-cohort-second');
+    assert.equal(firstRecord.pendingCompletionNotice, false);
+    assert.equal(firstRecord.notifiedCompletion, true);
+    assert.equal(secondRecord.pendingCompletionNotice, false);
+    assert.equal(secondRecord.notifiedCompletion, true);
   } finally {
     mockPi.uninstall();
     cleanupTestCtx(ctx, sessionId);
