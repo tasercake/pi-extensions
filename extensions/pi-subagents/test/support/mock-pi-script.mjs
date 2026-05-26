@@ -73,7 +73,11 @@ function writeSessionFile(args) {
 		const sessionFile = args[i + 1];
 		if (!sessionFile) return;
 		fs.mkdirSync(path.dirname(sessionFile), { recursive: true });
-		fs.writeFileSync(sessionFile, "", { flag: "a" });
+		fs.writeFileSync(
+			sessionFile,
+			`${JSON.stringify({ type: "session", id: `mock-session-${process.pid}` })}\n`,
+			{ flag: "a" },
+		);
 		return;
 	}
 }

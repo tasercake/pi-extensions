@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
+import { spawnSync } from 'node:child_process';
 import * as path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import registerSubagentExtension from '../../src/extension/index.ts';
@@ -65,6 +66,79 @@ async function waitForPersistedRecord(
   return record ?? readPersistedRecord(sessionId, id);
 }
 
+function freshCtxForSameSession(ctx: { cwd: string }, sessionId: string) {
+  return {
+    cwd: ctx.cwd,
+    sessionManager: {
+      getSessionFile: () => sessionId,
+      getSessionId: () => sessionId,
+    },
+  };
+}
+
+function readSubagentStore(sessionId: string) {
+  const storePath = path.join(os.homedir(), '.pi', 'agent', 'subagents-minimal', sessionId, 'subagents.json');
+  return JSON.parse(fs.readFileSync(storePath, 'utf-8')) as { records: Array<Record<string, unknown>> };
+}
+
+function readSubagentRecord(sessionId: string, id: string) {
+  const record = readSubagentStore(sessionId).records.find((r) => r.id === id);
+  assert.ok(record, `missing subagent record ${id}`);
+  return record;
+}
+
+async function waitForSubagentRecord(
+  sessionId: string,
+  id: string,
+  predicate: (record: Record<string, unknown>) => boolean,
+) {
+  for (let i = 0; i < 100; i++) {
+    const record = readSubagentRecord(sessionId, id);
+    if (predicate(record)) return record;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  return readSubagentRecord(sessionId, id);
+}
+
+function executeSubagentToolInFreshProcess(args: {
+  sessionId: string;
+  cwd: string;
+  tool: 'get_subagent_status' | 'list_subagents';
+  id?: string;
+}) {
+  const script = `
+    import registerSubagentExtension from ${JSON.stringify(path.join(projectRoot, 'src/extension/index.ts'))};
+    const messages = [];
+    const registered = new Map();
+    registerSubagentExtension({
+      registerTool(tool) { registered.set(tool.name, tool); },
+      sendMessage(message) { messages.push(message); },
+    });
+    const ctx = {
+      cwd: ${JSON.stringify(args.cwd)},
+      sessionManager: {
+        getSessionFile: () => ${JSON.stringify(args.sessionId)},
+        getSessionId: () => ${JSON.stringify(args.sessionId)},
+      },
+    };
+    const tool = registered.get(${JSON.stringify(args.tool)});
+    const result = await tool.execute(
+      'fresh-runtime-tool-call',
+      ${JSON.stringify(args.tool === 'get_subagent_status' ? { id: args.id } : {})},
+      new AbortController().signal,
+      undefined,
+      ctx,
+    );
+    console.log(JSON.stringify({ messages, result }));
+  `;
+  const result = spawnSync(process.execPath, ['--experimental-strip-types', '--input-type=module', '-e', script], {
+    cwd: projectRoot,
+    encoding: 'utf-8',
+  });
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+  return JSON.parse(result.stdout) as { messages: Array<{ content?: unknown }>; result: unknown };
+}
+
 function registerTestTools(sendMessage: (...args: unknown[]) => void) {
   const registered = new Map<string, any>();
   const fakePi = {
@@ -99,7 +173,9 @@ async function waitForStatus(statusTool: any, id: string, ctx: unknown) {
 
 test('schemas expose minimal three-tool parameter shapes', async () => {
   assert.equal(SpawnSubagentParams.additionalProperties, false);
-  assert.deepEqual(Object.keys(SpawnSubagentParams.properties).sort(), ['async', 'cwd', 'keepContext', 'model', 'outputMode', 'task'].sort());
+  assert.deepEqual(Object.keys(SpawnSubagentParams.properties).sort(), ['async', 'cwd', 'keepContext', 'model', 'outputMode', 'task', 'timeout'].sort());
+  assert.match(SpawnSubagentParams.properties.timeout.description, /Do not kill/i);
+  assert.match(SpawnSubagentParams.properties.timeout.description, /healthy timeout margin/i);
   assert.equal(GetSubagentStatusParams.additionalProperties, false);
   assert.deepEqual(Object.keys(GetSubagentStatusParams.properties), ['id']);
   assert.equal(ListSubagentsParams.additionalProperties, false);
@@ -208,7 +284,7 @@ test('async completion persists success and pending metadata when stale notifica
   try {
     await spawnTool.execute(
       'stale-notify-child',
-      { task: 'finish', async: true, keepContext: false, outputMode: 'inline' },
+      { task: 'finish', async: true, keepContext: false, outputMode: 'inline', timeout: 30 },
       new AbortController().signal,
       undefined,
       ctx,
@@ -467,6 +543,133 @@ test('stale final cohort notification failure leaves cohort pending until retry 
   }
 });
 
+test('async timeout notifies parent without killing child', async () => {
+  const mockPi = createMockPi();
+  mockPi.install();
+  mockPi.onCall({ output: 'slow done', exitCode: 0, delay: 150 });
+
+  const { sessionId, ctx } = makeTestCtx('pi-subagents-timeout');
+  const sentMessages: string[] = [];
+  const { spawnTool, statusTool } = registerTestTools((message) => {
+    const content = (message as { content?: unknown }).content;
+    if (typeof content === 'string') sentMessages.push(content);
+  });
+
+  try {
+    await spawnTool.execute(
+      'timeout-child',
+      { task: 'slow', async: true, keepContext: false, outputMode: 'inline', timeout: 0.05 },
+      new AbortController().signal,
+      undefined,
+      ctx,
+    );
+
+    await new Promise((resolve) => setTimeout(resolve, 90));
+    const timedOutStatus = await statusTool.execute(
+      'status-timeout-child-timeout',
+      { id: 'timeout-child' },
+      new AbortController().signal,
+      undefined,
+      ctx,
+    );
+
+    assert.equal(timedOutStatus.details.running, true);
+    assert.equal(timedOutStatus.details.timedOut, true);
+    assert.match(timedOutStatus.details.timeoutMessage, /sessionId=mock-session-/);
+    assert.match(timedOutStatus.details.timeoutMessage, /pid=\d+/);
+    assert.equal(sentMessages.length, 1);
+    assert.match(sentMessages[0], /timed out after 0.05s/);
+    assert.match(sentMessages[0], /not killed/);
+    assert.match(sentMessages[0], /sessionId=mock-session-/);
+    assert.match(sentMessages[0], /pid=\d+/);
+
+    const finalStatus = await waitForStatus(statusTool, 'timeout-child', ctx);
+    assert.equal(finalStatus.details.running, false);
+    assert.equal(finalStatus.details.result, 'slow done');
+    assert.equal(finalStatus.details.timedOut, true);
+  } finally {
+    mockPi.uninstall();
+    cleanupTestCtx(ctx, sessionId);
+  }
+});
+
+test('stale async completion notification remains pending and is retried once by the next live tool call', async () => {
+  const mockPi = createMockPi();
+  mockPi.install();
+  mockPi.onCall({ output: 'done after stale ctx', exitCode: 0 });
+
+  const childId = 'stale-retry-child';
+  const { sessionId, ctx } = makeTestCtx('pi-subagents-stale-retry');
+  let staleNotifyAttempts = 0;
+  const staleTools = registerTestTools(() => {
+    staleNotifyAttempts += 1;
+    throw new Error('This extension ctx is stale after session replacement or reload.');
+  });
+
+  try {
+    await staleTools.spawnTool.execute(
+      childId,
+      { task: 'finish after stale notify', async: true, keepContext: false, outputMode: 'inline', timeout: 30 },
+      new AbortController().signal,
+      undefined,
+      ctx,
+    );
+
+    const completedRecord = await waitForSubagentRecord(
+      sessionId,
+      childId,
+      (record) => record.running === false && record.result === 'done after stale ctx',
+    );
+    assert.equal(completedRecord.running, false);
+    assert.equal(completedRecord.result, 'done after stale ctx');
+
+    const recordAfterStaleFailure = await waitForSubagentRecord(
+      sessionId,
+      childId,
+      (record) => record.completionNotificationPending === true,
+    );
+    assert.equal(staleNotifyAttempts, 1);
+    assert.equal(recordAfterStaleFailure.completionNotificationPending, true);
+    assert.notEqual(recordAfterStaleFailure.notifiedCompletion, true);
+    assert.match(String(recordAfterStaleFailure.notifyError), /stale after session replacement or reload/);
+
+    // Contract: every subagent tool execution first drains durable pending notices
+    // for its current parent session. This phase runs in a separate Node process
+    // so the retry must come from persisted state, not module-level memory.
+    const retry = executeSubagentToolInFreshProcess({
+      sessionId,
+      cwd: ctx.cwd,
+      tool: 'get_subagent_status',
+      id: childId,
+    });
+
+    const retriedNotifications = retry.messages
+      .map((message) => message.content)
+      .filter((content): content is string => typeof content === 'string');
+    assert.equal(retriedNotifications.length, 1);
+    assert.match(retriedNotifications[0], /Subagent stale-retry-child completed\./);
+    const retryStatus = retry.result as { details: { id: string; running: boolean; result: string } };
+    assert.equal(retryStatus.details.id, childId);
+    assert.equal(retryStatus.details.running, false);
+    assert.equal(retryStatus.details.result, 'done after stale ctx');
+
+    const recordAfterRetry = readSubagentRecord(sessionId, childId);
+    assert.notEqual(recordAfterRetry.completionNotificationPending, true);
+    assert.equal(recordAfterRetry.notifiedCompletion, true);
+
+    const duplicateCheck = executeSubagentToolInFreshProcess({
+      sessionId,
+      cwd: ctx.cwd,
+      tool: 'list_subagents',
+    });
+
+    assert.equal(duplicateCheck.messages.length, 0);
+  } finally {
+    mockPi.uninstall();
+    cleanupTestCtx(ctx, sessionId);
+  }
+});
+
 test('stale cohort notification failure does not suppress later final notification', async () => {
   const mockPi = createMockPi();
   mockPi.install();
@@ -488,14 +691,14 @@ test('stale cohort notification failure does not suppress later final notificati
   try {
     await spawnTool.execute(
       'stale-cohort-first',
-      { task: 'finish first', async: true, keepContext: false, outputMode: 'inline' },
+      { task: 'finish first', async: true, keepContext: false, outputMode: 'inline', timeout: 30 },
       new AbortController().signal,
       undefined,
       ctx,
     );
     await spawnTool.execute(
       'stale-cohort-second',
-      { task: 'finish second', async: true, keepContext: false, outputMode: 'inline' },
+      { task: 'finish second', async: true, keepContext: false, outputMode: 'inline', timeout: 30 },
       new AbortController().signal,
       undefined,
       ctx,
