@@ -593,6 +593,121 @@ test('async timeout notifies parent without killing child', async () => {
   }
 });
 
+test('stale async timeout notification remains pending and is retried by the next live tool call', async () => {
+  const mockPi = createMockPi();
+  mockPi.install();
+  mockPi.onCall({ output: 'eventually done after stale timeout', exitCode: 0, delay: 500 });
+
+  const childId = 'stale-timeout-retry-child';
+  const { sessionId, ctx } = makeTestCtx('pi-subagents-stale-timeout-retry');
+  let staleTimeoutAttempts = 0;
+  const staleTools = registerTestTools(() => {
+    staleTimeoutAttempts += 1;
+    throw new Error('This extension ctx is stale after session replacement or reload.');
+  });
+
+  try {
+    await staleTools.spawnTool.execute(
+      childId,
+      { task: 'slow timeout then finish', async: true, keepContext: false, outputMode: 'inline', timeout: 0.05 },
+      new AbortController().signal,
+      undefined,
+      ctx,
+    );
+
+    const recordAfterStaleTimeout = await waitForSubagentRecord(
+      sessionId,
+      childId,
+      (record) => record.running === true && record.pendingTimeoutNotice === true,
+    );
+    assert.equal(recordAfterStaleTimeout.running, true);
+    assert.equal(recordAfterStaleTimeout.pendingTimeoutNotice, true);
+    assert.notEqual(recordAfterStaleTimeout.timeoutNotified, true);
+    assert.match(String(recordAfterStaleTimeout.timeoutNotifyError), /stale after session replacement or reload/);
+    assert.equal(staleTimeoutAttempts, 1);
+
+    const retry = executeSubagentToolInFreshProcess({
+      sessionId,
+      cwd: ctx.cwd,
+      tool: 'get_subagent_status',
+      id: childId,
+    });
+
+    const timeoutNotifications = retry.messages
+      .map((message) => message.content)
+      .filter((content): content is string => typeof content === 'string' && /timed out after 0.05s/.test(content));
+    assert.equal(timeoutNotifications.length, 1);
+    assert.match(timeoutNotifications[0], /not killed/);
+
+    const recordAfterRetry = readSubagentRecord(sessionId, childId);
+    assert.notEqual(recordAfterRetry.pendingTimeoutNotice, true);
+    assert.equal(recordAfterRetry.timeoutNotified, true);
+    assert.equal(recordAfterRetry.timeoutNotifyError, undefined);
+
+    const finalStatus = await waitForStatus(staleTools.statusTool, childId, ctx);
+    assert.equal(finalStatus.details.running, false);
+    assert.equal(finalStatus.details.result, 'eventually done after stale timeout');
+    assert.equal(finalStatus.details.timedOut, true);
+  } finally {
+    mockPi.uninstall();
+    cleanupTestCtx(ctx, sessionId);
+  }
+});
+
+test('stale async timeout notification is not retried after child completion', async () => {
+  const mockPi = createMockPi();
+  mockPi.install();
+  mockPi.onCall({ output: 'done before timeout retry', exitCode: 0, delay: 90 });
+
+  const childId = 'stale-timeout-completed-child';
+  const { sessionId, ctx } = makeTestCtx('pi-subagents-stale-timeout-completed');
+  const staleTools = registerTestTools(() => {
+    throw new Error('This extension ctx is stale after session replacement or reload.');
+  });
+
+  try {
+    await staleTools.spawnTool.execute(
+      childId,
+      { task: 'finish before timeout retry', async: true, keepContext: false, outputMode: 'inline', timeout: 0.02 },
+      new AbortController().signal,
+      undefined,
+      ctx,
+    );
+
+    await waitForSubagentRecord(
+      sessionId,
+      childId,
+      (record) => record.running === true && record.pendingTimeoutNotice === true,
+    );
+    await waitForSubagentRecord(
+      sessionId,
+      childId,
+      (record) => record.running === false && record.result === 'done before timeout retry',
+    );
+
+    const retry = executeSubagentToolInFreshProcess({
+      sessionId,
+      cwd: ctx.cwd,
+      tool: 'list_subagents',
+    });
+
+    const messages = retry.messages
+      .map((message) => message.content)
+      .filter((content): content is string => typeof content === 'string');
+    assert.equal(messages.some((content) => /timed out after 0.02s/.test(content)), false);
+
+    const recordAfterRetry = readSubagentRecord(sessionId, childId);
+    assert.notEqual(recordAfterRetry.pendingTimeoutNotice, true);
+    assert.notEqual(recordAfterRetry.timeoutNotified, true);
+    assert.equal(recordAfterRetry.result, 'done before timeout retry');
+    assert.ok(recordAfterRetry.timeoutAt);
+  } finally {
+    mockPi.uninstall();
+    cleanupTestCtx(ctx, sessionId);
+  }
+});
+
+
 test('stale async completion notification remains pending and is retried once by the next live tool call', async () => {
   const mockPi = createMockPi();
   mockPi.install();
