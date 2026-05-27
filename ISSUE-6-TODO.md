@@ -7,5 +7,6 @@ Parent-managed checklist for `docs/plans/issue-6-fix-plan.md`.
 - [x] Add regression tests for stale timeout notification retry and no retry after completion.
 - [x] Run package validation (`PI_SUBAGENT_DEPTH=0 npm test`; inherited subagent depth otherwise blocks mock child runs).
 - [x] Review git status for original repo and worktree.
-- [ ] Commit, push, open PR referencing and resolving `tasercake/cc-connect#6`.
+- [x] Commit and push branch.
+- [ ] Open PR referencing and resolving `tasercake/cc-connect#6`.
 - [ ] Verify PR diff/tests/mergeability, then merge PR at the end.

@@ -654,6 +654,68 @@ test('stale async timeout notification remains pending and is retried by the nex
   }
 });
 
+test('spawn_subagent retries a pending timeout notification before starting new work', async () => {
+  const mockPi = createMockPi();
+  mockPi.install();
+  mockPi.onCall({ output: 'first eventually done', exitCode: 0, delay: 500 });
+
+  const childId = 'stale-timeout-spawn-retry-child';
+  const { sessionId, ctx } = makeTestCtx('pi-subagents-stale-timeout-spawn-retry');
+  let staleTimeoutAttempts = 0;
+  const staleTools = registerTestTools(() => {
+    staleTimeoutAttempts += 1;
+    throw new Error('This extension ctx is stale after session replacement or reload.');
+  });
+
+  try {
+    await staleTools.spawnTool.execute(
+      childId,
+      { task: 'timeout before next spawn', async: true, keepContext: false, outputMode: 'inline', timeout: 0.05 },
+      new AbortController().signal,
+      undefined,
+      ctx,
+    );
+
+    await waitForSubagentRecord(
+      sessionId,
+      childId,
+      (record) => record.running === true && record.pendingTimeoutNotice === true,
+    );
+    assert.equal(staleTimeoutAttempts, 1);
+
+    mockPi.onCall({ output: 'trigger done', exitCode: 0 });
+    const retryMessages: string[] = [];
+    const retryTools = registerTestTools((message) => {
+      const content = (message as { content?: unknown }).content;
+      if (typeof content === 'string') retryMessages.push(content);
+    });
+
+    await retryTools.spawnTool.execute(
+      'timeout-retry-trigger-child',
+      { task: 'trigger retry', async: true, keepContext: false, outputMode: 'inline', timeout: 30 },
+      new AbortController().signal,
+      undefined,
+      ctx,
+    );
+
+    const timeoutNotifications = retryMessages.filter((content) => /timed out after 0.05s/.test(content));
+    assert.equal(timeoutNotifications.length, 1);
+    assert.match(timeoutNotifications[0], /Subagent stale-timeout-spawn-retry-child timed out/);
+
+    const recordAfterRetry = readSubagentRecord(sessionId, childId);
+    assert.notEqual(recordAfterRetry.pendingTimeoutNotice, true);
+    assert.equal(recordAfterRetry.timeoutNotified, true);
+    assert.equal(recordAfterRetry.timeoutNotifyError, undefined);
+
+    const finalStatus = await waitForStatus(retryTools.statusTool, childId, ctx);
+    assert.equal(finalStatus.details.running, false);
+    assert.equal(finalStatus.details.result, 'first eventually done');
+  } finally {
+    mockPi.uninstall();
+    cleanupTestCtx(ctx, sessionId);
+  }
+});
+
 test('stale async timeout notification is not retried after child completion', async () => {
   const mockPi = createMockPi();
   mockPi.install();
