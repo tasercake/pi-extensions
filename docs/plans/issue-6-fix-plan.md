@@ -1,52 +1,68 @@
-# Issue 6 Fix Plan: Stale Pi Extension Context in Async Subagent Notifications
+# Issue 6 Fix Plan: durable stale-context timeout notifications
 
 ## Scope
 
 Repository: `tasercake/pi-extensions` only.
 
-`cc-connect` changes are not needed. The issue evidence shows `cc-connect` only surfaced a Pi extension error; the stale context was created by `pi-subagents` async background notification using a captured session-bound `pi` object after parent session replacement/reload.
+`cc-connect` is the messenger/trigger surface for the observed Pi extension error, but the confirmed stale-context bug lives in `extensions/pi-subagents`. Current `pi-extensions` main already fixes the original async completion notification failure path; the remaining surgical gap is the delayed async timeout notification path.
 
-## Root Causes Addressed
+## Root causes addressed
 
-1. Async `spawn_subagent` completion notification uses captured `ExtensionAPI` after the parent Pi runtime/session may be stale.
-2. `pi.sendMessage(..., { triggerTurn: true })` can throw `This extension ctx is stale after session replacement or reload` after child completion.
-3. Notification failures must not overwrite or poison the already-persisted child result.
-4. Cohort final-notified state must only be persisted after the final notification send succeeds.
-5. Disk-backed `get_subagent_status` / `list_subagents` must remain able to retrieve results and retry pending notices after parent reload/replacement.
+Issue #6 root-cause findings require delayed background notifications to tolerate a parent Pi extension context becoming stale after session replacement/reload. Current code handles completion notifications with durable pending state and retry, but timeout notifications still have the same captured-`pi` delayed-send risk:
 
-## Existing Fix Baseline
+- `extensions/pi-subagents/src/extension/index.ts:markTimedOut` sets `timeoutNotified = true` before a timeout notification is successfully sent.
+- `notifyTimeout` catches `pi.sendMessage` failure and returns `false`, so stale ctx errors are non-fatal, but the timeout notice is silently lost and will not be retried.
+- This misses the issue-context direction to apply stale-context handling to all delayed background notifications, including timeout paths.
 
-The current branch already contains the main implementation in `extensions/pi-subagents/src/extension/index.ts`:
+## Concrete implementation
 
-- `notifyCompletion()` catches `pi.sendMessage` failures, records a pending notice, and returns `false`.
-- `notifyCompletionBestEffort()` ensures notification bookkeeping failures do not turn child success into child failure.
-- `runChild()` persists child result before best-effort notification.
-- `retryPendingCompletionNotices()` retries pending notices from later tool calls.
-- `cohortFinalNotified` is written only after successful final-cohort send.
+1. Update `extensions/pi-subagents/src/extension/index.ts`.
+   - Extend `PersistedSubagentRecord` with durable timeout notification bookkeeping:
+     - `pendingTimeoutNotice?: boolean`
+     - `timeoutNotifyError?: string`
+     - `timeoutNotifiedAt?: number`
+   - Split timeout occurrence from timeout notification success:
+     - `markTimedOut(record)` records `timeoutAt` and pending timeout notice state, but does not set `timeoutNotified = true`.
+     - Preserve idempotence and existing `timedOut` status semantics via `timeoutAt`.
+   - Add timeout notice helpers analogous to completion helpers:
+     - `markTimeoutNoticePending(record, error?)`
+     - `markTimeoutNoticeSent(record)`
+   - Change `notifyTimeout(pi, record)` so it:
+     - marks/refreshes timeout state,
+     - skips notification if the child is no longer running,
+     - on `sendMessage` failure persists pending timeout notice and error without marking success,
+     - on success clears pending/error state and sets `timeoutNotified = true`/`timeoutNotifiedAt`.
+   - Add `retryPendingTimeoutNotices(pi, parentId)` and call it from live tool executions alongside `retryPendingCompletionNotices` in:
+     - `spawn_subagent.execute`,
+     - `get_subagent_status.execute`,
+     - `list_subagents.execute`.
+   - Retry only while the child is still running and has `timeoutAt`; do not send stale timeout notices after a child has completed.
 
-Current tests in `extensions/pi-subagents/test/unit/minimal-subagents.test.ts` already cover stale single completion, retry via status/list, generic notification failure, and stale non-final cohort notification.
-
-## Surgical Additional Work
-
-Add one missing regression test for the final-cohort failure edge case:
-
-- File: `extensions/pi-subagents/test/unit/minimal-subagents.test.ts`
-- New test: when the final cohort completion notification send fails with the stale-context error, both child results remain persisted, both records retain `pendingCompletionNotice=true`, and neither record is marked `cohortFinalNotified`.
-- Then verify a later `get_subagent_status` retry can send the final cohort notification and clear pending metadata for both records.
-
-This directly proves root cause #4 for the exact highest-risk branch: `finalCohort === true` and `pi.sendMessage` throws.
+2. Add regression coverage in `extensions/pi-subagents/test/unit/minimal-subagents.test.ts`.
+   - Test stale async timeout notification remains pending and is retried by the next live tool call:
+     - spawn an async child with a very short timeout and delayed completion,
+     - make the initial timeout `sendMessage` throw `This extension ctx is stale after session replacement or reload`,
+     - assert the record has `timeoutAt`, pending timeout notice state, no `timeoutNotified`, and recorded error,
+     - execute a later status/list call with a live `pi`,
+     - assert exactly one timeout message is sent, pending state clears, and the child eventually completes successfully.
+   - Test no timeout retry is sent after the child has already completed:
+     - create the same stale pending timeout state,
+     - wait for child completion before the next live tool call,
+     - assert no timeout retry message is sent for the completed child and result remains successful.
 
 ## Validation
 
-Run from `extensions/pi-subagents`:
+Run from the worktree:
 
 ```bash
-npm test -- --test-name-pattern='stale|pending|notification|cohort'
+cd extensions/pi-subagents
 npm test
 ```
 
-If dependencies are missing, install with `npm install` in the worktree only, then rerun tests. Do not modify or commit dependency artifacts unless the package manager intentionally updates tracked lockfiles.
+Also run any available package typecheck/format script if present in `package.json`.
 
-## PR Scope
+## Non-goals
 
-Open one PR against `tasercake/pi-extensions` referencing and resolving `tasercake/cc-connect#6`.
+- No `cc-connect` code changes.
+- No issue comments/labels/state changes.
+- No broad notification redesign beyond durable timeout notification retry semantics.

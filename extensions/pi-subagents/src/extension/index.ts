@@ -60,6 +60,9 @@ interface PersistedSubagentRecord {
 	completedAt?: number;
 	timeoutAt?: number;
 	timeoutNotified?: boolean;
+	pendingTimeoutNotice?: boolean;
+	timeoutNotifyError?: string;
+	timeoutNotifiedAt?: number;
 	completionNotificationPending?: boolean;
 	notifiedCompletion?: boolean;
 	pendingCompletionNotice?: boolean;
@@ -171,6 +174,44 @@ function markCompletionNoticeSent(
 			latest.completionNotificationPending = false;
 			delete latest.notifyError;
 			latest.notifiedAt = Date.now();
+		}) ?? record
+	);
+}
+
+function markTimeoutNoticePending(
+	record: PersistedSubagentRecord,
+	error?: unknown,
+): PersistedSubagentRecord {
+	return (
+		updateRecordFields(record.parentSessionId, record.id, (latest) => {
+			latest.pendingTimeoutNotice = true;
+			latest.timeoutNotified = false;
+			if (error !== undefined)
+				latest.timeoutNotifyError = error instanceof Error ? error.message : String(error);
+		}) ?? record
+	);
+}
+
+function markTimeoutNoticeSent(
+	record: PersistedSubagentRecord,
+): PersistedSubagentRecord {
+	return (
+		updateRecordFields(record.parentSessionId, record.id, (latest) => {
+			latest.timeoutNotified = true;
+			latest.pendingTimeoutNotice = false;
+			delete latest.timeoutNotifyError;
+			latest.timeoutNotifiedAt = Date.now();
+		}) ?? record
+	);
+}
+
+function markTimeoutNoticeSkipped(
+	record: PersistedSubagentRecord,
+): PersistedSubagentRecord {
+	return (
+		updateRecordFields(record.parentSessionId, record.id, (latest) => {
+			latest.pendingTimeoutNotice = false;
+			delete latest.timeoutNotifyError;
 		}) ?? record
 	);
 }
@@ -472,12 +513,44 @@ function retryPendingCompletionNotices(
 	}
 }
 
-function markTimedOut(record: PersistedSubagentRecord): PersistedSubagentRecord {
+function retryPendingTimeoutNotices(
+	pi: ExtensionAPI,
+	parentId: string,
+): void {
+	const records = readStore(parentId).records;
+	for (const record of records) {
+		const refreshed = refreshRecordFromDisk(record);
+		if (!refreshed.timeoutAt) continue;
+		if (!refreshed.running) {
+			if (refreshed.pendingTimeoutNotice) markTimeoutNoticeSkipped(refreshed);
+			continue;
+		}
+		if (refreshed.pendingTimeoutNotice && !refreshed.timeoutNotified) {
+			notifyTimeout(pi, refreshed);
+		}
+	}
+}
+
+function retryPendingNotices(
+	pi: ExtensionAPI,
+	parentId: string,
+): void {
+	retryPendingTimeoutNotices(pi, parentId);
+	retryPendingCompletionNotices(pi, parentId);
+}
+
+function markTimedOut(
+	record: PersistedSubagentRecord,
+	queueNotice = true,
+): PersistedSubagentRecord {
 	const latest = findRecord(record.parentSessionId, record.id) ?? record;
 	const refreshed = refreshRecordFromDisk(latest);
-	if (!refreshed.running || refreshed.timeoutNotified) return refreshed;
-	refreshed.timeoutAt = Date.now();
-	refreshed.timeoutNotified = true;
+	if (!refreshed.running) {
+		if (refreshed.pendingTimeoutNotice) return markTimeoutNoticeSkipped(refreshed);
+		return refreshed;
+	}
+	if (!refreshed.timeoutAt) refreshed.timeoutAt = Date.now();
+	if (queueNotice && !refreshed.timeoutNotified) refreshed.pendingTimeoutNotice = true;
 	refreshed.updatedAt = Date.now();
 	upsertRecord(refreshed);
 	return refreshed;
@@ -488,7 +561,7 @@ function notifyTimeout(
 	record: PersistedSubagentRecord,
 ): boolean {
 	const timedOut = markTimedOut(record);
-	if (!timedOut.running || !timedOut.timeoutNotified) return false;
+	if (!timedOut.running || !timedOut.timeoutAt || timedOut.timeoutNotified) return false;
 	try {
 		pi.sendMessage(
 			{
@@ -498,9 +571,11 @@ function notifyTimeout(
 			},
 			{ triggerTurn: true },
 		);
-	} catch {
+	} catch (error) {
+		markTimeoutNoticePending(timedOut, error);
 		return false;
 	}
+	markTimeoutNoticeSent(timedOut);
 	return true;
 }
 
@@ -511,7 +586,7 @@ function startTimeoutTimer(
 ): NodeJS.Timeout {
 	return setTimeout(() => {
 		if (notify) notifyTimeout(pi, record);
-		else markTimedOut(record);
+		else markTimedOut(record, false);
 	}, record.timeout * 1000);
 }
 
@@ -559,8 +634,10 @@ async function runChild(
 			resolve({ code: 1, signal: null });
 		});
 	});
-	stdoutStream.end();
-	stderrStream.end();
+	await Promise.all([
+		new Promise<void>((resolve) => stdoutStream.end(resolve)),
+		new Promise<void>((resolve) => stderrStream.end(resolve)),
+	]);
 	runningChildren.delete(record.id);
 	cleanupTempDir(built.tempDir);
 	const stdout = fs.existsSync(record.stdoutFile)
@@ -605,7 +682,7 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 			_onUpdate: ((result: AgentToolResult<ToolDetails>) => void) | undefined,
 			ctx: ExtensionContext,
 		) {
-			retryPendingCompletionNotices(pi, parentSessionId(ctx));
+			retryPendingNotices(pi, parentSessionId(ctx));
 			const record = makeRecord(ctx, params, id);
 			if (params.async) {
 				const childPromise = runChild(pi, ctx, record, params.task, true);
@@ -636,7 +713,7 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 			});
 			const timeoutPromise = new Promise<PersistedSubagentRecord>((resolve) => {
 				timeoutTimer = setTimeout(
-					() => resolve(markTimedOut(record)),
+					() => resolve(markTimedOut(record, false)),
 					record.timeout * 1000,
 				);
 			});
@@ -669,7 +746,7 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 			ctx: ExtensionContext,
 		) {
 			const parentId = parentSessionId(ctx);
-			retryPendingCompletionNotices(pi, parentId);
+			retryPendingNotices(pi, parentId);
 			const record = findRecord(parentId, params.id);
 			if (!record) throw new Error(`Unknown subagent id: ${params.id}`);
 			return formatStatus(record);
@@ -697,7 +774,7 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 			ctx: ExtensionContext,
 		) {
 			const parentId = parentSessionId(ctx);
-			retryPendingCompletionNotices(pi, parentId);
+			retryPendingNotices(pi, parentId);
 			const records = readStore(parentId).records.map((r) =>
 				refreshRecordFromDisk(r),
 			);
