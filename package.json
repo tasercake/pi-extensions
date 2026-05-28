@@ -11,8 +11,7 @@
   ],
   "pi": {
     "extensions": [
-      "extensions/context-safety/index.ts",
-      "extensions/pi-subagents/src/extension/index.ts"
+      "extensions/*/src/index.ts"
     ],
     "skills": [
       "extensions/pi-subagents/skills"

@@ -1,0 +1,28 @@
+{
+  "name": "pi-context-safety",
+  "version": "1.0.0",
+  "description": "Context safety extension for Pi.",
+  "license": "MIT",
+  "type": "module",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "context",
+    "context-safety",
+    "safety"
+  ],
+  "files": [
+    "src/**/*.ts",
+    "index.ts"
+  ],
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-agent-core": "*",
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*"
+  }
+}
