@@ -14,7 +14,7 @@
       "extensions/*/src/index.ts"
     ],
     "skills": [
-      "extensions/pi-subagents/skills"
+      "extensions/*/skills"
     ]
   },
   "peerDependencies": {
