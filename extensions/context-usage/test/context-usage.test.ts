@@ -153,7 +153,7 @@ function makePi() {
 
 test("package exposes only the context usage extension", async () => {
   const pkg = JSON.parse(await readFile(packageJson, "utf8"));
-  assert.deepEqual(pkg.pi.extensions, ["./src/extension.ts"]);
+  assert.deepEqual(pkg.pi.extensions, ["./src/index.ts"]);
   assert.equal(pkg.name, "pi-context-usage");
 });
 

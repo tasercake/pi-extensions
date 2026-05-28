@@ -54,7 +54,7 @@
   },
   "pi": {
     "extensions": [
-      "./src/extension.ts"
+      "./src/index.ts"
     ]
   },
   "main": "src/api.ts",

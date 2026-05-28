@@ -42,7 +42,7 @@
   },
   "pi": {
     "extensions": [
-      "./src/extension/index.ts"
+      "./src/index.ts"
     ],
     "skills": [
       "./skills"

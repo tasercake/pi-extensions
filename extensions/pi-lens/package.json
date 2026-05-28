@@ -45,6 +45,7 @@
 	"license": "MIT",
 	"files": [
 		"index.ts",
+		"src/**/*.ts",
 		"i18n.ts",
 		"config/",
 		"tools/",
@@ -87,7 +88,7 @@
 	},
 	"pi": {
 		"extensions": [
-			"./index.ts"
+			"./src/index.ts"
 		],
 		"skills": [
 			"./skills"
