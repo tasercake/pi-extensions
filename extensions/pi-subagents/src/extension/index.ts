@@ -701,7 +701,7 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 					content: [
 						{
 							type: "text",
-							text: `Spawned subagent ${record.id}. You will be notified when this subagent completes. You can also call get_subagent_status({ id: "${record.id}" }) to retrieve the result.`,
+							text: `Spawned subagent ${record.id}. You will be notified when this subagent completes. Do not poll for result - continue with whatever other work you may have.`,
 						},
 					],
 					details: { id: record.id, running: true },
