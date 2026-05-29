@@ -24,6 +24,12 @@
     "@earendil-works/pi-tui": "*"
   },
   "dependencies": {
-    "typebox": "^1.1.24"
+    "@ast-grep/napi": "^0.42.1",
+    "@mrclrchtr/supi-core": "1.8.0",
+    "jiti": "^2.7.0",
+    "minimatch": "^10.2.5",
+    "typebox": "^1.1.24",
+    "typescript": "^6.0.3",
+    "vscode-jsonrpc": "^8.2.1"
   }
 }
