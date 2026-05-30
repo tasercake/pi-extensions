@@ -36,8 +36,6 @@ interface ToolDetails {
 	subagents?: Array<{ id: string; running: boolean }>;
 }
 
-type OutputMode = "inline" | "file";
-
 interface PersistedSubagentRecord {
 	id: string;
 	parentSessionId: string;
@@ -45,7 +43,6 @@ interface PersistedSubagentRecord {
 	taskPreview: string;
 	keepContext: boolean;
 	timeout: number;
-	outputMode: OutputMode;
 	model?: string;
 	running: boolean;
 	pid?: number;
@@ -274,27 +271,42 @@ function refreshRecordFromDisk(
 		const stderr = fs.existsSync(record.stderrFile)
 			? fs.readFileSync(record.stderrFile, "utf-8")
 			: "";
-		const finalOutput = extractFinalOutput(stdout);
 		record.running = false;
 		record.updatedAt = Date.now();
 		record.completedAt ??= Date.now();
-		if (stderr.trim() && !finalOutput) record.error = stderr.trim();
-		if (record.outputMode === "file") {
-			if (finalOutput && record.outputFile)
+
+		// Check if subagent already wrote to the result file.
+		const hasExistingResult =
+			record.outputFile &&
+			fs.existsSync(record.outputFile) &&
+			fs.readFileSync(record.outputFile, "utf-8").trim().length > 0;
+
+		if (!hasExistingResult) {
+			const finalOutput = extractFinalOutput(stdout);
+			if (finalOutput && record.outputFile) {
 				fs.writeFileSync(record.outputFile, `${finalOutput}\n`, {
 					mode: 0o600,
 				});
-			record.result = record.outputFile;
-		} else {
-			record.result = finalOutput;
+			} else if (stderr.trim()) {
+				// Subagent produced only stderr, no stdout output.
+				if (!record.error) record.error = stderr.trim();
+				if (record.outputFile) {
+					fs.writeFileSync(record.outputFile, "(error)\n", { mode: 0o600 });
+				}
+			} else if (record.outputFile) {
+				// Edge case: neither stdout nor stderr produced content.
+				// Write a placeholder so the parent gets a valid result file.
+				fs.writeFileSync(record.outputFile, "(no output)\n", { mode: 0o600 });
+			}
 		}
+		record.result = record.outputFile;
 		upsertRecord(record);
 	}
 	return record;
 }
 
 function resultForRecord(record: PersistedSubagentRecord): string | undefined {
-	return record.outputMode === "file" ? record.outputFile : record.result;
+	return record.outputFile;
 }
 
 function subagentSessionId(
@@ -341,7 +353,7 @@ function formatStatus(
 					{
 						id: refreshed.id,
 						running: refreshed.running,
-						...(result ? { result } : {}),
+						...(result ? { resultPath: result } : {}),
 						...(timedOut
 							? {
 									timedOut: true,
@@ -362,7 +374,7 @@ function formatStatus(
 		details: {
 			id: refreshed.id,
 			running: refreshed.running,
-			...(result ? { result } : {}),
+			...(result ? { resultPath: result } : {}),
 			...(timedOut
 				? {
 						timedOut: true,
@@ -394,7 +406,6 @@ function makeRecord(
 		taskPreview: params.task.slice(0, 500),
 		keepContext: params.keepContext,
 		timeout: params.timeout ?? DEFAULT_TIMEOUT_SECONDS,
-		outputMode: params.outputMode,
 		...(params.model ? { model: params.model } : {}),
 		running: false,
 		sessionFile: path.join(dir, "session.jsonl"),
@@ -429,13 +440,14 @@ function buildArgsForRecord(
 		model: record.model,
 		intercomSessionName: `subagent-${record.id}`,
 		runId: record.id,
+		resultPath: record.outputFile,
 	});
 }
 
 function completionMessage(record: PersistedSubagentRecord): string {
 	return [
 		`Subagent ${record.id} completed.`,
-		`Call get_subagent_status({ id: "${record.id}" }) to retrieve the result.`,
+		`Result file: ${record.outputFile}`,
 	].join("\n");
 }
 
@@ -663,7 +675,6 @@ async function runChild(
 	const stderr = fs.existsSync(record.stderrFile)
 		? fs.readFileSync(record.stderrFile, "utf-8")
 		: "";
-	const finalOutput = extractFinalOutput(stdout);
 	const latest = findRecord(record.parentSessionId, record.id);
 	if (latest?.timeoutAt) record.timeoutAt = latest.timeoutAt;
 	if (latest?.timeoutNotified) record.timeoutNotified = latest.timeoutNotified;
@@ -674,12 +685,29 @@ async function runChild(
 		record.error =
 			stderr.trim() ||
 			`Subagent exited with code ${finished.code}${finished.signal ? ` (${finished.signal})` : ""}`;
-	if (record.outputMode === "file") {
-		fs.writeFileSync(record.outputFile!, `${finalOutput}\n`, { mode: 0o600 });
-		record.result = record.outputFile;
-	} else {
-		record.result = finalOutput;
+	// Check if subagent already wrote to result file
+	const hasExistingResult =
+		record.outputFile &&
+		fs.existsSync(record.outputFile) &&
+		fs.readFileSync(record.outputFile, "utf-8").trim().length > 0;
+
+	if (!hasExistingResult) {
+		// Subagent did not write to result file — auto-save final output
+		const finalOutput = extractFinalOutput(stdout);
+		if (finalOutput && record.outputFile) {
+			fs.writeFileSync(record.outputFile, `${finalOutput}\n`, { mode: 0o600 });
+		} else if (stderr.trim()) {
+			// Subagent produced only stderr, no stdout output.
+			if (!record.error) record.error = stderr.trim();
+			if (record.outputFile) {
+				fs.writeFileSync(record.outputFile, "(error)\n", { mode: 0o600 });
+			}
+		} else if (record.outputFile) {
+			// Edge case: neither stdout nor stderr produced content.
+			fs.writeFileSync(record.outputFile, "(no output)\n", { mode: 0o600 });
+		}
 	}
+	record.result = record.outputFile;
 	upsertRecord(record);
 	if (notify) notifyCompletionBestEffort(pi, record);
 	return record;
@@ -721,10 +749,14 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 					content: [
 						{
 							type: "text",
-							text: `Spawned subagent ${record.id}. You will be notified when this subagent completes. Do not poll for result - continue with whatever other work you may have.`,
+							text: `Spawned subagent ${record.id}. Result will be at: ${record.outputFile}. You will be notified when this subagent completes. Do not poll for result - continue with whatever other work you may have.`,
 						},
 					],
-					details: { id: record.id, running: true },
+					details: {
+						id: record.id,
+						running: true,
+						resultPath: record.outputFile,
+					},
 				};
 			}
 			let timeoutTimer: NodeJS.Timeout | undefined;
@@ -748,7 +780,7 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 		},
 		renderCall(args, theme) {
 			return new Text(
-				`${theme.fg("toolTitle", theme.bold("spawn_subagent "))}${args.async ? theme.fg("warning", "async") : "blocking"} ${theme.fg("accent", args.outputMode ?? "inline")}`,
+				`${theme.fg("toolTitle", theme.bold("spawn_subagent "))}${args.async ? theme.fg("warning", "async") : "blocking"}`,
 				0,
 				0,
 			);
