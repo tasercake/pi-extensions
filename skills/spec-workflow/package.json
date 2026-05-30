@@ -1,0 +1,8 @@
+{
+  "name": "spec-workflow",
+  "version": "1.0.0",
+  "description": "Spec-driven development workflow: brainstorm → scope → plan → execute",
+  "pi": {
+    "skills": ["."]
+  }
+}
