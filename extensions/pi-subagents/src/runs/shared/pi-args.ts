@@ -11,6 +11,7 @@ const PROMPT_RUNTIME_EXTENSION_PATH = path.join(
 export const SUBAGENT_ORCHESTRATOR_TARGET_ENV =
 	"PI_SUBAGENT_ORCHESTRATOR_TARGET";
 export const SUBAGENT_RUN_ID_ENV = "PI_SUBAGENT_RUN_ID";
+export const SUBAGENT_RESULT_PATH_ENV = "PI_SUBAGENT_RESULT_PATH";
 
 interface BuildPiArgsInput {
 	baseArgs: string[];
@@ -22,6 +23,7 @@ interface BuildPiArgsInput {
 	intercomSessionName?: string;
 	orchestratorIntercomTarget?: string;
 	runId?: string;
+	resultPath?: string;
 }
 
 interface BuildPiArgsResult {
@@ -72,6 +74,7 @@ export function buildPiArgs(input: BuildPiArgsInput): BuildPiArgsResult {
 	if (input.orchestratorIntercomTarget)
 		env[SUBAGENT_ORCHESTRATOR_TARGET_ENV] = input.orchestratorIntercomTarget;
 	if (input.runId) env[SUBAGENT_RUN_ID_ENV] = input.runId;
+	if (input.resultPath) env[SUBAGENT_RESULT_PATH_ENV] = input.resultPath;
 	return { args, env, tempDir };
 }
 
