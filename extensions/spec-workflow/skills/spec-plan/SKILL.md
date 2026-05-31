@@ -38,10 +38,17 @@ YOUR PLAN MUST BE:
 3. Unambiguous. Precisely specify what to build, where to put it, what it
    depends on, and how to verify correctness. No "should" or "could" — only "must."
 4. Research-backed. Use all tools at your disposal (web search, reading existing
-   code, reading docs) to identify potential blockers, edge cases, risks, and
-   constraints that the scope may imply but not explicitly state.
+   code, reading docs, calling grep/LSP to find exact locations) to identify
+   potential blockers, edge cases, risks, and constraints that the scope may
+   imply but not explicitly state.
 5. Scope-aligned. Every item in your plan must trace back to a specific
    requirement or goal in the scope. Nothing extra. Nothing missing.
+6. VERIFIED. Every claim about code behavior, existing functions, line numbers,
+   file paths, or API signatures must be verified against actual source during
+   planning. Use grep, read, LSP navigation — do NOT guess. Do NOT write
+   approximate line numbers (~1281). Do NOT write "implementer should check" —
+   the plan IS the final word. If a question cannot be resolved during planning,
+   state it as a concrete risk with a specific gate step, not an open task.
 
 YOUR PLAN DOCUMENT STRUCTURE:
 ## Implementation Plan
@@ -150,7 +157,8 @@ When APPROVED:
 - Do NOT let the planner add things not in the scope. The reviewer will catch this.
 - Do NOT modify the scope during planning. It is frozen.
 - The reviewer only finds problems, never suggests solutions. Keep it that way.
-- If the planner keeps missing, the scope might be ambiguous. Surface this to the user rather than looping forever.
+- Do NOT leave open implementer tasks in the plan. Every claim about code behavior must be verified against actual source during planning — grep, read, trace call paths, find exact line numbers. Do NOT write "implementer should check" or "verify before implementation" — the plan IS the verification. If a question cannot be answered during planning, it is a risk with a concrete gate, not an open task for the executor.
+- Do NOT use approximate line numbers (`~1281`). Find exact line numbers with grep or LSP before writing them into the plan. If line numbers may shift, cite the function/symbol name instead.
 
 ## Verification
 - Reviewer verdict is unqualified APPROVED
