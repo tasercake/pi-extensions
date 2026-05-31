@@ -263,11 +263,11 @@ test("buildPiArgs supports sessionId with sessionDir", () => {
 		sessionDir: "/tmp/pi-subagent-test/session-dir",
 	});
 
-	assert(built.args.includes("--session-id"));
+	assert(built.args.includes("--session"));
 	assert(built.args.includes("123e4567-e89b-12d3-a456-426614174000"));
 	assert(built.args.includes("--session-dir"));
 	assert(built.args.includes("/tmp/pi-subagent-test/session-dir"));
-	assert.equal(built.args.includes("--session"), false);
+	assert.equal(built.args.includes("--session-id"), false);
 });
 
 test("async completion persists success and pending metadata when stale notification fails", async () => {
@@ -361,7 +361,7 @@ test("blocking spawn persists unified id session file result.log and fresh args"
 		assert.match(fs.readFileSync(record.outputFile, "utf-8"), /uuid done/);
 
 		const captured = readLatestMockPiArgs(mockPi).args;
-		assert(captured.includes("--session-id"));
+		assert(captured.includes("--session"));
 		assert(captured.includes(record.id));
 		assert(captured.includes("--session-dir"));
 		assert(captured.includes(record.sessionDir));
@@ -396,7 +396,7 @@ test("spawn starts fresh session and never forks parent history", async () => {
 			captured.includes(path.join(sessionId, "session.jsonl")),
 			false,
 		);
-		assert(captured.includes("--session-id"));
+		assert(captured.includes("--session"));
 		assert(captured.includes(record.id));
 		assert(captured.includes("--session-dir"));
 		assert(captured.includes(record.sessionDir));
