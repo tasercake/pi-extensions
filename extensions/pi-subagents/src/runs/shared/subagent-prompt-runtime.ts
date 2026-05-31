@@ -25,7 +25,7 @@ export default function registerSubagentPromptRuntime(pi: ExtensionAPI): void {
 
 		const resultPath = process.env[SUBAGENT_RESULT_PATH_ENV]?.trim();
 		if (resultPath && !rewritten.includes(RESULT_PATH_MARKER)) {
-			rewritten = `${rewritten}\n\nYour result file: ${resultPath}\nYou may write your final output to this file at any time using any tool (e.g., write, bash). If you leave the file empty, your final assistant message will be automatically saved there on exit.`;
+			rewritten = `${rewritten}\n\nYour result file: ${resultPath}\nYou may write your final output to this file at any time using any tool (e.g., write, bash). If you leave the file empty, your final assistant message will be automatically saved there on exit. The environment variable "$PI_SUBAGENT_RESULT_PATH" is aliased to ${resultPath}; you can pipe your answer there. Particularly for very large outputs, or for programmatic outputs, use tools to write the result directly to "$PI_SUBAGENT_RESULT_PATH".`;
 		}
 
 		if (rewritten === event.systemPrompt) return;

@@ -1414,13 +1414,17 @@ test("subagent system prompt includes result file path when env var set", () => 
 	const RESULT_PATH_MARKER = "Your result file:";
 	let rewritten = rewriteSubagentPrompt(prompt);
 	if (resultPath && !rewritten.includes(RESULT_PATH_MARKER)) {
-		rewritten = `${rewritten}\n\nYour result file: ${resultPath}\nYou may write your final output to this file at any time using any tool (e.g., write, bash). If you leave the file empty, your final assistant message will be automatically saved there on exit.`;
+		rewritten = `${rewritten}\n\nYour result file: ${resultPath}\nYou may write your final output to this file at any time using any tool (e.g., write, bash). If you leave the file empty, your final assistant message will be automatically saved there on exit. The environment variable "$PI_SUBAGENT_RESULT_PATH" is aliased to ${resultPath}; you can pipe your answer there. Particularly for very large outputs, or for programmatic outputs, use tools to write the result directly to "$PI_SUBAGENT_RESULT_PATH".`;
 	}
 
 	assert.ok(rewritten.includes(resultPath));
 	assert.ok(rewritten.includes("Your result file:"));
 	assert.ok(rewritten.includes("write"));
 	assert.ok(rewritten.includes("automatically saved"));
+	assert.ok(rewritten.includes('"$PI_SUBAGENT_RESULT_PATH"'));
+	assert.ok(rewritten.includes("you can pipe your answer there"));
+	assert.ok(rewritten.includes("very large outputs"));
+	assert.ok(rewritten.includes("programmatic outputs"));
 
 	// Idempotency: second injection must not append again
 	let rewrittenAgain = rewritten;
@@ -1460,7 +1464,12 @@ test("buildPiArgs omits PI_SUBAGENT_RESULT_PATH when resultPath not provided", (
 });
 
 // Test 10: Integration — end-to-end blocking subagent with real pi binary (Scope Test Plan)
-test("integration: blocking subagent writes result.md at expected path", () => {
+test("integration: blocking subagent writes result.md at expected path", (t) => {
+	if (process.env.CI) {
+		t.skip("requires a configured local pi model provider");
+		return;
+	}
+
 	// Find the pi binary
 	const piBin = process.env.PI_BIN || "pi";
 
@@ -2713,7 +2722,7 @@ test("Phase 7.11: parent/session restart with live PID — reconcile keeps activ
 test("N4: restarted parent reconciles an already-live child from a prior process", async () => {
 	const mockPi = createMockPi();
 	mockPi.install();
-	mockPi.onCall({ output: "live restart done", exitCode: 0, delay: 700 });
+	mockPi.onCall({ output: "live restart done", exitCode: 0, delay: 2500 });
 	const { sessionId, ctx } = makeTestCtx("pi-subagents-live-restart-n4");
 	const sessionFile = path.join(sessionId, "session.jsonl");
 	const extensionPath = path.join(projectRoot, "src/extension/index.ts");
@@ -2769,7 +2778,7 @@ test("N4: restarted parent reconciles an already-live child from a prior process
 		await sessionStart(undefined, ctx);
 		const storeAfterStart = JSON.parse(fs.readFileSync(${JSON.stringify(storeFile(sessionId))}, "utf-8"));
 		const recordAfterStart = storeAfterStart.records.find((candidate) => candidate.id === ${JSON.stringify(childId)});
-		await new Promise((resolve) => setTimeout(resolve, 900));
+		await new Promise((resolve) => setTimeout(resolve, 2700));
 		await registered.get("list_subagents").execute(
 			"restart-list-after-exit",
 			{},
