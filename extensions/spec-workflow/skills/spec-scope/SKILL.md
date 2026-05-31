@@ -16,7 +16,7 @@ Do NOT use this skill if:
 ## Procedure
 
 ### 1. Choose the scope file path
-Decide on a file path for the scope document. Convention: `docs/specs/<feature-slug>/SCOPE.md`. Confirm with the user, then create the directory.
+Decide on a file path for the scope document. Convention: `.spec/<slug>/SCOPE.md`, where `<slug>` is the feature slug selected for the workflow. Use the same slug for PLAN and TODO in later phases. Confirm with the user, then create the directory.
 
 ### 2. Write the scope document
 Write a scope document with these **mandatory** sections. Nothing more, nothing less.

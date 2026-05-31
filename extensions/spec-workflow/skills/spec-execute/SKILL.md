@@ -7,49 +7,36 @@ created: 2026-05-30
 
 ## When to Use
 
-Invoke after `spec-plan` has an APPROVED verdict and the plan is immutable.
+Invoke after `spec-plan` has APPROVED the PLAN and TODO, and the plan is immutable.
 
 Prerequisites:
-- Scope file is frozen and immutable
-- Plan file is approved and immutable (reviewer gave unqualified APPROVED)
-- No code has been written yet for this feature
+- Scope file exists at `.spec/<slug>/SCOPE.md`, is frozen, and is immutable.
+- Plan file exists at `.spec/<slug>/PLAN.md`, is approved, and is immutable.
+- TODO file exists at `.spec/<slug>/TODO.md`, is approved, and remains mutable for parent progress updates.
+- No code has been written yet for this feature.
 
 ## Procedure
 
-### Phase 1: Bootstrap
+### Phase 1: Load Approved Artifacts
 
-#### 1. Create the TODO checklist
-Read the plan document. Create a TODO checklist at `docs/specs/<feature-slug>/TODO.md` that breaks down every implementation item from the plan into granular, checkable tasks.
+#### 1. Read the approved workflow artifacts
+Parent reads SCOPE, PLAN, and TODO from `.spec/<slug>/`:
+- `.spec/<slug>/SCOPE.md`
+- `.spec/<slug>/PLAN.md`
+- `.spec/<slug>/TODO.md`
 
-The TODO format:
-```markdown
-# <Feature Name> — TODO
+The execute phase must not generate, rewrite, reorganize, or reinterpret TODO.
 
-## Legend
-- `[ ]` — Not started
-- `[~]` — In progress (subagent working)
-- `[x]` — Done (implemented AND reviewed)
-
-## Tasks
-### Phase 1: <phase name>
-- [ ] **TASK-ID-001**: <description> → File: `<path>`, Reviewer: `<subagent-id or pending>`
-
-### Phase 2: <phase name>
-...
-```
-
-Rules for TODO:
-- One task per logical unit of work. Typically one file = one task, but complex files may be split.
-- Tasks are grouped by implementation phases from the plan.
-- A task is NOT done until BOTH implemented AND reviewed.
-- The TODO file is the single source of truth for execution progress.
+Parent follows TODO phase ordering, dependencies, and allowed parallelism exactly as written. TODO is the source of progress truth. PLAN is the source of work-detail truth. SCOPE is the source of goal/constraint truth.
 
 ### Phase 2: Execute
 
 #### 2. Spawn implementation subagents
-For each phase, spawn implementation subagents. Follow the plan's implementation order.
+For each phase, spawn implementation subagents according to the approved TODO. Follow TODO phase ordering, dependencies, and allowed parallelism exactly as written.
 
-**Parallel execution rule:** Tasks within the same phase that have no mutual dependencies can (and should) be executed in parallel. Tasks across phases must be sequential—phase N must complete before phase N+1 starts.
+Before spawning an implementation subagent for a TODO task, parent updates that task from `[ ]` to `[~]` and records the implementation subagent ID if the TODO format has a field for it.
+
+After implementation subagent completes, parent does not mark `[x]` until reviewer returns `APPROVED`.
 
 Implementation subagent prompt (use verbatim):
 
@@ -59,19 +46,18 @@ You are executing an approved implementation plan.
 READ ONLY (do not modify these files):
 - Scope: <scope_path>
 - Plan: <plan_path>
-
-READ/WRITE:
-- TODO: <todo_path> (update checkboxes to [x] when YOUR tasks are done)
+- TODO: <todo_path>
 
 YOUR TASK:
 <specific task description from TODO>
 
 Rules:
-1. Read the scope and plan to understand the full picture.
+1. Read the scope, plan, and TODO to understand the assigned work and execution order.
 2. Implement ONLY what is assigned to you. Do not touch files assigned to other tasks.
-3. Follow the plan verbatim. Do not improvise, optimize, or add "nice to haves."
-4. After completing implementation, mark your TODO items as [x] by editing the TODO file.
-5. Use `<subagent-id>` as your identifier so your work can be traced.
+3. Follow the approved PLAN and assigned TODO item verbatim. Do not improvise, optimize, derive new tasks, rewrite TODO, reorganize TODO, or add nice-to-haves.
+4. Treat SCOPE, PLAN, and TODO as read-only. Do not update TODO checkboxes or reviewer fields.
+5. Report completed files and any blockers to the parent.
+6. Use `<subagent-id>` as your identifier so your work can be traced.
 
 Your subagent ID: <subagent-id>
 ```
@@ -85,9 +71,9 @@ After an implementation subagent finishes, spawn a reviewer subagent to verify t
 
 ```
 You are a neutral, skeptical code reviewer. Your job is to verify that
-implementation work matches the approved plan.
+implementation work matches the approved plan and assigned TODO item.
 
-READ ONLY:
+READ ONLY (do not modify these files):
 - Scope: <scope_path>
 - Plan: <plan_path>
 - TODO: <todo_path>
@@ -98,13 +84,14 @@ VERIFY:
 Rules:
 1. Read the scope to understand the goals and constraints.
 2. Read the plan to understand what should be implemented.
-3. Inspect the implemented files. Check that:
+3. Read the TODO to understand the assigned task and execution context.
+4. Inspect the implemented files. Check that:
    a. Every plan instruction for these files is implemented exactly as specified.
    b. Nothing extra is implemented beyond what the plan specifies.
    c. The implementation aligns with scope goals and does not violate constraints.
    d. Edge cases mentioned in the plan are handled.
    e. The code is correct and complete.
-4. Read the TODO to see which task(s) claim to be done.
+5. Do not update TODO. Parent owns TODO progress updates.
 
 Respond in exactly this format:
 
@@ -123,9 +110,9 @@ If CHANGES NEEDED:
 
 Replace placeholders with actual paths.
 
-**If CHANGES NEEDED:** Feed the reviewer feedback back to the implementation subagent for fixes. Re-review after fixes.
-
-**If APPROVED:** Mark the TODO task as verified. Add the reviewer's subagent ID as the verifier.
+Parent progress update rules:
+- If reviewer returns `APPROVED`, parent updates the task to `[x]` and records reviewer subagent ID in the task's `Reviewer:` field.
+- If reviewer returns `CHANGES NEEDED`, parent leaves or returns the task to `[~]`, sends the reviewer feedback to the implementation subagent, and re-reviews after fixes.
 
 ### Phase 3: Final Verification
 
@@ -135,7 +122,7 @@ After all TODO items are checked off, spawn one final reviewer subagent for a co
 ```
 You are a neutral, skeptical code reviewer performing the FINAL verification.
 
-READ ONLY:
+READ ONLY (do not modify these files):
 - Scope: <scope_path>
 - Plan: <plan_path>
 - TODO: <todo_path>
@@ -143,9 +130,10 @@ READ ONLY:
 The TODO claims all tasks are complete. Verify this is true by:
 1. Reading the scope and confirming every requirement is satisfied.
 2. Reading the plan and confirming every instruction is implemented.
-3. Checking that no scope constraint is violated.
-4. Checking that no non-goal was accidentally implemented.
-5. Running any build, lint, or test commands specified in the plan.
+3. Reading the TODO and confirming every task is complete and reviewer-verified.
+4. Checking that no scope constraint is violated.
+5. Checking that no non-goal was accidentally implemented.
+6. Running any build, lint, or test commands specified in the plan.
 
 Respond in exactly this format:
 
@@ -167,12 +155,16 @@ When the final reviewer returns PASS:
 ## Critical Rules
 
 1. **Parent NEVER implements.** The parent agent only spawns subagents, feeds feedback, and updates the TODO. Never write code directly.
-2. **Subagents NEVER modify scope, plan, or TODO.** The TODO is only updated by the parent after reviewer approval. Implementation subagents may mark their own items as `[x]` but the parent must confirm via reviewer before considering them truly done.
+2. **Parent owns TODO updates.** Execution and review subagents never modify SCOPE, PLAN, or TODO.
 3. **No task is done without review.** Every implementation change must be verified by a neutral reviewer subagent.
 4. **Reviewers are neutral.** Give them only file paths. No extra context, no hints, no nudging.
 5. **Reviewers find problems, never suggest fixes.** Their output is a list of discrepancies, period.
 
 ## Pitfalls
+- Do NOT create TODO during execution.
+- Do NOT ask execution agents to update TODO.
+- Do NOT let execution agents review TODO alignment before working.
+- Do NOT reinterpret TODO ordering or parallelism; follow approved TODO exactly.
 - Do NOT skip the reviewer. Even "trivial" changes must be reviewed.
 - Do NOT spawn a reviewer that also wrote the code. Reviewers must be fresh subagents.
 - Do NOT check off TODO items based on implementation subagent self-report alone. Always verify through reviewer.
@@ -181,7 +173,10 @@ When the final reviewer returns PASS:
 - If reviewer and implementer disagree, prefer the reviewer. The reviewer's job is to enforce the contract.
 
 ## Verification
-- All TODO items are `[x]` with reviewer verification
-- Final reviewer returned PASS with no caveats
-- All build/lint/test commands pass (verified by final reviewer)
-- No scope violations, no plan deviations
+- TODO existed before execution.
+- Parent performed all TODO progress updates.
+- No execution or review subagent modified SCOPE, PLAN, or TODO.
+- All TODO items are `[x]` with reviewer verification.
+- Final reviewer returned PASS with no caveats.
+- All build/lint/test commands pass (verified by final reviewer).
+- No scope violations, no plan deviations.
