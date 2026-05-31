@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as os from "node:os";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import registerSubagentExtension from "../../src/extension/index.ts";
@@ -75,21 +75,12 @@ async function waitForPersistedRecord(
 		try {
 			record = readPersistedRecord(sessionId, id);
 			if (ready(record)) return record;
-		} catch {}
+		} catch {
+			// Record may not exist yet.
+		}
 		await new Promise((resolve) => setTimeout(resolve, 20));
 	}
 	return record ?? readPersistedRecord(sessionId, id);
-}
-
-function freshCtxForSameSession(ctx: { cwd: string }, sessionId: string) {
-	const sessionFile = path.join(sessionId, "session.jsonl");
-	return {
-		cwd: ctx.cwd,
-		sessionManager: {
-			getSessionFile: () => sessionFile,
-			getSessionId: () => sessionFile,
-		},
-	};
 }
 
 function readSubagentStore(sessionId: string) {
@@ -196,24 +187,47 @@ async function waitForStatus(statusTool: any, id: string, ctx: unknown) {
 	return status;
 }
 
+function makeFakeCtx(sessionId: string, cwd: string, hasUI: boolean) {
+	const widgetCalls: Array<{ key: string; lines: string[] | undefined }> = [];
+	return {
+		sessionId,
+		ctx: {
+			cwd,
+			hasUI,
+			ui: hasUI
+				? {
+						setWidget(key: string, lines: string[] | undefined) {
+							widgetCalls.push({ key, lines });
+						},
+					}
+				: undefined,
+			sessionManager: {
+				getSessionFile: () => sessionId,
+				getSessionId: () => sessionId,
+			},
+		},
+		widgetCalls,
+	};
+}
+
 test("schemas expose minimal three-tool parameter shapes", async () => {
-	assert.equal(SpawnSubagentParams.additionalProperties, false);
+	assert.equal((SpawnSubagentParams as any).additionalProperties, false);
 	assert.deepEqual(
 		Object.keys(SpawnSubagentParams.properties).sort(),
 		["async", "cwd", "keepContext", "model", "task", "timeout"].sort(),
 	);
 	assert(!("outputMode" in SpawnSubagentParams.properties));
 	assert.match(
-		SpawnSubagentParams.properties.timeout.description,
+		(SpawnSubagentParams.properties.timeout as any).description,
 		/Do not kill/i,
 	);
 	assert.match(
-		SpawnSubagentParams.properties.timeout.description,
+		(SpawnSubagentParams.properties.timeout as any).description,
 		/healthy timeout margin/i,
 	);
-	assert.equal(GetSubagentStatusParams.additionalProperties, false);
+	assert.equal((GetSubagentStatusParams as any).additionalProperties, false);
 	assert.deepEqual(Object.keys(GetSubagentStatusParams.properties), ["id"]);
-	assert.equal(ListSubagentsParams.additionalProperties, false);
+	assert.equal((ListSubagentsParams as any).additionalProperties, false);
 	assert.deepEqual(Object.keys(ListSubagentsParams.properties), []);
 
 	const schemas = await import("../../src/extension/schemas.ts");
@@ -1453,8 +1467,6 @@ test("integration: blocking subagent writes result.md at expected path", () => {
 	// Create a temp session file so we can inspect the result
 	const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagent-int-"));
 	const sessionFile = path.join(tmpDir, "session.jsonl");
-	const sessionId = path.basename(tmpDir);
-
 	try {
 		// Run pi with a prompt that spawns a blocking subagent.
 		// --no-extensions avoids tool-name conflict with a pre-loaded subagents extension.
@@ -1515,6 +1527,1858 @@ test("integration: blocking subagent writes result.md at expected path", () => {
 		// Best-effort cleanup
 		try {
 			fs.rmSync(tmpDir, { recursive: true, force: true });
-		} catch {}
+		} catch {
+			// Best-effort cleanup only.
+		}
+	}
+});
+
+// ── Phase 7: widget / reconciliation / headless tests ──
+
+test("Phase 7.1: async widget renders on spawn and clears on completion", async () => {
+	const mockPi = createMockPi();
+	mockPi.install();
+	mockPi.onCall({ output: "widget done", exitCode: 0 });
+
+	const { sessionId, ctx } = makeTestCtx("pi-subagents-widget-1");
+	const fake = makeFakeCtx(sessionId, ctx.cwd, true);
+
+	const sentMessages: string[] = [];
+	const { spawnTool, statusTool } = registerTestTools((message) => {
+		const content = (message as { content?: unknown }).content;
+		if (typeof content === "string") sentMessages.push(content);
+	});
+
+	try {
+		await spawnTool.execute(
+			"widget-child",
+			{
+				task: "widget render test",
+				async: true,
+				keepContext: false,
+			},
+			new AbortController().signal,
+			undefined,
+			fake.ctx,
+		);
+
+		// Widget should have been rendered with the subagent line
+		const renderCall = fake.widgetCalls.find(
+			(c) => c.key != null && c.lines != null && c.lines.length === 1,
+		);
+		assert.ok(renderCall, "expected at least one render widget call");
+		assert.match(renderCall!.lines![0], /subagent widget-child running/);
+
+		await waitForStatus(statusTool, "widget-child", fake.ctx);
+
+		// Widget should have been cleared (setWidget with undefined)
+		const clearCall = fake.widgetCalls.find((c) => c.lines === undefined);
+		assert.ok(clearCall, "expected widget clear call");
+	} finally {
+		mockPi.uninstall();
+		cleanupTestCtx(ctx, sessionId);
+	}
+});
+
+test("N1: sync subagent widget appears during execution and clears after", async () => {
+	const mockPi = createMockPi();
+	mockPi.install();
+	mockPi.onCall({ output: "sync widget done", exitCode: 0, delay: 80 });
+	const { sessionId, ctx } = makeTestCtx("pi-subagents-sync-widget-n1");
+	const fake = makeFakeCtx(sessionId, ctx.cwd, true);
+	const { spawnTool } = registerTestTools(() => {});
+	try {
+		const resultPromise = spawnTool.execute(
+			"sync-widget-child",
+			{ task: "sync widget", async: false, keepContext: false },
+			new AbortController().signal,
+			undefined,
+			fake.ctx,
+		);
+		for (let i = 0; i < 50; i++) {
+			if (
+				fake.widgetCalls.some((c) =>
+					c.lines?.some((line) => line.includes("sync-widget-child")),
+				)
+			) {
+				break;
+			}
+			await new Promise((resolve) => setTimeout(resolve, 5));
+		}
+		assert.ok(
+			fake.widgetCalls.some((c) =>
+				c.lines?.some((line) => line.includes("sync-widget-child")),
+			),
+			"widget must render before sync spawn_subagent resolves",
+		);
+		const result = await resultPromise;
+		assert.equal(result.details.running, false);
+		assert.ok(result.details.resultPath);
+		assert.equal(
+			fs.readFileSync(result.details.resultPath, "utf-8").trim(),
+			"sync widget done",
+		);
+		assert.ok(
+			fake.widgetCalls.some((c) =>
+				c.lines?.some((line) => line.includes("sync-widget-child")),
+			),
+			"widget rendered during sync run",
+		);
+		assert.ok(
+			fake.widgetCalls.some((c) => c.lines === undefined),
+			"widget cleared after sync run",
+		);
+	} finally {
+		mockPi.uninstall();
+		cleanupTestCtx(ctx, sessionId);
+	}
+});
+
+test("Phase 7.2: multiple active subagents show multiple widget lines, clear one by one", async () => {
+	const mockPi = createMockPi();
+	mockPi.install();
+	mockPi.onCall({ output: "first done", exitCode: 0, delay: 80 });
+	mockPi.onCall({ output: "second done", exitCode: 0, delay: 30_000 });
+
+	const { sessionId, ctx } = makeTestCtx("pi-subagents-widget-2");
+	const fake = makeFakeCtx(sessionId, ctx.cwd, true);
+
+	const { spawnTool, statusTool, listTool } = registerTestTools(() => {});
+
+	try {
+		await spawnTool.execute(
+			"multi-first",
+			{ task: "first", async: true, keepContext: false },
+			new AbortController().signal,
+			undefined,
+			fake.ctx,
+		);
+		for (let i = 0; i < 100 && mockPi.callCount() < 1; i++) {
+			await new Promise((resolve) => setTimeout(resolve, 10));
+		}
+		assert.equal(
+			mockPi.callCount(),
+			1,
+			"first child must claim first mock response before second spawns",
+		);
+		await spawnTool.execute(
+			"multi-second",
+			{ task: "second", async: true, keepContext: false },
+			new AbortController().signal,
+			undefined,
+			fake.ctx,
+		);
+
+		// Should have a render with 2 lines while both are running
+		const multiCall = fake.widgetCalls.find(
+			(c) => c.lines != null && c.lines.length === 2,
+		);
+		assert.ok(multiCall, "expected widget with 2 lines");
+
+		let firstStatus: any;
+		for (let i = 0; i < 400; i++) {
+			firstStatus = await statusTool.execute(
+				`multi-first-status-${i}`,
+				{ id: "multi-first" },
+				new AbortController().signal,
+				undefined,
+				fake.ctx,
+			);
+			if (!firstStatus.details.running) break;
+			await new Promise((resolve) => setTimeout(resolve, 20));
+		}
+		assert.equal(firstStatus.details.running, false);
+		await listTool.execute(
+			"multi-after-first",
+			{},
+			new AbortController().signal,
+			undefined,
+			fake.ctx,
+		);
+		let afterFirstClear = fake.widgetCalls.find(
+			(c) =>
+				c.lines != null &&
+				c.lines.length === 1 &&
+				c.lines[0].includes("multi-second") &&
+				!c.lines[0].includes("multi-first"),
+		);
+		for (let i = 0; !afterFirstClear && i < 100; i++) {
+			await new Promise((resolve) => setTimeout(resolve, 20));
+			afterFirstClear = fake.widgetCalls.find(
+				(c) =>
+					c.lines != null &&
+					c.lines.length === 1 &&
+					c.lines[0].includes("multi-second") &&
+					!c.lines[0].includes("multi-first"),
+			);
+		}
+		assert.ok(afterFirstClear, "expected widget to clear first child only");
+
+		const runningSecond = readPersistedRecord(sessionId, "multi-second");
+		if (runningSecond.running && typeof runningSecond.pid === "number") {
+			try {
+				process.kill(runningSecond.pid, "SIGTERM");
+			} catch {
+				// Child may have exited between reading the durable record and cleanup.
+			}
+		}
+
+		let secondStatus: any;
+		for (let i = 0; i < 400; i++) {
+			secondStatus = await statusTool.execute(
+				`multi-second-status-${i}`,
+				{ id: "multi-second" },
+				new AbortController().signal,
+				undefined,
+				fake.ctx,
+			);
+			if (!secondStatus.details.running) break;
+			await new Promise((resolve) => setTimeout(resolve, 20));
+		}
+		assert.equal(secondStatus.details.running, false);
+
+		// Final calls: should clear
+		let clearCount = 0;
+		for (let i = 0; i < 100; i++) {
+			clearCount = fake.widgetCalls.filter((c) => c.lines === undefined).length;
+			if (clearCount >= 1) break;
+			await new Promise((resolve) => setTimeout(resolve, 20));
+		}
+		assert.ok(clearCount >= 1, "expected at least one clear call");
+	} finally {
+		await new Promise((resolve) => setTimeout(resolve, 300));
+		mockPi.uninstall();
+		cleanupTestCtx(ctx, sessionId);
+	}
+});
+
+test("Phase 7.3: timeout widget line shows 'timed out, still running'", async () => {
+	const mockPi = createMockPi();
+	mockPi.install();
+	mockPi.onCall({ output: "slow done", exitCode: 0, delay: 500 });
+
+	const { sessionId, ctx } = makeTestCtx("pi-subagents-widget-3");
+	const fake = makeFakeCtx(sessionId, ctx.cwd, true);
+
+	const { spawnTool, statusTool } = registerTestTools(() => {});
+
+	try {
+		await spawnTool.execute(
+			"timeout-widget-child",
+			{
+				task: "slow",
+				async: true,
+				keepContext: false,
+				timeout: 0.05,
+			},
+			new AbortController().signal,
+			undefined,
+			fake.ctx,
+		);
+
+		// Wait for timeout to fire
+		await new Promise((resolve) => setTimeout(resolve, 120));
+
+		// Trigger widget render via get_subagent_status (calls maybeRenderRunningWidget)
+		// Status check forces render without waiting for timer.
+		await statusTool.execute(
+			"trigger-widget-refresh",
+			{ id: "timeout-widget-child" },
+			new AbortController().signal,
+			undefined,
+			fake.ctx,
+		);
+
+		const timeoutCall = fake.widgetCalls.find(
+			(c) =>
+				c.lines != null &&
+				c.lines.some((line) => /timed out, still running/.test(line)),
+		);
+		assert.ok(
+			timeoutCall,
+			"expected widget line with 'timed out, still running'",
+		);
+		await waitForStatus(statusTool, "timeout-widget-child", fake.ctx);
+	} finally {
+		mockPi.uninstall();
+		cleanupTestCtx(ctx, sessionId);
+	}
+});
+
+test("Phase 7.4: no UI is headless-safe — no setWidget calls, no crash", async () => {
+	const mockPi = createMockPi();
+	mockPi.install();
+	mockPi.onCall({ output: "headless done", exitCode: 0 });
+
+	const { sessionId, ctx } = makeTestCtx("pi-subagents-headless-4");
+	const fake = makeFakeCtx(sessionId, ctx.cwd, false);
+
+	const { spawnTool, statusTool } = registerTestTools(() => {});
+
+	try {
+		await spawnTool.execute(
+			"headless-child",
+			{
+				task: "headless test",
+				async: true,
+				keepContext: false,
+			},
+			new AbortController().signal,
+			undefined,
+			fake.ctx,
+		);
+
+		const status = await waitForStatus(statusTool, "headless-child", fake.ctx);
+		assert.equal(status.details.running, false);
+		assert.ok(status.details.resultPath);
+		assert.equal(
+			fs.readFileSync(status.details.resultPath, "utf-8").trim(),
+			"headless done",
+		);
+
+		// No widget calls in headless mode
+		assert.equal(fake.widgetCalls.length, 0);
+	} finally {
+		mockPi.uninstall();
+		cleanupTestCtx(ctx, sessionId);
+	}
+});
+
+test("N2: running widget survives agent_end", async () => {
+	const originalSetInterval = globalThis.setInterval;
+	const originalClearInterval = globalThis.clearInterval;
+	const timers: Array<{
+		fn: () => void;
+		ms: number;
+		cleared: boolean;
+		unrefCalled: boolean;
+	}> = [];
+	(globalThis as any).setInterval = (fn: () => void, ms?: number) => {
+		const timer = { fn, ms: Number(ms), cleared: false, unrefCalled: false };
+		(timer as any).unref = () => {
+			timer.unrefCalled = true;
+		};
+		timers.push(timer);
+		return timer as any;
+	};
+	(globalThis as any).clearInterval = (timer: any) => {
+		timer.cleared = true;
+	};
+	const mockPi = createMockPi();
+	mockPi.install();
+	mockPi.onCall({ output: "agent end done", exitCode: 0, delay: 200 });
+	const { sessionId, ctx } = makeTestCtx("pi-subagents-agent-end-n2");
+	const fake = makeFakeCtx(sessionId, ctx.cwd, true);
+	let agentEnd: ((_event: unknown, ctx: unknown) => void) | undefined;
+	const registered = new Map<string, any>();
+	registerSubagentExtension({
+		registerTool(tool: any) {
+			registered.set(tool.name, tool);
+		},
+		sendMessage() {},
+		on(event: string, handler: any) {
+			if (event === "agent_end") agentEnd = handler;
+		},
+	} as never);
+	try {
+		await registered
+			.get("spawn_subagent")
+			.execute(
+				"agent-end-child",
+				{ task: "agent end", async: true, keepContext: false },
+				new AbortController().signal,
+				undefined,
+				fake.ctx,
+			);
+		assert.ok(
+			fake.widgetCalls.some((c) =>
+				c.lines?.some((line) => line.includes("agent-end-child")),
+			),
+		);
+		const widgetTimer = timers.find((t) => t.ms === 1000);
+		const reconcileTimer = timers.find((t) => t.ms === 5000);
+		assert.ok(
+			widgetTimer && widgetTimer.unrefCalled,
+			"widget timer scheduled before agent_end",
+		);
+		assert.ok(
+			reconcileTimer && reconcileTimer.unrefCalled,
+			"reconcile timer scheduled before agent_end",
+		);
+		assert.ok(agentEnd, "agent_end handler registered");
+		agentEnd!(undefined, fake.ctx);
+		const afterAgentEnd = fake.widgetCalls.filter((c) =>
+			c.lines?.some((line) => line.includes("agent-end-child")),
+		);
+		assert.ok(
+			afterAgentEnd.length >= 2,
+			"agent_end re-renders active widget instead of clearing",
+		);
+		assert.equal(
+			widgetTimer.cleared,
+			false,
+			"widget refresh timer remains scheduled after agent_end",
+		);
+		assert.equal(
+			reconcileTimer.cleared,
+			false,
+			"reconcile timer remains scheduled after agent_end",
+		);
+		const widgetCallsBeforeTimer = fake.widgetCalls.length;
+		(widgetTimer as any).fn?.();
+		assert.ok(
+			fake.widgetCalls.length > widgetCallsBeforeTimer,
+			"uiParents still retains parent ctx after agent_end so widget timer can re-render",
+		);
+		await waitForPersistedRecord(sessionId, "agent-end-child");
+	} finally {
+		mockPi.uninstall();
+		cleanupTestCtx(ctx, sessionId);
+		globalThis.setInterval = originalSetInterval;
+		globalThis.clearInterval = originalClearInterval;
+	}
+});
+
+test("Phase 7.5: reconciliation marks record not running when persisted PID is dead", async () => {
+	const { sessionId, ctx } = makeTestCtx("pi-subagents-deadpid-5");
+
+	// Manually persist a record with a dead PID (32767 is unlikely to exist)
+	const record = {
+		id: "deadpid-child",
+		parentSessionId: sessionId,
+		cwd: ctx.cwd,
+		taskPreview: "dead pid test",
+		keepContext: false,
+		timeout: 30,
+		running: true,
+		pid: 32767,
+		sessionFile: path.join(
+			storeDir(sessionId),
+			"deadpid-child",
+			"session.jsonl",
+		),
+		outputFile: path.join(storeDir(sessionId), "deadpid-child", "result.md"),
+		stdoutFile: path.join(storeDir(sessionId), "deadpid-child", "stdout.log"),
+		stderrFile: path.join(storeDir(sessionId), "deadpid-child", "stderr.log"),
+		createdAt: Date.now() - 60_000,
+		updatedAt: Date.now() - 60_000,
+	};
+	const storeFilePath = storeFile(sessionId);
+	fs.mkdirSync(path.dirname(storeFilePath), { recursive: true });
+	fs.mkdirSync(path.dirname(record.stdoutFile), { recursive: true });
+	fs.writeFileSync(
+		record.stdoutFile,
+		'{"type":"message","message":{"role":"assistant","content":"dead output"}}\n',
+		"utf-8",
+	);
+	fs.writeFileSync(
+		storeFilePath,
+		JSON.stringify({ records: [record] }, null, 2),
+		{ mode: 0o600 },
+	);
+
+	const retry = executeSubagentToolInFreshProcess({
+		sessionId,
+		cwd: ctx.cwd,
+		tool: "get_subagent_status",
+		id: "deadpid-child",
+	});
+
+	const status = retry.result as {
+		details: {
+			id: string;
+			running: boolean;
+			resultPath?: string;
+			error?: string;
+		};
+	};
+	assert.equal(status.details.id, "deadpid-child");
+	assert.equal(status.details.running, false);
+	assert.ok(
+		status.details.resultPath || status.details.error,
+		"should have result path or error after reconciliation",
+	);
+
+	// The record in store should now be marked not running
+	const persisted = readPersistedRecord(sessionId, "deadpid-child");
+	assert.equal(persisted.running, false);
+
+	cleanupTestCtx(ctx, sessionId);
+});
+
+test("N5: dual timers are unref'd, refresh independently, and clear when idle", async () => {
+	const originalSetInterval = globalThis.setInterval;
+	const originalClearInterval = globalThis.clearInterval;
+	const originalKill = process.kill;
+	let childPid: number | undefined;
+	let livePidChecks = 0;
+	(process as any).kill = (pid: number, signal?: NodeJS.Signals | number) => {
+		if (childPid !== undefined && pid === childPid && signal === 0) {
+			livePidChecks += 1;
+		}
+		return (originalKill as any).call(process, pid, signal);
+	};
+	const timers: Array<{
+		ms: number;
+		unrefCalled: boolean;
+		cleared: boolean;
+		handle: any;
+	}> = [];
+	(globalThis as any).setInterval = (
+		fn: () => void,
+		ms?: number,
+		...args: unknown[]
+	) => {
+		const handle = originalSetInterval(fn, ms as any, ...args);
+		const timer = {
+			ms: Number(ms),
+			unrefCalled: false,
+			cleared: false,
+			handle,
+		};
+		const originalUnref =
+			typeof (handle as any).unref === "function"
+				? (handle as any).unref.bind(handle)
+				: undefined;
+		(handle as any).unref = () => {
+			timer.unrefCalled = true;
+			return originalUnref?.();
+		};
+		timers.push(timer);
+		return handle;
+	};
+	(globalThis as any).clearInterval = (handle: any) => {
+		const timer = timers.find((candidate) => candidate.handle === handle);
+		if (timer) timer.cleared = true;
+		return originalClearInterval(handle);
+	};
+	const mockPi = createMockPi();
+	mockPi.install();
+	mockPi.onCall({ output: "timer done", exitCode: 0, delay: 6_500 });
+	const { sessionId, ctx } = makeTestCtx("pi-subagents-dual-timer-n5");
+	const fake = makeFakeCtx(sessionId, ctx.cwd, true);
+	const { spawnTool, statusTool } = registerTestTools(() => {});
+	try {
+		await spawnTool.execute(
+			"dual-timer-child",
+			{ task: "dual timer", async: true, keepContext: false, timeout: 2 },
+			new AbortController().signal,
+			undefined,
+			fake.ctx,
+		);
+		const widgetTimer = timers.find((t) => t.ms === 1000)!;
+		const reconcileTimer = timers.find((t) => t.ms === 5000)!;
+		assert.ok(widgetTimer?.unrefCalled, "1Hz widget timer unref'd");
+		assert.ok(reconcileTimer?.unrefCalled, "0.2Hz reconcile timer unref'd");
+		const runningRecord = readPersistedRecord(sessionId, "dual-timer-child");
+		childPid = runningRecord.pid;
+		assert.equal(runningRecord.running, true);
+		assert.equal(typeof childPid, "number");
+
+		const widgetCallsBefore = fake.widgetCalls.length;
+		await new Promise((resolve) => setTimeout(resolve, 1_100));
+		assert.ok(
+			fake.widgetCalls.length > widgetCallsBefore,
+			"real 1s widget timer refreshes widget",
+		);
+		assert.ok(
+			fake.widgetCalls.some((c) =>
+				c.lines?.some(
+					(line) =>
+						line.includes("dual-timer-child") && /running [1-9]\d*s/.test(line),
+				),
+			),
+			"elapsed-time display refreshes after a real 1s wait",
+		);
+
+		const livePidChecksBeforeReconcile = livePidChecks;
+		await new Promise((resolve) => setTimeout(resolve, 5_100));
+		assert.ok(
+			livePidChecks > livePidChecksBeforeReconcile,
+			"real 5s reconcile timer calls reconcileStore via live PID check",
+		);
+		assert.equal(
+			readPersistedRecord(sessionId, "dual-timer-child").running,
+			true,
+			"real 5s reconcile timer reconciles store without killing live child",
+		);
+
+		await waitForStatus(statusTool, "dual-timer-child", fake.ctx);
+		assert.ok(widgetTimer.cleared, "widget timer cleared when idle");
+		assert.ok(reconcileTimer.cleared, "reconcile timer cleared when idle");
+	} finally {
+		mockPi.uninstall();
+		cleanupTestCtx(ctx, sessionId);
+		globalThis.setInterval = originalSetInterval;
+		globalThis.clearInterval = originalClearInterval;
+		(process as any).kill = originalKill;
+	}
+});
+
+test("Phase 7.6: widget failure isolation — setWidget throws but child still works", async () => {
+	const mockPi = createMockPi();
+	mockPi.install();
+	mockPi.onCall({ output: "isolated done", exitCode: 0 });
+
+	const { sessionId, ctx } = makeTestCtx("pi-subagents-isolate-6");
+	let setWidgetCalls = 0;
+	const fakeCtx = {
+		cwd: ctx.cwd,
+		hasUI: true,
+		ui: {
+			setWidget() {
+				setWidgetCalls += 1;
+				throw new Error("widget renderer is broken");
+			},
+		},
+		sessionManager: {
+			getSessionFile: () => sessionId,
+			getSessionId: () => sessionId,
+		},
+	};
+
+	const { spawnTool, statusTool } = registerTestTools(() => {});
+
+	try {
+		await spawnTool.execute(
+			"isolate-child",
+			{
+				task: "isolate test",
+				async: true,
+				keepContext: false,
+			},
+			new AbortController().signal,
+			undefined,
+			fakeCtx,
+		);
+
+		const status = await waitForStatus(statusTool, "isolate-child", fakeCtx);
+		assert.equal(status.details.running, false);
+		assert.ok(status.details.resultPath);
+		assert.equal(
+			fs.readFileSync(status.details.resultPath, "utf-8").trim(),
+			"isolated done",
+		);
+		assert.ok(
+			setWidgetCalls >= 1,
+			"setWidget was called (and threw) at least once",
+		);
+	} finally {
+		mockPi.uninstall();
+		cleanupTestCtx(ctx, sessionId);
+	}
+});
+
+test("Phase 7.7: notification idempotency — two processes do not send duplicate completion", async () => {
+	const mockPi = createMockPi();
+	mockPi.install();
+	mockPi.onCall({ output: "idempotent done", exitCode: 0 });
+
+	const { sessionId, ctx } = makeTestCtx("pi-subagents-idempotent-7");
+	const sentMessages: string[] = [];
+	const { spawnTool } = registerTestTools((message) => {
+		const content = (message as { content?: unknown }).content;
+		if (typeof content === "string") sentMessages.push(content);
+	});
+
+	try {
+		await spawnTool.execute(
+			"idempotent-child",
+			{
+				task: "idempotent test",
+				async: true,
+				keepContext: false,
+			},
+			new AbortController().signal,
+			undefined,
+			ctx,
+		);
+
+		await waitForPersistedRecord(sessionId, "idempotent-child");
+
+		// First process sent the notification
+		const completionMessages = sentMessages.filter((m) =>
+			/Subagent idempotent-child completed\./.test(m),
+		);
+		assert.equal(
+			completionMessages.length,
+			1,
+			"exactly one completion notification",
+		);
+
+		// A second process (simulated via executeSubagentToolInFreshProcess) should NOT send
+		// a duplicate notification because notifiedCompletion is already true
+		const retry = executeSubagentToolInFreshProcess({
+			sessionId,
+			cwd: ctx.cwd,
+			tool: "list_subagents",
+		});
+
+		const retryMessages = retry.messages
+			.map((m) => m.content)
+			.filter((c): c is string => typeof c === "string");
+		const duplicateCompletions = retryMessages.filter((m) =>
+			/Subagent idempotent-child completed\./.test(m),
+		);
+		assert.equal(
+			duplicateCompletions.length,
+			0,
+			"second process must not send duplicate completion",
+		);
+	} finally {
+		mockPi.uninstall();
+		cleanupTestCtx(ctx, sessionId);
+	}
+});
+
+test("N3: pending completion notice retries on next session_start after parent death", async () => {
+	const mockPi = createMockPi();
+	mockPi.install();
+	mockPi.onCall({ output: "late done", exitCode: 0, delay: 80 });
+	const { sessionId, ctx } = makeTestCtx("pi-subagents-pending-notice-n3");
+	const fake = makeFakeCtx(sessionId, ctx.cwd, false);
+	let parentApi: { alive: boolean } | undefined = { alive: true };
+	const oldParentMessages: any[] = [];
+	const { spawnTool } = registerTestTools((message) => {
+		if (!parentApi?.alive) {
+			throw new Error("old parent ExtensionAPI discarded");
+		}
+		oldParentMessages.push(message);
+	});
+	try {
+		await spawnTool.execute(
+			"pending-notice-child",
+			{ task: "pending notice", async: true, keepContext: false },
+			new AbortController().signal,
+			undefined,
+			fake.ctx,
+		);
+		// Simulate parent death by discarding the only test-held ExtensionAPI/process
+		// reference before the child completes; the old callback now behaves like a
+		// dead parent and cannot deliver the notification.
+		parentApi.alive = false;
+		parentApi = undefined;
+
+		await waitForPersistedRecord(
+			sessionId,
+			"pending-notice-child",
+			(record) =>
+				record.running === false && record.pendingCompletionNotice === true,
+		);
+		assert.equal(oldParentMessages.length, 0);
+		const beforeRestart = readPersistedRecord(
+			sessionId,
+			"pending-notice-child",
+		);
+		assert.equal(beforeRestart.pendingCompletionNotice, true);
+		assert.equal(beforeRestart.notifiedCompletion, undefined);
+		assert.match(
+			beforeRestart.notifyError,
+			/old parent ExtensionAPI discarded/,
+		);
+
+		const restartScript = `
+			import registerSubagentExtension from ${JSON.stringify(path.join(projectRoot, "src/extension/index.ts"))};
+			const messages = [];
+			let sessionStart;
+			registerSubagentExtension({
+				registerTool() {},
+				sendMessage(message) { if (typeof message.content === "string") messages.push(message.content); },
+				on(event, handler) { if (event === "session_start") sessionStart = handler; },
+			});
+			const ctx = {
+				cwd: ${JSON.stringify(ctx.cwd)},
+				hasUI: false,
+				sessionManager: {
+					getSessionFile: () => ${JSON.stringify(path.join(sessionId, "session.jsonl"))},
+					getSessionId: () => ${JSON.stringify(path.join(sessionId, "session.jsonl"))},
+				},
+			};
+			await sessionStart(undefined, ctx);
+			console.log(JSON.stringify({ messages }));
+		`;
+		const restarted = spawnSync(
+			process.execPath,
+			[
+				"--experimental-strip-types",
+				"--input-type=module",
+				"-e",
+				restartScript,
+			],
+			{ cwd: projectRoot, encoding: "utf-8", env: process.env },
+		);
+		assert.equal(restarted.status, 0, restarted.stderr || restarted.stdout);
+		const restartResult = JSON.parse(restarted.stdout) as {
+			messages: string[];
+		};
+		assert.ok(
+			restartResult.messages.some(
+				(m) => m.includes("pending-notice-child") && m.includes("completed"),
+			),
+		);
+		const persisted = readPersistedRecord(sessionId, "pending-notice-child");
+		assert.equal(persisted.pendingCompletionNotice, false);
+		assert.equal(persisted.notifiedCompletion, true);
+	} finally {
+		mockPi.uninstall();
+		cleanupTestCtx(ctx, sessionId);
+	}
+});
+
+test("Phase 7.8: headless liveness — stdio pipes keep parent process alive naturally", async () => {
+	const mockPi = createMockPi();
+	mockPi.install();
+	mockPi.onCall({ output: "headless live done", exitCode: 0, delay: 220 });
+
+	const { sessionId, ctx } = makeTestCtx("pi-subagents-headless-live-8");
+	const sessionFile = path.join(sessionId, "session.jsonl");
+	const extensionPath = path.join(projectRoot, "src/extension/index.ts");
+	const childId = "headless-live-child";
+	const script = `
+		import fs from "node:fs";
+		import registerSubagentExtension from ${JSON.stringify(extensionPath)};
+		const registered = new Map();
+		registerSubagentExtension({
+			registerTool(tool) { registered.set(tool.name, tool); },
+			sendMessage(message) { process.stdout.write(JSON.stringify({ type: "message", content: message.content }) + "\\n"); },
+			on() {},
+		});
+		const ctx = {
+			cwd: ${JSON.stringify(ctx.cwd)},
+			hasUI: false,
+			sessionManager: {
+				getSessionFile: () => ${JSON.stringify(sessionFile)},
+				getSessionId: () => ${JSON.stringify(sessionFile)},
+			},
+		};
+		await registered.get("spawn_subagent").execute(
+			${JSON.stringify(childId)},
+			{ task: "headless liveness test", async: true, keepContext: false },
+			new AbortController().signal,
+			undefined,
+			ctx,
+		);
+		process.stdout.write(JSON.stringify({ type: "spawned", at: Date.now() }) + "\\n");
+		// No timers or explicit retain/release here. If child stdio pipes are not
+		// ref-counted, this parent process exits before the child delay elapses.
+	`;
+	try {
+		const extensionSource = fs.readFileSync(extensionPath, "utf-8");
+		const childSpawnOptions = extensionSource.match(
+			/child = spawn\(spawnSpec\.command, spawnSpec\.args, \{[\s\S]*?\n\t\t\}\);/,
+		)?.[0];
+		assert.ok(childSpawnOptions, "extension child spawn call is present");
+		assert.match(
+			childSpawnOptions,
+			/stdio:\s*\["ignore", "pipe", "pipe"\]/,
+			"extension child spawn uses default pipe stdio for stdout/stderr",
+		);
+		assert.doesNotMatch(
+			childSpawnOptions,
+			/detached\s*:/,
+			"extension child spawn does not detach child process",
+		);
+		assert.doesNotMatch(
+			extensionSource,
+			/child\.unref\s*\(/,
+			"extension child process is not unref'd",
+		);
+
+		const started = Date.now();
+		const child = spawn(
+			process.execPath,
+			["--experimental-strip-types", "--input-type=module", "-e", script],
+			{ cwd: projectRoot, env: process.env, stdio: ["ignore", "pipe", "pipe"] },
+		);
+		let stdout = "";
+		let stderr = "";
+		child.stdout.setEncoding("utf-8");
+		child.stderr.setEncoding("utf-8");
+		child.stdout.on("data", (chunk) => {
+			stdout += chunk;
+		});
+		child.stderr.on("data", (chunk) => {
+			stderr += chunk;
+		});
+
+		await new Promise((resolve) => setTimeout(resolve, 90));
+		assert.equal(
+			child.exitCode,
+			null,
+			"parent must still be alive before child completes",
+		);
+
+		const exitCode = await new Promise<number | null>((resolve) => {
+			child.on("exit", (code) => resolve(code));
+		});
+		assert.equal(exitCode, 0, stderr || stdout);
+		assert.ok(
+			Date.now() - started >= 180,
+			"parent lifetime should track child stdio lifetime",
+		);
+		assert.match(stdout, /"type":"spawned"/);
+		assert.match(stdout, /headless-live-child completed/);
+
+		const record = readPersistedRecord(sessionId, childId);
+		assert.equal(record.running, false);
+		assert.equal(
+			fs.readFileSync(record.result, "utf-8").trim(),
+			"headless live done",
+		);
+	} finally {
+		mockPi.uninstall();
+		cleanupTestCtx(ctx, sessionId);
+	}
+});
+
+test("Phase 7.9: spawn/setup error semantics — depth check fails before child exists", async () => {
+	const mockPi = createMockPi();
+	mockPi.install();
+
+	const { sessionId, ctx } = makeTestCtx("pi-subagents-depthfail-9");
+	const fake = makeFakeCtx(sessionId, ctx.cwd, true);
+
+	const sentMessages: string[] = [];
+	const { spawnTool } = registerTestTools((message) => {
+		const content = (message as { content?: unknown }).content;
+		if (typeof content === "string") sentMessages.push(content);
+	});
+
+	// Force depth check to block by setting PI_SUBAGENT_DEPTH >= max
+	const origDepth = process.env.PI_SUBAGENT_DEPTH;
+	process.env.PI_SUBAGENT_DEPTH = "3";
+	try {
+		const result = await spawnTool.execute(
+			"depth-fail-child",
+			{
+				task: "should fail depth check",
+				async: true,
+				keepContext: false,
+			},
+			new AbortController().signal,
+			undefined,
+			fake.ctx,
+		);
+
+		// Spawn returns successfully (async doesn't re-throw setup failure)
+		assert.equal(result.details?.id, "depth-fail-child");
+		assert.equal(result.details?.running, false);
+
+		// Record must be persisted with error and running=false
+		const record = readPersistedRecord(sessionId, "depth-fail-child");
+		assert.equal(record.running, false);
+		assert.match(record.error, /recursion depth exceeded/);
+		assert.ok(record.completedAt);
+
+		// onSetupFailure should clear widget (setWidget with undefined)
+		const clearCalls = fake.widgetCalls.filter(
+			(c) => c.lines === undefined && c.key?.includes("pi-subagents-running"),
+		);
+		assert.ok(
+			clearCalls.length >= 1,
+			"onSetupFailure should trigger widget clear",
+		);
+	} finally {
+		if (origDepth === undefined) delete process.env.PI_SUBAGENT_DEPTH;
+		else process.env.PI_SUBAGENT_DEPTH = origDepth;
+		mockPi.uninstall();
+		cleanupTestCtx(ctx, sessionId);
+	}
+});
+
+test("Phase 7.9b: child error after spawn — done resolves with errored record", async () => {
+	const mockPi = createMockPi();
+	mockPi.install();
+	// Child exits with non-zero code and stderr to simulate error after spawn
+	mockPi.onCall({
+		output: "",
+		stderr: "simulated spawn failure: cannot exec",
+		exitCode: 1,
+	});
+
+	const { sessionId, ctx } = makeTestCtx("pi-subagents-childerror-9b");
+	const fake = makeFakeCtx(sessionId, ctx.cwd, true);
+
+	const sentMessages: string[] = [];
+	const { spawnTool, statusTool } = registerTestTools((message) => {
+		const content = (message as { content?: unknown }).content;
+		if (typeof content === "string") sentMessages.push(content);
+	});
+
+	try {
+		await spawnTool.execute(
+			"child-error-after-spawn",
+			{
+				task: "will error after spawn",
+				async: true,
+				keepContext: false,
+			},
+			new AbortController().signal,
+			undefined,
+			fake.ctx,
+		);
+
+		const status = await waitForStatus(
+			statusTool,
+			"child-error-after-spawn",
+			fake.ctx,
+		);
+		assert.equal(status.details.running, false);
+		assert.ok(status.details.error, "should have error after non-zero exit");
+
+		const record = readPersistedRecord(sessionId, "child-error-after-spawn");
+		assert.equal(record.running, false);
+		assert.ok(record.error);
+		assert.ok(record.completedAt);
+
+		// Widget should eventually clear
+		const clearCalls = fake.widgetCalls.filter(
+			(c) => c.lines === undefined && c.key?.includes("pi-subagents-running"),
+		);
+		assert.ok(clearCalls.length >= 1, "widget should clear on error");
+
+		// No unhandled rejection — the async .catch() must silence it
+		// (test passes if we reach here without process-level unhandled rejection)
+	} finally {
+		mockPi.uninstall();
+		cleanupTestCtx(ctx, sessionId);
+	}
+});
+
+test("Phase 7.10: store overwrite race guard — terminal wins over running", async () => {
+	const { sessionId, ctx } = makeTestCtx("pi-subagents-overwrite-10");
+
+	// Write a running record directly
+	const recordId = "race-child";
+	const storeFilePath = storeFile(sessionId);
+	fs.mkdirSync(path.dirname(storeFilePath), { recursive: true });
+
+	const childDataDir = path.join(storeDir(sessionId), recordId);
+	fs.mkdirSync(childDataDir, { recursive: true });
+	const stdoutPath = path.join(childDataDir, "stdout.log");
+	fs.writeFileSync(stdoutPath, "", "utf-8");
+
+	const initialRecord = {
+		id: recordId,
+		parentSessionId: sessionId,
+		cwd: ctx.cwd,
+		taskPreview: "race test",
+		keepContext: false,
+		timeout: 30,
+		running: true,
+		pid: 32767,
+		sessionFile: path.join(childDataDir, "session.jsonl"),
+		outputFile: path.join(childDataDir, "result.md"),
+		stdoutFile: stdoutPath,
+		stderrFile: path.join(childDataDir, "stderr.log"),
+		createdAt: Date.now() - 120_000,
+		updatedAt: Date.now() - 60_000,
+		pendingCompletionNotice: true,
+		completionNotificationPending: true,
+	};
+	fs.writeFileSync(
+		storeFilePath,
+		JSON.stringify({ records: [initialRecord] }, null, 2),
+		{ mode: 0o600 },
+	);
+
+	// Simulate another writer storing a newer terminal update with notifiedCompletion=true
+	// This races with reconcile reading — merge should prefer terminal + notified
+	const racedRecord = {
+		...initialRecord,
+		running: false,
+		result: path.join(childDataDir, "result.md"),
+		completedAt: Date.now() - 30_000,
+		updatedAt: Date.now() - 10_000,
+		notifiedCompletion: true,
+		pendingCompletionNotice: false,
+		completionNotificationPending: false,
+	};
+
+	fs.writeFileSync(
+		path.join(childDataDir, "result.md"),
+		"race-winner\n",
+		"utf-8",
+	);
+
+	// Write the raced (newer terminal) record concurrently
+	fs.writeFileSync(
+		storeFilePath,
+		JSON.stringify({ records: [racedRecord] }, null, 2),
+		{ mode: 0o600 },
+	);
+
+	// Reconcile via fresh process (reads latest, refreshes, merges)
+	const result = executeSubagentToolInFreshProcess({
+		sessionId,
+		cwd: ctx.cwd,
+		tool: "get_subagent_status",
+		id: recordId,
+	});
+
+	const status = result.result as {
+		details: {
+			id: string;
+			running: boolean;
+			resultPath?: string;
+			error?: string;
+		};
+	};
+	assert.equal(status.details.id, recordId);
+	assert.equal(status.details.running, false);
+	assert.ok(status.details.resultPath);
+	assert.equal(
+		fs.readFileSync(status.details.resultPath, "utf-8").trim(),
+		"race-winner",
+	);
+
+	// The persisted record must reflect terminal wins
+	const persisted = readPersistedRecord(sessionId, recordId);
+	assert.equal(persisted.running, false);
+	assert.equal(
+		fs.readFileSync(persisted.result, "utf-8").trim(),
+		"race-winner",
+	);
+
+	// Notification fields: notifiedCompletion should be preserved (true)
+	assert.equal(persisted.notifiedCompletion, true);
+	assert.equal(persisted.pendingCompletionNotice, false);
+
+	cleanupTestCtx(ctx, sessionId);
+});
+
+test("Phase 7.11: parent/session restart with live PID — reconcile keeps active", async () => {
+	const { sessionId, ctx } = makeTestCtx("pi-subagents-livepid-11");
+
+	const recordId = "livepid-child";
+	const storeFilePath = storeFile(sessionId);
+	fs.mkdirSync(path.dirname(storeFilePath), { recursive: true });
+
+	const childDataDir = path.join(storeDir(sessionId), recordId);
+	fs.mkdirSync(childDataDir, { recursive: true });
+	const stdoutPath = path.join(childDataDir, "stdout.log");
+	const stderrPath = path.join(childDataDir, "stderr.log");
+	// Write minimal stdout so extractFinalOutput doesn't produce empty error
+	fs.writeFileSync(
+		stdoutPath,
+		'{"type":"message","message":{"role":"assistant","content":"still alive"}}\n',
+		"utf-8",
+	);
+	fs.writeFileSync(stderrPath, "", "utf-8");
+
+	// Use the current test process PID — it's definitely running
+	const record = {
+		id: recordId,
+		parentSessionId: sessionId,
+		cwd: ctx.cwd,
+		taskPreview: "live pid test",
+		keepContext: false,
+		timeout: 3600,
+		running: true,
+		pid: process.pid,
+		sessionFile: path.join(childDataDir, "session.jsonl"),
+		outputFile: path.join(childDataDir, "result.md"),
+		stdoutFile: stdoutPath,
+		stderrFile: stderrPath,
+		createdAt: Date.now() - 60_000,
+		updatedAt: Date.now() - 30_000,
+	};
+	fs.writeFileSync(
+		storeFilePath,
+		JSON.stringify({ records: [record] }, null, 2),
+		{ mode: 0o600 },
+	);
+
+	// Simulate fresh session_start via fresh process
+	const result = executeSubagentToolInFreshProcess({
+		sessionId,
+		cwd: ctx.cwd,
+		tool: "get_subagent_status",
+		id: recordId,
+	});
+
+	const status = result.result as {
+		details: { id: string; running: boolean; result?: string };
+	};
+	assert.equal(status.details.id, recordId);
+	// PID is live, so reconcile keeps running=true
+	assert.equal(status.details.running, true);
+
+	const persisted = readPersistedRecord(sessionId, recordId);
+	assert.equal(persisted.running, true);
+
+	cleanupTestCtx(ctx, sessionId);
+});
+
+test("N4: restarted parent reconciles an already-live child from a prior process", async () => {
+	const mockPi = createMockPi();
+	mockPi.install();
+	mockPi.onCall({ output: "live restart done", exitCode: 0, delay: 700 });
+	const { sessionId, ctx } = makeTestCtx("pi-subagents-live-restart-n4");
+	const sessionFile = path.join(sessionId, "session.jsonl");
+	const extensionPath = path.join(projectRoot, "src/extension/index.ts");
+	const childId = "live-restart-child";
+	const messagesFile = path.join(sessionId, "n4-messages.jsonl");
+	const firstProcessScript = `
+		import fs from "node:fs";
+		import registerSubagentExtension from ${JSON.stringify(extensionPath)};
+		const registered = new Map();
+		registerSubagentExtension({
+			registerTool(tool) { registered.set(tool.name, tool); },
+			sendMessage(message) { fs.appendFileSync(${JSON.stringify(messagesFile)}, JSON.stringify(message) + "\\n", "utf-8"); },
+			on() {},
+		});
+		const ctx = {
+			cwd: ${JSON.stringify(ctx.cwd)},
+			hasUI: false,
+			sessionManager: {
+				getSessionFile: () => ${JSON.stringify(sessionFile)},
+				getSessionId: () => ${JSON.stringify(sessionFile)},
+			},
+		};
+		await registered.get("spawn_subagent").execute(
+			${JSON.stringify(childId)},
+			{ task: "live restart", async: true, keepContext: false },
+			new AbortController().signal,
+			undefined,
+			ctx,
+		);
+		// Process stays alive naturally until the async child exits because child stdio is ref'd.
+	`;
+	const restartScript = `
+		import fs from "node:fs";
+		import registerSubagentExtension from ${JSON.stringify(extensionPath)};
+		const messages = [];
+		const widgetCalls = [];
+		const registered = new Map();
+		let sessionStart;
+		registerSubagentExtension({
+			registerTool(tool) { registered.set(tool.name, tool); },
+			sendMessage(message) { if (typeof message.content === "string") messages.push(message.content); },
+			on(event, handler) { if (event === "session_start") sessionStart = handler; },
+		});
+		const ctx = {
+			cwd: ${JSON.stringify(ctx.cwd)},
+			hasUI: true,
+			ui: { setWidget(key, lines) { widgetCalls.push({ key, lines }); } },
+			sessionManager: {
+				getSessionFile: () => ${JSON.stringify(sessionFile)},
+				getSessionId: () => ${JSON.stringify(sessionFile)},
+			},
+		};
+		await sessionStart(undefined, ctx);
+		const storeAfterStart = JSON.parse(fs.readFileSync(${JSON.stringify(storeFile(sessionId))}, "utf-8"));
+		const recordAfterStart = storeAfterStart.records.find((candidate) => candidate.id === ${JSON.stringify(childId)});
+		await new Promise((resolve) => setTimeout(resolve, 900));
+		await registered.get("list_subagents").execute(
+			"restart-list-after-exit",
+			{},
+			new AbortController().signal,
+			undefined,
+			ctx,
+		);
+		const terminalStore = JSON.parse(fs.readFileSync(${JSON.stringify(storeFile(sessionId))}, "utf-8"));
+		const terminalRecord = terminalStore.records.find((candidate) => candidate.id === ${JSON.stringify(childId)});
+		const status = await registered.get("get_subagent_status").execute(
+			"restart-status",
+			{ id: ${JSON.stringify(childId)} },
+			new AbortController().signal,
+			undefined,
+			ctx,
+		);
+		await new Promise((resolve) => setTimeout(resolve, 50));
+		const storeAfterCompletion = JSON.parse(fs.readFileSync(${JSON.stringify(storeFile(sessionId))}, "utf-8"));
+		const recordAfterCompletion = storeAfterCompletion.records.find((candidate) => candidate.id === ${JSON.stringify(childId)});
+		console.log(JSON.stringify({ messages, widgetCalls, recordAfterStart, recordAfterCompletion, status }));
+	`;
+	let first: ReturnType<typeof spawn> | undefined;
+	try {
+		first = spawn(
+			process.execPath,
+			[
+				"--experimental-strip-types",
+				"--input-type=module",
+				"-e",
+				firstProcessScript,
+			],
+			{ cwd: projectRoot, env: process.env },
+		);
+		await waitForPersistedRecord(
+			sessionId,
+			childId,
+			(record) => record.running === true && typeof record.pid === "number",
+		);
+		const preRestart = readPersistedRecord(sessionId, childId);
+		assert.equal(preRestart.running, true);
+		assert.equal(typeof preRestart.pid, "number");
+		assert.notEqual(preRestart.pid, process.pid);
+
+		const restarted = spawnSync(
+			process.execPath,
+			[
+				"--experimental-strip-types",
+				"--input-type=module",
+				"-e",
+				restartScript,
+			],
+			{ cwd: projectRoot, encoding: "utf-8", env: process.env },
+		);
+		assert.equal(restarted.status, 0, restarted.stderr || restarted.stdout);
+		const result = JSON.parse(restarted.stdout) as {
+			messages: string[];
+			widgetCalls: Array<{ key: string; lines?: string[] }>;
+			recordAfterStart?: Record<string, any>;
+			recordAfterCompletion?: Record<string, any>;
+			status: { details: { running: boolean } };
+		};
+		assert.ok(
+			result.recordAfterStart,
+			"restarted parent reads pre-existing child record",
+		);
+		assert.equal(
+			result.recordAfterStart.running,
+			true,
+			"live PID stays running after restart reconciliation",
+		);
+		assert.equal(result.recordAfterStart.pid, preRestart.pid);
+		const firstExit = await new Promise<{
+			code: number | null;
+			signal: NodeJS.Signals | null;
+		}>((resolve) => {
+			first!.once("exit", (code, signal) => resolve({ code, signal }));
+		});
+		assert.deepEqual(firstExit, { code: 0, signal: null });
+		const parentMessages = fs
+			.readFileSync(messagesFile, "utf-8")
+			.trim()
+			.split("\n")
+			.filter(Boolean)
+			.map((line) => JSON.parse(line) as { content?: unknown });
+		assert.ok(
+			result.widgetCalls.some((c) =>
+				c.lines?.some((line) => line.includes(childId)),
+			),
+			"restarted parent renders widget for already-live child",
+		);
+		assert.equal(
+			parentMessages.filter(
+				(m) => typeof m.content === "string" && m.content.includes("completed"),
+			).length,
+			1,
+			"original live parent eventually sends exactly one completion notification",
+		);
+		assert.equal(
+			result.messages.filter((m) => m.includes("completed")).length,
+			0,
+		);
+		assert.equal(result.status.details.running, false);
+		assert.equal(result.recordAfterCompletion?.running, false);
+		assert.ok(
+			parentMessages.some(
+				(m) =>
+					typeof m.content === "string" &&
+					m.content.includes(childId) &&
+					m.content.includes("completed"),
+			),
+			"normal child completion sends notification after child exits",
+		);
+		assert.ok(
+			result.widgetCalls.some((c) => c.lines === undefined),
+			"restarted parent clears widget after completion",
+		);
+	} finally {
+		if (first && !first.killed) first.kill();
+		mockPi.uninstall();
+		cleanupTestCtx(ctx, sessionId);
+	}
+});
+
+test("Phase 7.12: dead PID with no output is terminal unknown/error", async () => {
+	const { sessionId, ctx } = makeTestCtx("pi-subagents-deadpid-nooutput-12");
+
+	const recordId = "deadpid-nooutput-child";
+	const storeFilePath = storeFile(sessionId);
+	fs.mkdirSync(path.dirname(storeFilePath), { recursive: true });
+
+	const childDataDir = path.join(storeDir(sessionId), recordId);
+	fs.mkdirSync(childDataDir, { recursive: true });
+	const stdoutPath = path.join(childDataDir, "stdout.log");
+	const stderrPath = path.join(childDataDir, "stderr.log");
+	// No output at all — files are empty
+	fs.writeFileSync(stdoutPath, "", "utf-8");
+	fs.writeFileSync(stderrPath, "", "utf-8");
+
+	const record = {
+		id: recordId,
+		parentSessionId: sessionId,
+		cwd: ctx.cwd,
+		taskPreview: "dead pid no output",
+		keepContext: false,
+		timeout: 3600,
+		running: true,
+		pid: 32767, // definitely not running
+		sessionFile: path.join(childDataDir, "session.jsonl"),
+		outputFile: path.join(childDataDir, "result.md"),
+		stdoutFile: stdoutPath,
+		stderrFile: stderrPath,
+		createdAt: Date.now() - 60_000,
+		updatedAt: Date.now() - 60_000,
+	};
+	fs.writeFileSync(
+		storeFilePath,
+		JSON.stringify({ records: [record] }, null, 2),
+		{ mode: 0o600 },
+	);
+
+	const result = executeSubagentToolInFreshProcess({
+		sessionId,
+		cwd: ctx.cwd,
+		tool: "get_subagent_status",
+		id: recordId,
+	});
+
+	const status = result.result as {
+		details: {
+			id: string;
+			running: boolean;
+			resultPath?: string;
+			error?: string;
+		};
+	};
+	assert.equal(status.details.id, recordId);
+	assert.equal(status.details.running, false);
+	assert.ok(status.details.resultPath);
+	assert.equal(
+		fs.readFileSync(status.details.resultPath, "utf-8").trim(),
+		"(no output)",
+	);
+
+	// Persisted record must also show terminal no-output result path
+	const persisted = readPersistedRecord(sessionId, recordId);
+	assert.equal(persisted.running, false);
+	assert.equal(
+		fs.readFileSync(persisted.result, "utf-8").trim(),
+		"(no output)",
+	);
+	assert.ok(persisted.completedAt);
+
+	// Widget should NOT render an active line for this record
+	// Verify via list: should show running=false
+	const listResult = executeSubagentToolInFreshProcess({
+		sessionId,
+		cwd: ctx.cwd,
+		tool: "list_subagents",
+	});
+	const listed = listResult.result as {
+		details: { subagents: Array<{ id: string; running: boolean }> };
+	};
+	assert.deepEqual(listed.details.subagents, [
+		{ id: recordId, running: false },
+	]);
+
+	cleanupTestCtx(ctx, sessionId);
+});
+
+test("Phase 7.13: per-parent widget timer cleanup — one parent idles, other stays active", async () => {
+	const originalSetInterval = globalThis.setInterval;
+	const originalClearInterval = globalThis.clearInterval;
+	const timers: Array<{
+		fn: () => void;
+		ms: number;
+		cleared: boolean;
+		unrefCalled: boolean;
+	}> = [];
+	(globalThis as any).setInterval = (fn: () => void, ms?: number) => {
+		const timer = { fn, ms: Number(ms), cleared: false, unrefCalled: false };
+		(timer as any).unref = () => {
+			timer.unrefCalled = true;
+		};
+		timers.push(timer);
+		return timer as any;
+	};
+	(globalThis as any).clearInterval = (timer: any) => {
+		timer.cleared = true;
+	};
+	const mockPi = createMockPi();
+	mockPi.install();
+	mockPi.onCall({ output: "parent-a done", exitCode: 0, delay: 80 });
+	// Parent B must remain active while parent A idles; use a long-lived child
+	// and explicitly terminate it after the active-timer assertion.
+	mockPi.onCall({ output: "parent-b done", exitCode: 0, delay: 30_000 });
+
+	// Parent A
+	const a = makeTestCtx("pi-subagents-timer-a-13");
+	const fakeA = makeFakeCtx(a.sessionId, a.ctx.cwd, true);
+	const toolsA = registerTestTools(() => {});
+
+	// Parent B
+	const b = makeTestCtx("pi-subagents-timer-b-13");
+	const fakeB = makeFakeCtx(b.sessionId, b.ctx.cwd, true);
+	const toolsB = registerTestTools(() => {});
+
+	try {
+		// Spawn async in both parents
+		await toolsA.spawnTool.execute(
+			"timer-child-a",
+			{
+				task: "parent A child",
+				async: true,
+				keepContext: false,
+			},
+			new AbortController().signal,
+			undefined,
+			fakeA.ctx,
+		);
+		await toolsB.spawnTool.execute(
+			"timer-child-b",
+			{
+				task: "parent B child",
+				async: true,
+				keepContext: false,
+			},
+			new AbortController().signal,
+			undefined,
+			fakeB.ctx,
+		);
+
+		// Both should have widget lines
+		const aRender = fakeA.widgetCalls.find(
+			(c) => c.lines != null && c.lines.length === 1,
+		);
+		const bRender = fakeB.widgetCalls.find(
+			(c) => c.lines != null && c.lines.length === 1,
+		);
+		assert.ok(aRender, "parent A should have widget line");
+		assert.ok(bRender, "parent B should have widget line");
+		assert.equal(timers.length, 4, "two timers per active parent");
+		const parentATimers = timers.slice(0, 2);
+		const parentBTimers = timers.slice(2, 4);
+		assert.deepEqual(
+			parentATimers.map((t) => t.ms).sort((x, y) => x - y),
+			[1000, 5000],
+			"parent A has widget + reconcile timers",
+		);
+		assert.deepEqual(
+			parentBTimers.map((t) => t.ms).sort((x, y) => x - y),
+			[1000, 5000],
+			"parent B has widget + reconcile timers",
+		);
+
+		// End parent A deterministically, then run parent A's reconcile timer
+		// callback explicitly because this test stubs setInterval.
+		const runningA = readPersistedRecord(a.sessionId, "timer-child-a");
+		if (runningA.running && typeof runningA.pid === "number") {
+			try {
+				process.kill(runningA.pid, "SIGTERM");
+			} catch {
+				// Child may have exited between reading the durable record and cleanup.
+			}
+		}
+		for (let i = 0; i < 200; i++) {
+			parentATimers.find((timer) => timer.ms === 5000 && !timer.cleared)?.fn();
+			const status = await toolsA.statusTool.execute(
+				`timer-child-a-status-${i}`,
+				{ id: "timer-child-a" },
+				new AbortController().signal,
+				undefined,
+				fakeA.ctx,
+			);
+			if (!status.details.running) break;
+			await new Promise((resolve) => setTimeout(resolve, 20));
+		}
+		parentATimers.find((timer) => timer.ms === 5000)?.fn();
+
+		await toolsA.listTool.execute(
+			"timer-child-a-refresh",
+			{},
+			new AbortController().signal,
+			undefined,
+			fakeA.ctx,
+		);
+
+		// Parent A's widget should be cleared after list/status reconciliation observes idle state.
+		let aClearCount = 0;
+		for (let i = 0; i < 100; i++) {
+			aClearCount = fakeA.widgetCalls.filter(
+				(c) => c.lines === undefined && c.key?.includes("pi-subagents-running"),
+			).length;
+			if (aClearCount >= 1 && parentATimers.every((timer) => timer.cleared))
+				break;
+			await new Promise((resolve) => setTimeout(resolve, 20));
+		}
+		assert.ok(
+			aClearCount >= 1 || parentATimers.every((timer) => timer.cleared),
+			"parent A should become idle after child completes",
+		);
+		assert.ok(
+			parentATimers.every((timer) => timer.cleared),
+			"idle parent A timers should be cleared one by one",
+		);
+		assert.ok(
+			parentBTimers.every((timer) => !timer.cleared),
+			"active parent B timers must remain scheduled",
+		);
+
+		// Parent B's child is still running (delay 3000), widget should still have line
+		const bStillShown = fakeB.widgetCalls.some(
+			(c) =>
+				c.lines != null &&
+				c.lines.length === 1 &&
+				c.lines[0].includes("timer-child-b"),
+		);
+		assert.ok(
+			bStillShown,
+			"parent B widget should still be active while child runs",
+		);
+
+		const runningB = readPersistedRecord(b.sessionId, "timer-child-b");
+		assert.equal(
+			runningB.running,
+			true,
+			"parent B child remains active before cleanup",
+		);
+		assert.equal(typeof runningB.pid, "number");
+		try {
+			process.kill(runningB.pid, "SIGTERM");
+		} catch {
+			// If the child exited between the assertion and cleanup, status polling below
+			// still observes the terminal state.
+		}
+
+		// Now wait for parent B's child to complete.
+		let bStatus: any;
+		for (let i = 0; i < 200; i++) {
+			parentBTimers.find((timer) => timer.ms === 5000 && !timer.cleared)?.fn();
+			bStatus = await toolsB.statusTool.execute(
+				`status-timer-child-b-${i}`,
+				{ id: "timer-child-b" },
+				new AbortController().signal,
+				undefined,
+				fakeB.ctx,
+			);
+			if (!bStatus.details.running) break;
+			await new Promise((resolve) => setTimeout(resolve, 20));
+		}
+		assert.equal(
+			bStatus.details.running,
+			false,
+			"parent B child should complete",
+		);
+
+		// Parent B's widget should also clear now.
+		let bClearCount = 0;
+		for (let i = 0; i < 100; i++) {
+			bClearCount = fakeB.widgetCalls.filter(
+				(c) => c.lines === undefined && c.key?.includes("pi-subagents-running"),
+			).length;
+			if (bClearCount >= 1) break;
+			await new Promise((resolve) => setTimeout(resolve, 20));
+		}
+		assert.ok(
+			bClearCount >= 1 || parentBTimers.every((timer) => timer.cleared),
+			"parent B widget should clear after its child completes",
+		);
+		await new Promise((resolve) => setTimeout(resolve, 300));
+	} finally {
+		mockPi.uninstall();
+		cleanupTestCtx(a.ctx, a.sessionId);
+		cleanupTestCtx(b.ctx, b.sessionId);
+		globalThis.setInterval = originalSetInterval;
+		globalThis.clearInterval = originalClearInterval;
+	}
+});
+
+test("Phase 7.14: session_start renders widget before user status", async () => {
+	const { sessionId, ctx } = makeTestCtx("pi-subagents-sessionstart-14");
+
+	const recordId = "sessionstart-child";
+	const storeFilePath = storeFile(sessionId);
+	fs.mkdirSync(path.dirname(storeFilePath), { recursive: true });
+
+	const childDataDir = path.join(storeDir(sessionId), recordId);
+	fs.mkdirSync(childDataDir, { recursive: true });
+	const stdoutPath = path.join(childDataDir, "stdout.log");
+	const stderrPath = path.join(childDataDir, "stderr.log");
+	fs.writeFileSync(
+		stdoutPath,
+		'{"type":"message","message":{"role":"assistant","content":"session start test"}}\n',
+		"utf-8",
+	);
+	fs.writeFileSync(stderrPath, "", "utf-8");
+
+	// Persist a live running record (PID = current process, definitely alive)
+	const record = {
+		id: recordId,
+		parentSessionId: sessionId,
+		cwd: ctx.cwd,
+		taskPreview: "session start test",
+		keepContext: false,
+		timeout: 3600,
+		running: true,
+		pid: process.pid,
+		sessionFile: path.join(childDataDir, "session.jsonl"),
+		outputFile: path.join(childDataDir, "result.md"),
+		stdoutFile: stdoutPath,
+		stderrFile: stderrPath,
+		createdAt: Date.now() - 60_000,
+		updatedAt: Date.now() - 30_000,
+	};
+	fs.writeFileSync(
+		storeFilePath,
+		JSON.stringify({ records: [record] }, null, 2),
+		{ mode: 0o600 },
+	);
+
+	// Capture session_start handler
+	let sessionStartHandler:
+		| ((_event: unknown, ctx: unknown) => void)
+		| undefined;
+	const widgetCalls: Array<{ key: string; lines: string[] | undefined }> = [];
+
+	const fakePi = {
+		registerTool() {},
+		sendMessage() {},
+		on(event: string, handler: (_event: unknown, ctx: unknown) => void) {
+			if (event === "session_start") sessionStartHandler = handler;
+		},
+	};
+	registerSubagentExtension(fakePi as never);
+
+	const uiCtx = {
+		cwd: ctx.cwd,
+		hasUI: true,
+		ui: {
+			setWidget(key: string, lines: string[] | undefined) {
+				widgetCalls.push({ key, lines });
+			},
+		},
+		sessionManager: {
+			getSessionFile: () => sessionId,
+			getSessionId: () => sessionId,
+		},
+	};
+
+	// Trigger session_start
+	assert.ok(sessionStartHandler, "session_start handler should be registered");
+	sessionStartHandler!(undefined, uiCtx);
+
+	// After session_start, widget should have rendered with active subagent line
+	const widgetAfterStart = widgetCalls.filter(
+		(c) => c.lines != null && c.key?.includes("pi-subagents-running"),
+	);
+	assert.ok(
+		widgetAfterStart.length >= 1,
+		"session_start should render widget with active subagent line",
+	);
+
+	const activeWidget = widgetAfterStart.find((c) =>
+		c.lines?.some((line) => line.includes(recordId)),
+	);
+	assert.ok(
+		activeWidget,
+		"widget should show active line for persisted live child",
+	);
+
+	cleanupTestCtx(ctx, sessionId);
+});
+
+test("Phase 7.15: completion callback after timeout — one timeout, one completion, terminal state persists", async () => {
+	const mockPi = createMockPi();
+	mockPi.install();
+	// Child takes long enough for timeout to fire first
+	mockPi.onCall({ output: "eventual done", exitCode: 0, delay: 200 });
+
+	const { sessionId, ctx } = makeTestCtx("pi-subagents-timeout-complete-15");
+	const fake = makeFakeCtx(sessionId, ctx.cwd, true);
+
+	const sentMessages: string[] = [];
+	const { spawnTool, statusTool } = registerTestTools((message) => {
+		const content = (message as { content?: unknown }).content;
+		if (typeof content === "string") sentMessages.push(content);
+	});
+
+	try {
+		await spawnTool.execute(
+			"timeout-then-complete",
+			{
+				task: "timeout then done",
+				async: true,
+				keepContext: false,
+				timeout: 0.08, // fires before delay=200
+			},
+			new AbortController().signal,
+			undefined,
+			fake.ctx,
+		);
+
+		// Wait for timeout to fire (0.08s + buffer)
+		await new Promise((resolve) => setTimeout(resolve, 150));
+
+		// Trigger widget render via status (status check avoids waiting for timer)
+		await statusTool.execute(
+			"trigger-timeout-widget-refresh",
+			{ id: "timeout-then-complete" },
+			new AbortController().signal,
+			undefined,
+			fake.ctx,
+		);
+
+		// Check timeout notification was sent
+		const timeoutMessages = sentMessages.filter(
+			(m) =>
+				m.includes("timeout-then-complete") && m.includes("timed out after"),
+		);
+		assert.equal(timeoutMessages.length, 1, "exactly one timeout notification");
+
+		// Widget should show timed out, still running
+		const timedOutWidget = fake.widgetCalls.find(
+			(c) =>
+				c.lines != null &&
+				c.lines.some((line) => /timed out, still running/.test(line)),
+		);
+		assert.ok(timedOutWidget, "widget should show timed out state");
+
+		// Now wait for completion
+		const finalStatus = await waitForStatus(
+			statusTool,
+			"timeout-then-complete",
+			fake.ctx,
+		);
+		assert.equal(finalStatus.details.running, false);
+		assert.ok(finalStatus.details.resultPath);
+		assert.equal(
+			fs.readFileSync(finalStatus.details.resultPath, "utf-8").trim(),
+			"eventual done",
+		);
+		assert.equal(finalStatus.details.timedOut, true);
+
+		// Completion notification should be sent exactly once
+		const completionMessages = sentMessages.filter(
+			(m) => m.includes("timeout-then-complete") && m.includes("completed"),
+		);
+		assert.equal(
+			completionMessages.length,
+			1,
+			"exactly one completion notification",
+		);
+
+		// Terminal state persists
+		const record = readPersistedRecord(sessionId, "timeout-then-complete");
+		assert.equal(record.running, false);
+		assert.equal(
+			fs.readFileSync(record.result, "utf-8").trim(),
+			"eventual done",
+		);
+		assert.ok(record.timeoutAt);
+		assert.equal(record.notifiedCompletion, true);
+
+		// Widget should clear
+		const clearCalls = fake.widgetCalls.filter(
+			(c) => c.lines === undefined && c.key?.includes("pi-subagents-running"),
+		);
+		assert.ok(clearCalls.length >= 1, "widget should clear after completion");
+	} finally {
+		mockPi.uninstall();
+		cleanupTestCtx(ctx, sessionId);
 	}
 });

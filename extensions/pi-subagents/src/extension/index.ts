@@ -12,7 +12,6 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { createForkContextResolver } from "../shared/fork-context.ts";
-import { resolveCurrentSessionId } from "../shared/session-identity.ts";
 import {
 	checkSubagentDepth,
 	getSubagentDepthEnv,
@@ -72,8 +71,33 @@ interface StoreFile {
 	records: PersistedSubagentRecord[];
 }
 
+interface ReconcileResult {
+	records: PersistedSubagentRecord[];
+	active: PersistedSubagentRecord[];
+}
+
+interface StartChildHooks {
+	onRunning?(record: PersistedSubagentRecord): void;
+	onTimeout?(record: PersistedSubagentRecord): void;
+	onTerminal?(record: PersistedSubagentRecord): void;
+	onSetupFailure?(record: PersistedSubagentRecord, error: unknown): void;
+}
+
 const DEFAULT_TIMEOUT_SECONDS = 3600;
 const runningChildren = new Map<string, ChildProcess>();
+
+// Widget state: parentId -> latest UI-capable ExtensionContext
+const uiParents = new Map<string, ExtensionContext>();
+// Dual timers per parent (always unref'd):
+// - widget (1Hz): refresh elapsed-time display
+// - reconcile (0.2Hz): belt-and-suspenders reconcile for sleep/wake recovery
+const widgetTimers = new Map<
+	string,
+	{ widget: NodeJS.Timeout; reconcile: NodeJS.Timeout }
+>();
+function safeName(value: string): string {
+	return value.replace(/[^a-zA-Z0-9_.-]/g, "_").slice(0, 160) || "session";
+}
 
 function getBaseDir(ctx: ExtensionContext): string {
 	const sessionFile = ctx.sessionManager.getSessionFile?.();
@@ -261,48 +285,304 @@ function extractFinalOutput(stdout: string): string {
 	return lastAssistant || rawLines.join("\n").trim();
 }
 
+function refreshRecord(record: PersistedSubagentRecord): {
+	record: PersistedSubagentRecord;
+	changed: boolean;
+} {
+	if (!record.running || isPidRunning(record.pid)) {
+		return { record, changed: false };
+	}
+	const refreshed: PersistedSubagentRecord = { ...record };
+	const stdout = fs.existsSync(refreshed.stdoutFile)
+		? fs.readFileSync(refreshed.stdoutFile, "utf-8")
+		: "";
+	const stderr = fs.existsSync(refreshed.stderrFile)
+		? fs.readFileSync(refreshed.stderrFile, "utf-8")
+		: "";
+	refreshed.running = false;
+	refreshed.updatedAt = Date.now();
+	refreshed.completedAt ??= Date.now();
+
+	// Check if subagent already wrote to the result file.
+	const hasExistingResult =
+		refreshed.outputFile &&
+		fs.existsSync(refreshed.outputFile) &&
+		fs.readFileSync(refreshed.outputFile, "utf-8").trim().length > 0;
+
+	if (!hasExistingResult) {
+		const finalOutput = extractFinalOutput(stdout);
+		if (finalOutput && refreshed.outputFile) {
+			fs.writeFileSync(refreshed.outputFile, `${finalOutput}\n`, {
+				mode: 0o600,
+			});
+		} else if (stderr.trim()) {
+			// Subagent produced only stderr, no stdout output.
+			if (!refreshed.error) refreshed.error = stderr.trim();
+			if (refreshed.outputFile) {
+				fs.writeFileSync(refreshed.outputFile, "(error)\n", { mode: 0o600 });
+			}
+		} else if (refreshed.outputFile) {
+			// Edge case: neither stdout nor stderr produced content.
+			// Write a placeholder so the parent gets a valid result file.
+			fs.writeFileSync(refreshed.outputFile, "(no output)\n", { mode: 0o600 });
+		}
+	}
+	refreshed.result = refreshed.outputFile;
+	return { record: refreshed, changed: true };
+}
+
 function refreshRecordFromDisk(
 	record: PersistedSubagentRecord,
 ): PersistedSubagentRecord {
-	if (record.running && !isPidRunning(record.pid)) {
-		const stdout = fs.existsSync(record.stdoutFile)
-			? fs.readFileSync(record.stdoutFile, "utf-8")
-			: "";
-		const stderr = fs.existsSync(record.stderrFile)
-			? fs.readFileSync(record.stderrFile, "utf-8")
-			: "";
-		record.running = false;
-		record.updatedAt = Date.now();
-		record.completedAt ??= Date.now();
+	const { record: refreshed, changed } = refreshRecord(record);
+	if (changed) upsertRecord(refreshed);
+	return refreshed;
+}
 
-		// Check if subagent already wrote to the result file.
-		const hasExistingResult =
-			record.outputFile &&
-			fs.existsSync(record.outputFile) &&
-			fs.readFileSync(record.outputFile, "utf-8").trim().length > 0;
-
-		if (!hasExistingResult) {
-			const finalOutput = extractFinalOutput(stdout);
-			if (finalOutput && record.outputFile) {
-				fs.writeFileSync(record.outputFile, `${finalOutput}\n`, {
-					mode: 0o600,
-				});
-			} else if (stderr.trim()) {
-				// Subagent produced only stderr, no stdout output.
-				if (!record.error) record.error = stderr.trim();
-				if (record.outputFile) {
-					fs.writeFileSync(record.outputFile, "(error)\n", { mode: 0o600 });
-				}
-			} else if (record.outputFile) {
-				// Edge case: neither stdout nor stderr produced content.
-				// Write a placeholder so the parent gets a valid result file.
-				fs.writeFileSync(record.outputFile, "(no output)\n", { mode: 0o600 });
-			}
+function reconcileStore(parentId: string): ReconcileResult {
+	const store = readStore(parentId);
+	const refreshedResults = store.records.map((r) => refreshRecord(r));
+	const latest = readStore(parentId);
+	const latestById = new Map(latest.records.map((r) => [r.id, r]));
+	const merged: PersistedSubagentRecord[] = [];
+	let anyChanged = false;
+	for (const { record: r, changed } of refreshedResults) {
+		const existing = latestById.get(r.id);
+		if (!existing) {
+			merged.push(r);
+			if (changed) anyChanged = true;
+			continue;
 		}
-		record.result = record.outputFile;
-		upsertRecord(record);
+		const result = mergeRecord(existing, r);
+		merged.push(result);
+		if (changed || JSON.stringify(result) !== JSON.stringify(existing))
+			anyChanged = true;
 	}
-	return record;
+	for (const [id, r] of latestById) {
+		if (!refreshedResults.some((ref) => ref.record.id === id)) merged.push(r);
+	}
+	if (anyChanged) writeStore(parentId, { records: merged });
+	const active = merged.filter((r) => r.running === true);
+	return { records: merged, active };
+}
+
+function mergeRecord(
+	latest: PersistedSubagentRecord,
+	refreshed: PersistedSubagentRecord,
+): PersistedSubagentRecord {
+	if (refreshed.running === false && latest.running === true) {
+		return applyNotificationFields(latest, refreshed, refreshed);
+	}
+	if (latest.running === false && refreshed.running === true) {
+		return applyNotificationFields(latest, refreshed, latest);
+	}
+	const base =
+		refreshed.updatedAt > latest.updatedAt
+			? {
+					...latest,
+					pid: refreshed.pid ?? latest.pid,
+					cwd: refreshed.cwd,
+					taskPreview: refreshed.taskPreview,
+					keepContext: refreshed.keepContext,
+					timeout: refreshed.timeout,
+					model: refreshed.model ?? latest.model,
+					running: refreshed.running,
+					sessionFile: refreshed.sessionFile ?? latest.sessionFile,
+					outputFile: refreshed.outputFile ?? latest.outputFile,
+					stdoutFile: refreshed.stdoutFile,
+					stderrFile: refreshed.stderrFile,
+					result: refreshed.result ?? latest.result,
+					error: refreshed.error ?? latest.error,
+					createdAt: refreshed.createdAt,
+					updatedAt: refreshed.updatedAt,
+					completedAt: refreshed.completedAt ?? latest.completedAt,
+					timeoutAt: refreshed.timeoutAt ?? latest.timeoutAt,
+				}
+			: latest;
+	return applyNotificationFields(latest, refreshed, base);
+}
+
+function applyNotificationFields(
+	latest: PersistedSubagentRecord,
+	refreshed: PersistedSubagentRecord,
+	base: PersistedSubagentRecord,
+): PersistedSubagentRecord {
+	// Avoid reordering keys: only assign fields whose computed value differs
+	// from what is already on the base. Otherwise JSON.stringify detects key
+	// reordering and triggers spurious reconcile writes that clobber durable
+	// notification state.
+	const r = base as unknown as Record<string, unknown>;
+	function set(key: string, val: unknown): void {
+		if (r[key] !== val) r[key] = val;
+	}
+	set(
+		"notifiedCompletion",
+		latest.notifiedCompletion || refreshed.notifiedCompletion,
+	);
+	set("timeoutNotified", latest.timeoutNotified || refreshed.timeoutNotified);
+	set(
+		"cohortFinalNotified",
+		latest.cohortFinalNotified || refreshed.cohortFinalNotified,
+	);
+	set("notifiedAt", refreshed.notifiedAt ?? latest.notifiedAt);
+	set(
+		"timeoutNotifiedAt",
+		refreshed.timeoutNotifiedAt ?? latest.timeoutNotifiedAt,
+	);
+	const notifiedCompletion =
+		latest.notifiedCompletion || refreshed.notifiedCompletion;
+	set(
+		"pendingCompletionNotice",
+		(latest.pendingCompletionNotice || refreshed.pendingCompletionNotice) &&
+			!notifiedCompletion,
+	);
+	set(
+		"completionNotificationPending",
+		(latest.completionNotificationPending ||
+			refreshed.completionNotificationPending) &&
+			!notifiedCompletion,
+	);
+	const timeoutNotified = latest.timeoutNotified || refreshed.timeoutNotified;
+	set(
+		"pendingTimeoutNotice",
+		(latest.pendingTimeoutNotice || refreshed.pendingTimeoutNotice) &&
+			!timeoutNotified,
+	);
+	set("notifyError", refreshed.notifyError || latest.notifyError);
+	set(
+		"timeoutNotifyError",
+		refreshed.timeoutNotifyError || latest.timeoutNotifyError,
+	);
+	return r as unknown as PersistedSubagentRecord;
+}
+
+function activeRecordsForParent(parentId: string): PersistedSubagentRecord[] {
+	return readStore(parentId).records.filter((r) => r.running === true);
+}
+
+function hasUiWidget(ctx: ExtensionContext): boolean {
+	return Boolean(ctx.hasUI && ctx.ui && typeof ctx.ui.setWidget === "function");
+}
+
+function safeSetWidget(
+	ctx: ExtensionContext,
+	key: string,
+	lines: string[] | undefined,
+): void {
+	if (!hasUiWidget(ctx)) return;
+	try {
+		ctx.ui?.setWidget(key, lines, { placement: "aboveEditor" });
+	} catch (_widgetError) {
+		// Widget failure must never fail child lifecycle
+	}
+}
+
+function rememberUiContext(ctx: ExtensionContext): void {
+	if (!hasUiWidget(ctx)) return;
+	const parentId = parentSessionId(ctx);
+	uiParents.set(parentId, ctx);
+}
+
+const WIDGET_REFRESH_INTERVAL_MS = 1000; // 1Hz — elapsed-time display
+const RECONCILE_INTERVAL_MS = 5000; // 0.2Hz — wake recovery belt-and-suspenders
+
+function scheduleWidgetRefresh(parentId: string): void {
+	const ctx = uiParents.get(parentId);
+	if (!ctx) return;
+	const active = activeRecordsForParent(parentId);
+	if (active.length === 0) {
+		stopWidgetRefreshIfIdle(parentId);
+		return;
+	}
+
+	const existing = widgetTimers.get(parentId);
+	if (existing) return; // already scheduled
+
+	const widgetTimer = setInterval(() => {
+		const freshCtx = uiParents.get(parentId);
+		if (!freshCtx) {
+			stopWidgetRefreshIfIdle(parentId);
+			return;
+		}
+		renderRunningWidget(freshCtx, parentId);
+	}, WIDGET_REFRESH_INTERVAL_MS);
+	widgetTimer.unref();
+
+	const reconcileTimer = setInterval(() => {
+		const freshCtx = uiParents.get(parentId);
+		if (!freshCtx) {
+			stopWidgetRefreshIfIdle(parentId);
+			return;
+		}
+		reconcileStore(parentId);
+		renderRunningWidget(freshCtx, parentId);
+		stopWidgetRefreshIfIdle(parentId);
+	}, RECONCILE_INTERVAL_MS);
+	reconcileTimer.unref();
+
+	widgetTimers.set(parentId, {
+		widget: widgetTimer,
+		reconcile: reconcileTimer,
+	});
+}
+
+function stopWidgetRefreshIfIdle(parentId: string): void {
+	const timers = widgetTimers.get(parentId);
+	if (!timers) return;
+	const active = activeRecordsForParent(parentId);
+	if (active.length > 0) return;
+	clearInterval(timers.widget);
+	clearInterval(timers.reconcile);
+	widgetTimers.delete(parentId);
+}
+
+function stopAllWidgetRefreshForInstance(): void {
+	for (const timers of widgetTimers.values()) {
+		clearInterval(timers.widget);
+		clearInterval(timers.reconcile);
+	}
+	widgetTimers.clear();
+	uiParents.clear();
+}
+
+function renderRunningWidget(ctx: ExtensionContext, parentId: string): void {
+	const active = activeRecordsForParent(parentId);
+	const key = runningWidgetKey(parentId);
+	if (active.length === 0) {
+		safeSetWidget(ctx, key, undefined);
+		stopWidgetRefreshIfIdle(parentId);
+		return;
+	}
+	const lines = active.map((r) => formatRunningLine(r));
+	safeSetWidget(ctx, key, lines);
+}
+
+function maybeRenderRunningWidget(
+	ctx: ExtensionContext,
+	parentId: string,
+): void {
+	if (!hasUiWidget(ctx)) return;
+	renderRunningWidget(ctx, parentId);
+}
+
+function runningWidgetKey(parentId: string): string {
+	return `pi-subagents-running:${safeName(parentId)}`;
+}
+
+function sanitizePreview(text: string): string {
+	return text.split("\n")[0].trim().slice(0, 100);
+}
+
+function formatRunningLine(record: PersistedSubagentRecord): string {
+	const elapsed = Math.floor((Date.now() - record.createdAt) / 1000);
+	const timedOut = Boolean(record.timeoutAt);
+	const statusText = timedOut
+		? "timed out, still running"
+		: `running ${elapsed}s`;
+	const pidPart = record.pid ? ` pid=${record.pid}` : "";
+	const preview = sanitizePreview(record.taskPreview);
+	const previewPart = preview ? ` — ${preview}` : "";
+	return `⏳ subagent ${record.id} ${statusText}${pidPart}${previewPart}`;
 }
 
 function resultForRecord(record: PersistedSubagentRecord): string | undefined {
@@ -320,7 +600,9 @@ function subagentSessionId(
 			const event = JSON.parse(line) as { type?: string; id?: unknown };
 			if (event.type === "session" && typeof event.id === "string")
 				return event.id;
-		} catch {}
+		} catch {
+			// Ignore malformed session log lines.
+		}
 	}
 	return undefined;
 }
@@ -569,25 +851,56 @@ function markTimedOut(
 	record: PersistedSubagentRecord,
 	queueNotice = true,
 ): PersistedSubagentRecord {
-	const latest = findRecord(record.parentSessionId, record.id) ?? record;
-	const refreshed = refreshRecordFromDisk(latest);
-	if (!refreshed.running) {
-		if (refreshed.pendingTimeoutNotice)
-			return markTimeoutNoticeSkipped(refreshed);
-		return refreshed;
-	}
-	if (!refreshed.timeoutAt) refreshed.timeoutAt = Date.now();
-	if (queueNotice && !refreshed.timeoutNotified)
-		refreshed.pendingTimeoutNotice = true;
-	refreshed.updatedAt = Date.now();
-	upsertRecord(refreshed);
-	return refreshed;
+	// Use updateRecordFields for atomic read-modify-write to avoid
+	// clobbering a newer terminal state written by the child close handler.
+	// WARNING: Do NOT call refreshRecordFromDisk or upsertRecord inside the
+	// callback.  The outer updateRecordFields writes the store after the
+	// callback returns, so any inner upsert would be immediately clobbered.
+	// Instead only check liveness via isPidRunning and conditionally clear
+	// pending flags on the record that updateRecordFields will persist.
+	const updated = updateRecordFields(
+		record.parentSessionId,
+		record.id,
+		(latest) => {
+			// Already terminal (child close handler won): just clear pending
+			// timeout flags without re-marking running.
+			if (!latest.running) {
+				if (latest.pendingTimeoutNotice) {
+					latest.pendingTimeoutNotice = false;
+					delete latest.timeoutNotifyError;
+				}
+				return;
+			}
+			// Verify PID is still alive.  If the PID died but store still
+			// says running, mark terminal inline (no separate upsert).
+			if (!isPidRunning(latest.pid)) {
+				latest.running = false;
+				latest.completedAt ??= Date.now();
+				if (latest.pendingTimeoutNotice) {
+					latest.pendingTimeoutNotice = false;
+					delete latest.timeoutNotifyError;
+				}
+				return;
+			}
+			if (!latest.timeoutAt) latest.timeoutAt = Date.now();
+			if (queueNotice && !latest.timeoutNotified) {
+				latest.pendingTimeoutNotice = true;
+			}
+		},
+	);
+	if (!updated) return record;
+	return updated;
 }
 
 function notifyTimeout(
 	pi: ExtensionAPI,
 	record: PersistedSubagentRecord,
 ): boolean {
+	// Re-read latest from store before sending; skip if already notified.
+	// Return true: consistent with notifyCompletion ("did we handle it?").
+	const freshLatest = findRecord(record.parentSessionId, record.id);
+	if (freshLatest?.timeoutNotified) return true;
+
 	const timedOut = markTimedOut(record);
 	if (!timedOut.running || !timedOut.timeoutAt || timedOut.timeoutNotified)
 		return false;
@@ -613,104 +926,169 @@ function startTimeoutTimer(
 	record: PersistedSubagentRecord,
 	notify: boolean,
 ): NodeJS.Timeout {
-	return setTimeout(() => {
+	const timer = setTimeout(function onSubagentTimeout() {
 		if (notify) notifyTimeout(pi, record);
 		else markTimedOut(record, false);
 	}, record.timeout * 1000);
+	timer.unref();
+	return timer;
 }
 
-async function runChild(
+function startChild(
 	pi: ExtensionAPI,
 	ctx: ExtensionContext,
 	record: PersistedSubagentRecord,
 	task: string,
 	notify = false,
-): Promise<PersistedSubagentRecord> {
+	hooks?: StartChildHooks,
+): { record: PersistedSubagentRecord; done: Promise<PersistedSubagentRecord> } {
 	const depth = checkSubagentDepth();
-	if (depth.blocked)
-		throw new Error(
+	if (depth.blocked) {
+		const error = new Error(
 			`Subagent recursion depth exceeded: depth ${depth.depth} >= max ${depth.maxDepth}.`,
 		);
+		record.running = false;
+		record.error = error.message;
+		record.completedAt = Date.now();
+		record.updatedAt = Date.now();
+		upsertRecord(record);
+		hooks?.onSetupFailure?.(record, error);
+		return { record, done: Promise.reject(error) };
+	}
+
+	let child: ChildProcess;
+	let stdoutStream: fs.WriteStream;
+	let stderrStream: fs.WriteStream;
 	const built = buildArgsForRecord(ctx, record, task);
-	upsertRecord(record);
-	const spawnSpec = getPiSpawnCommand(built.args);
-	const stdoutStream = fs.createWriteStream(record.stdoutFile, { flags: "a" });
-	const stderrStream = fs.createWriteStream(record.stderrFile, { flags: "a" });
-	const env = {
-		...process.env,
-		...built.env,
-		...getSubagentDepthEnv(resolveCurrentMaxSubagentDepth()),
-	};
-	const child = spawn(spawnSpec.command, spawnSpec.args, {
-		cwd: record.cwd,
-		stdio: ["ignore", "pipe", "pipe"],
-		env,
-	});
+
+	try {
+		upsertRecord(record);
+		const spawnSpec = getPiSpawnCommand(built.args);
+		stdoutStream = fs.createWriteStream(record.stdoutFile, { flags: "a" });
+		stderrStream = fs.createWriteStream(record.stderrFile, { flags: "a" });
+		const env = {
+			...process.env,
+			...built.env,
+			...getSubagentDepthEnv(resolveCurrentMaxSubagentDepth()),
+		};
+		child = spawn(spawnSpec.command, spawnSpec.args, {
+			cwd: record.cwd,
+			stdio: ["ignore", "pipe", "pipe"],
+			env,
+		});
+	} catch (error) {
+		record.running = false;
+		record.error = error instanceof Error ? error.message : String(error);
+		record.completedAt = Date.now();
+		record.updatedAt = Date.now();
+		upsertRecord(record);
+		hooks?.onSetupFailure?.(record, error);
+		return {
+			record,
+			done: Promise.reject(
+				error instanceof Error ? error : new Error(String(error)),
+			),
+		};
+	}
+
 	record.pid = child.pid;
 	record.running = true;
 	record.updatedAt = Date.now();
 	upsertRecord(record);
 	runningChildren.set(record.id, child);
+	hooks?.onRunning?.(record);
+
+	if (!child.stdout || !child.stderr) {
+		throw new Error("Subagent process stdio pipes were not created.");
+	}
 	child.stdout.pipe(stdoutStream);
 	child.stderr.pipe(stderrStream);
-	const finished = await new Promise<{
-		code: number | null;
-		signal: NodeJS.Signals | null;
-	}>((resolve) => {
-		child.on("close", (code, signal) => resolve({ code, signal }));
+
+	const done = new Promise<PersistedSubagentRecord>((resolve) => {
+		let finalized = false;
+
+		async function finalizeChild(
+			code: number | null,
+			signal: NodeJS.Signals | null,
+		) {
+			if (finalized) return;
+			finalized = true;
+
+			await Promise.all([
+				new Promise<void>((r) => stdoutStream.end(r)),
+				new Promise<void>((r) => stderrStream.end(r)),
+			]);
+
+			runningChildren.delete(record.id);
+			cleanupTempDir(built.tempDir);
+
+			const stdout = fs.existsSync(record.stdoutFile)
+				? fs.readFileSync(record.stdoutFile, "utf-8")
+				: "";
+			const stderr = fs.existsSync(record.stderrFile)
+				? fs.readFileSync(record.stderrFile, "utf-8")
+				: "";
+
+			const latest = findRecord(record.parentSessionId, record.id);
+			if (latest?.timeoutAt) record.timeoutAt = latest.timeoutAt;
+			if (latest?.timeoutNotified)
+				record.timeoutNotified = latest.timeoutNotified;
+
+			record.running = false;
+			record.completedAt = Date.now();
+			record.updatedAt = Date.now();
+
+			if (code !== 0 && !record.error)
+				record.error =
+					stderr.trim() ||
+					`Subagent exited with code ${code}${signal ? ` (${signal})` : ""}`;
+
+			// Check if subagent already wrote to result file
+			const hasExistingResult =
+				record.outputFile &&
+				fs.existsSync(record.outputFile) &&
+				fs.readFileSync(record.outputFile, "utf-8").trim().length > 0;
+
+			if (!hasExistingResult) {
+				// Subagent did not write to result file — auto-save final output
+				const finalOutput = extractFinalOutput(stdout);
+				if (finalOutput && record.outputFile) {
+					fs.writeFileSync(record.outputFile, `${finalOutput}\n`, {
+						mode: 0o600,
+					});
+				} else if (stderr.trim()) {
+					// Subagent produced only stderr, no stdout output.
+					if (!record.error) record.error = stderr.trim();
+					if (record.outputFile) {
+						fs.writeFileSync(record.outputFile, "(error)\n", { mode: 0o600 });
+					}
+				} else if (record.outputFile) {
+					// Edge case: neither stdout nor stderr produced content.
+					fs.writeFileSync(record.outputFile, "(no output)\n", { mode: 0o600 });
+				}
+			}
+			record.result = record.outputFile;
+
+			upsertRecord(record);
+
+			if (notify) {
+				notifyCompletionBestEffort(pi, record);
+			}
+
+			hooks?.onTerminal?.(record);
+			resolve(record);
+		}
+
+		child.on("close", (code, signal) => finalizeChild(code, signal));
 		child.on("error", (error) => {
-			record.error = error instanceof Error ? error.message : String(error);
-			resolve({ code: 1, signal: null });
+			if (!record.error) {
+				record.error = error instanceof Error ? error.message : String(error);
+			}
+			finalizeChild(1, null);
 		});
 	});
-	await Promise.all([
-		new Promise<void>((resolve) => stdoutStream.end(resolve)),
-		new Promise<void>((resolve) => stderrStream.end(resolve)),
-	]);
-	runningChildren.delete(record.id);
-	cleanupTempDir(built.tempDir);
-	const stdout = fs.existsSync(record.stdoutFile)
-		? fs.readFileSync(record.stdoutFile, "utf-8")
-		: "";
-	const stderr = fs.existsSync(record.stderrFile)
-		? fs.readFileSync(record.stderrFile, "utf-8")
-		: "";
-	const latest = findRecord(record.parentSessionId, record.id);
-	if (latest?.timeoutAt) record.timeoutAt = latest.timeoutAt;
-	if (latest?.timeoutNotified) record.timeoutNotified = latest.timeoutNotified;
-	record.running = false;
-	record.completedAt = Date.now();
-	record.updatedAt = Date.now();
-	if (finished.code !== 0 && !record.error)
-		record.error =
-			stderr.trim() ||
-			`Subagent exited with code ${finished.code}${finished.signal ? ` (${finished.signal})` : ""}`;
-	// Check if subagent already wrote to result file
-	const hasExistingResult =
-		record.outputFile &&
-		fs.existsSync(record.outputFile) &&
-		fs.readFileSync(record.outputFile, "utf-8").trim().length > 0;
 
-	if (!hasExistingResult) {
-		// Subagent did not write to result file — auto-save final output
-		const finalOutput = extractFinalOutput(stdout);
-		if (finalOutput && record.outputFile) {
-			fs.writeFileSync(record.outputFile, `${finalOutput}\n`, { mode: 0o600 });
-		} else if (stderr.trim()) {
-			// Subagent produced only stderr, no stdout output.
-			if (!record.error) record.error = stderr.trim();
-			if (record.outputFile) {
-				fs.writeFileSync(record.outputFile, "(error)\n", { mode: 0o600 });
-			}
-		} else if (record.outputFile) {
-			// Edge case: neither stdout nor stderr produced content.
-			fs.writeFileSync(record.outputFile, "(no output)\n", { mode: 0o600 });
-		}
-	}
-	record.result = record.outputFile;
-	upsertRecord(record);
-	if (notify) notifyCompletionBestEffort(pi, record);
-	return record;
+	return { record, done };
 }
 
 export default function registerSubagentExtension(pi: ExtensionAPI): void {
@@ -727,12 +1105,32 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 			_onUpdate: ((result: AgentToolResult<ToolDetails>) => void) | undefined,
 			ctx: ExtensionContext,
 		) {
-			retryPendingNotices(pi, parentSessionId(ctx));
+			const parentId = parentSessionId(ctx);
+			retryPendingNotices(pi, parentId);
+			rememberUiContext(ctx);
 			const record = makeRecord(ctx, params, id);
 			if (params.async) {
-				const childPromise = runChild(pi, ctx, record, params.task, true);
-				const timeoutTimer = startTimeoutTimer(pi, record, true);
-				void childPromise
+				const hooks: StartChildHooks = {
+					onRunning(_r) {
+						rememberUiContext(ctx);
+						renderRunningWidget(ctx, parentId);
+						scheduleWidgetRefresh(parentId);
+					},
+					onTimeout(_r) {
+						renderRunningWidget(ctx, parentId);
+					},
+					onTerminal(_r) {
+						renderRunningWidget(ctx, parentId);
+						stopWidgetRefreshIfIdle(parentId);
+					},
+					onSetupFailure(_r, _error) {
+						renderRunningWidget(ctx, parentId);
+						stopWidgetRefreshIfIdle(parentId);
+					},
+				};
+				const started = startChild(pi, ctx, record, params.task, true, hooks);
+				const timeoutTimer = startTimeoutTimer(pi, started.record, true);
+				void started.done
 					.catch((error) => {
 						record.running = false;
 						record.error =
@@ -744,39 +1142,62 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 							markPendingBeforeSend: false,
 						});
 					})
+					.catch(() => {})
 					.finally(() => clearTimeout(timeoutTimer));
 				return {
 					content: [
 						{
 							type: "text",
-							text: `Spawned subagent ${record.id}. Result will be at: ${record.outputFile}. You will be notified when this subagent completes. Do not poll for result - continue with whatever other work you may have.`,
+							text: `Spawned subagent ${started.record.id}. Result will be at: ${started.record.outputFile}. You will be notified when this subagent completes. Do not poll for result - continue with whatever other work you may have.`,
 						},
 					],
 					details: {
-						id: record.id,
-						running: true,
-						resultPath: record.outputFile,
+						id: started.record.id,
+						running: started.record.running,
+						resultPath: started.record.outputFile,
 					},
 				};
 			}
-			let timeoutTimer: NodeJS.Timeout | undefined;
-			const childPromise = runChild(
-				pi,
-				ctx,
-				record,
-				params.task,
-				false,
-			).finally(() => {
-				if (timeoutTimer) clearTimeout(timeoutTimer);
-			});
+
+			// Sync path
+			const hooks: StartChildHooks = {
+				onRunning(_r) {
+					rememberUiContext(ctx);
+					renderRunningWidget(ctx, parentId);
+					scheduleWidgetRefresh(parentId);
+				},
+				onTimeout(_r) {
+					renderRunningWidget(ctx, parentId);
+				},
+				onTerminal(_r) {
+					renderRunningWidget(ctx, parentId);
+					stopWidgetRefreshIfIdle(parentId);
+				},
+				onSetupFailure(_r, _error) {
+					renderRunningWidget(ctx, parentId);
+					stopWidgetRefreshIfIdle(parentId);
+				},
+			};
+			const started = startChild(pi, ctx, record, params.task, false, hooks);
+
+			let timeoutResolve: ((r: PersistedSubagentRecord) => void) | undefined;
+			const timeoutTimer = setTimeout(function onSyncSubagentTimeout() {
+				const timedOut = markTimedOut(started.record, false);
+				timeoutResolve?.(timedOut);
+			}, started.record.timeout * 1000);
+			timeoutTimer.unref();
+
 			const timeoutPromise = new Promise<PersistedSubagentRecord>((resolve) => {
-				timeoutTimer = setTimeout(
-					() => resolve(markTimedOut(record, false)),
-					record.timeout * 1000,
-				);
+				timeoutResolve = resolve;
 			});
-			const completed = await Promise.race([childPromise, timeoutPromise]);
-			return formatStatus(completed);
+
+			try {
+				const completed = await Promise.race([started.done, timeoutPromise]);
+				return formatStatus(completed);
+			} finally {
+				clearTimeout(timeoutTimer);
+				timeoutResolve = undefined;
+			}
 		},
 		renderCall(args, theme) {
 			return new Text(
@@ -796,7 +1217,7 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 		description:
 			"Get the status and result (or result file path) for a subagent. If the subagent is still running, the response will instruct you not to poll.",
 		parameters: GetSubagentStatusParams,
-		execute(
+		async execute(
 			_toolCallId: string,
 			params: GetSubagentStatusParamsLike,
 			_signal: AbortSignal,
@@ -804,9 +1225,11 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 			ctx: ExtensionContext,
 		) {
 			const parentId = parentSessionId(ctx);
+			rememberUiContext(ctx);
 			retryPendingNotices(pi, parentId);
 			const record = findRecord(parentId, params.id);
 			if (!record) throw new Error(`Unknown subagent id: ${params.id}`);
+			maybeRenderRunningWidget(ctx, parentId);
 			return formatStatus(record);
 		},
 		renderCall(args, theme) {
@@ -824,7 +1247,7 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 		description:
 			"List subagents for the current parent session. Data is persisted on disk across session restarts.",
 		parameters: ListSubagentsParams,
-		execute(
+		async execute(
 			_toolCallId: string,
 			_params: Record<string, never>,
 			_signal: AbortSignal,
@@ -832,11 +1255,11 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 			ctx: ExtensionContext,
 		) {
 			const parentId = parentSessionId(ctx);
+			rememberUiContext(ctx);
 			retryPendingNotices(pi, parentId);
-			const records = readStore(parentId).records.map((r) =>
-				refreshRecordFromDisk(r),
-			);
+			const { records } = reconcileStore(parentId);
 			const subagents = records.map((r) => ({ id: r.id, running: r.running }));
+			maybeRenderRunningWidget(ctx, parentId);
 			return {
 				content: [{ type: "text", text: JSON.stringify(subagents, null, 2) }],
 				details: { subagents },
@@ -854,4 +1277,38 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 	pi.registerTool(spawnTool);
 	pi.registerTool(statusTool);
 	pi.registerTool(listTool);
+
+	if (typeof pi.on === "function") {
+		pi.on("session_start", (_event, ctx) => {
+			rememberUiContext(ctx);
+			const parentId = parentSessionId(ctx);
+			reconcileStore(parentId);
+			if (hasUiWidget(ctx)) {
+				renderRunningWidget(ctx, parentId);
+				scheduleWidgetRefresh(parentId);
+			}
+			retryPendingNotices(pi, parentId);
+		});
+
+		pi.on("agent_end", (_event, ctx) => {
+			rememberUiContext(ctx);
+			const parentId = parentSessionId(ctx);
+			if (hasUiWidget(ctx)) {
+				renderRunningWidget(ctx, parentId);
+				scheduleWidgetRefresh(parentId);
+			}
+			// Headless/JSON mode: parent process stays alive naturally because
+			// child stdout/stderr pipes to fs.WriteStream keep Node's event loop alive.
+			// When all children complete, event loop drains and process exits naturally.
+			// IMPORTANT: assumes Pi does NOT call process.exit() after agent_end in
+			// headless mode. If that changes, extension needs explicit ref-counting.
+			// Do not close stdout: external caller owns stdout lifecycle.
+			// pi.sendMessage writes NDJSON to stdout after agent_end while stdout stays open.
+		});
+
+		pi.on("session_shutdown", (_event, _ctx) => {
+			// Clear all widget refresh timers to prevent stale UI state across extension instances.
+			stopAllWidgetRefreshForInstance();
+		});
+	}
 }
