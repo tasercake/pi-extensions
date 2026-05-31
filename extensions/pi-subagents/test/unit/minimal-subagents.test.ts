@@ -5,6 +5,7 @@ import * as os from "node:os";
 import { spawn, spawnSync } from "node:child_process";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
+import { Value } from "typebox/value";
 import registerSubagentExtension from "../../src/extension/index.ts";
 import {
 	SpawnSubagentParams,
@@ -21,6 +22,7 @@ import { buildPiArgs } from "../../src/runs/shared/pi-args.ts";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const projectRoot = path.resolve(__dirname, "..", "..");
+const subagentIdAliases = new Map<string, string>();
 
 function makeTestCtx(prefix: string) {
 	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), `${prefix}-`));
@@ -56,11 +58,18 @@ function cleanupTestCtx(ctx: { cwd: string }, sessionId: string) {
 	fs.rmSync(ctx.cwd, { recursive: true, force: true });
 }
 
+function actualSubagentId(id: string) {
+	return subagentIdAliases.get(id) ?? id;
+}
+
 function readPersistedRecord(sessionId: string, id: string) {
 	const store = JSON.parse(fs.readFileSync(storeFile(sessionId), "utf-8")) as {
 		records: Array<Record<string, any>>;
 	};
-	const record = store.records.find((candidate) => candidate.id === id);
+	const actualId = actualSubagentId(id);
+	const record = store.records.find((candidate) => candidate.id === actualId);
+	if (record) return record;
+	if (actualId === id && store.records.length === 1) return store.records[0]!;
 	assert(record, `expected persisted record ${id}`);
 	return record;
 }
@@ -90,7 +99,11 @@ function readSubagentStore(sessionId: string) {
 }
 
 function readSubagentRecord(sessionId: string, id: string) {
-	const record = readSubagentStore(sessionId).records.find((r) => r.id === id);
+	const actualId = actualSubagentId(id);
+	const store = readSubagentStore(sessionId);
+	const record = store.records.find((r) => r.id === actualId);
+	if (record) return record;
+	if (actualId === id && store.records.length === 1) return store.records[0]!;
 	assert.ok(record, `missing subagent record ${id}`);
 	return record;
 }
@@ -115,6 +128,7 @@ function executeSubagentToolInFreshProcess(args: {
 	id?: string;
 }) {
 	const sessionFile = path.join(args.sessionId, "session.jsonl");
+	const actualId = args.id ? actualSubagentId(args.id) : undefined;
 	const script = `
     import registerSubagentExtension from ${JSON.stringify(path.join(projectRoot, "src/extension/index.ts"))};
     const messages = [];
@@ -133,7 +147,7 @@ function executeSubagentToolInFreshProcess(args: {
     const tool = registered.get(${JSON.stringify(args.tool)});
     const result = await tool.execute(
       'fresh-runtime-tool-call',
-      ${JSON.stringify(args.tool === "get_subagent_status" ? { id: args.id } : {})},
+      ${JSON.stringify(args.tool === "get_subagent_status" ? { id: actualId } : {})},
       new AbortController().signal,
       undefined,
       ctx,
@@ -155,6 +169,17 @@ function executeSubagentToolInFreshProcess(args: {
 	};
 }
 
+function readLatestMockPiArgs(mockPi: { dir: string }) {
+	const calls = fs
+		.readdirSync(mockPi.dir)
+		.filter((name) => name.startsWith("call-") && name.endsWith(".json"))
+		.sort();
+	assert.ok(calls.length > 0, "expected mock pi args capture");
+	return JSON.parse(
+		fs.readFileSync(path.join(mockPi.dir, calls.at(-1)!), "utf-8"),
+	) as { args: string[] };
+}
+
 function registerTestTools(sendMessage: (...args: unknown[]) => void) {
 	const registered = new Map<string, any>();
 	const fakePi = {
@@ -164,9 +189,26 @@ function registerTestTools(sendMessage: (...args: unknown[]) => void) {
 		sendMessage,
 	};
 	registerSubagentExtension(fakePi as never);
+	const rawSpawnTool = registered.get("spawn_subagent");
 	return {
-		spawnTool: registered.get("spawn_subagent"),
-		statusTool: registered.get("get_subagent_status"),
+		spawnTool: {
+			...rawSpawnTool,
+			async execute(callId: string, ...args: any[]) {
+				const result = await rawSpawnTool.execute(callId, ...args);
+				const id = result?.details?.id;
+				if (typeof id === "string") subagentIdAliases.set(callId, id);
+				return result;
+			},
+		},
+		statusTool: {
+			...registered.get("get_subagent_status"),
+			execute(callId: string, params: any, ...args: any[]) {
+				const actualId = subagentIdAliases.get(params?.id) ?? params?.id;
+				return registered
+					.get("get_subagent_status")
+					.execute(callId, { ...params, id: actualId }, ...args);
+			},
+		},
 		listTool: registered.get("list_subagents"),
 	};
 }
@@ -214,8 +256,9 @@ test("schemas expose minimal three-tool parameter shapes", async () => {
 	assert.equal((SpawnSubagentParams as any).additionalProperties, false);
 	assert.deepEqual(
 		Object.keys(SpawnSubagentParams.properties).sort(),
-		["async", "cwd", "keepContext", "model", "task", "timeout"].sort(),
+		["async", "cwd", "model", "task", "timeout"].sort(),
 	);
+	assert(!("keepContext" in SpawnSubagentParams.properties));
 	assert(!("outputMode" in SpawnSubagentParams.properties));
 	assert.match(
 		(SpawnSubagentParams.properties.timeout as any).description,
@@ -232,6 +275,21 @@ test("schemas expose minimal three-tool parameter shapes", async () => {
 
 	const schemas = await import("../../src/extension/schemas.ts");
 	assert.equal("SteerSubagentParams" in schemas, false);
+});
+
+test("spawn rejects keepContext as additional property", () => {
+	assert.equal(
+		Value.Check(SpawnSubagentParams, {
+			task: "x",
+			async: false,
+			keepContext: false,
+		}),
+		false,
+	);
+	assert.equal(
+		Value.Check(SpawnSubagentParams, { task: "x", async: false }),
+		true,
+	);
 });
 
 test("extension registers only spawn status and list tools", () => {
@@ -324,6 +382,22 @@ test("child pi args do not restrict tools skills extensions or MCP", () => {
 	assert(built.args.includes("--extension"));
 });
 
+test("buildPiArgs supports sessionId with sessionDir", () => {
+	const built = buildPiArgs({
+		baseArgs: [],
+		task: "hello",
+		sessionEnabled: true,
+		sessionId: "123e4567-e89b-12d3-a456-426614174000",
+		sessionDir: "/tmp/pi-subagent-test/session-dir",
+	});
+
+	assert(built.args.includes("--session-id"));
+	assert(built.args.includes("123e4567-e89b-12d3-a456-426614174000"));
+	assert(built.args.includes("--session-dir"));
+	assert(built.args.includes("/tmp/pi-subagent-test/session-dir"));
+	assert.equal(built.args.includes("--session"), false);
+});
+
 test("async completion persists success and pending metadata when stale notification fails", async () => {
 	const mockPi = createMockPi();
 	mockPi.install();
@@ -341,7 +415,7 @@ test("async completion persists success and pending metadata when stale notifica
 	try {
 		await spawnTool.execute(
 			"stale-notify-child",
-			{ task: "finish", async: true, keepContext: false, timeout: 30 },
+			{ task: "finish", async: true, timeout: 30 },
 			new AbortController().signal,
 			undefined,
 			ctx,
@@ -394,7 +468,7 @@ test("get_subagent_status retries and clears a pending completion notice", async
 	try {
 		await spawnTool.execute(
 			"retry-status-child",
-			{ task: "finish", async: true, keepContext: false },
+			{ task: "finish", async: true },
 			new AbortController().signal,
 			undefined,
 			ctx,
@@ -453,7 +527,7 @@ test("list_subagents retries pending completion notices best-effort", async () =
 	try {
 		await spawnTool.execute(
 			"retry-list-child",
-			{ task: "finish", async: true, keepContext: false },
+			{ task: "finish", async: true },
 			new AbortController().signal,
 			undefined,
 			ctx,
@@ -475,7 +549,7 @@ test("list_subagents retries pending completion notices best-effort", async () =
 		const record = readPersistedRecord(sessionId, "retry-list-child");
 
 		assert.deepEqual(listed.details.subagents, [
-			{ id: "retry-list-child", running: false },
+			{ id: record.id, running: false },
 		]);
 		assert.equal(notifyAttempts, 2);
 		assert.equal(sentMessages.length, 1);
@@ -502,7 +576,7 @@ test("notification failures do not overwrite successful child result", async () 
 	try {
 		await spawnTool.execute(
 			"notify-failure-child",
-			{ task: "finish", async: true, keepContext: false },
+			{ task: "finish", async: true },
 			new AbortController().signal,
 			undefined,
 			ctx,
@@ -554,14 +628,14 @@ test("stale final cohort notification failure leaves cohort pending until retry 
 	try {
 		await spawnTool.execute(
 			"stale-final-cohort-first",
-			{ task: "finish first", async: true, keepContext: false },
+			{ task: "finish first", async: true },
 			new AbortController().signal,
 			undefined,
 			ctx,
 		);
 		await spawnTool.execute(
 			"stale-final-cohort-second",
-			{ task: "finish second", async: true, keepContext: false },
+			{ task: "finish second", async: true },
 			new AbortController().signal,
 			undefined,
 			ctx,
@@ -671,7 +745,7 @@ test("async timeout notifies parent without killing child", async () => {
 	try {
 		await spawnTool.execute(
 			"timeout-child",
-			{ task: "slow", async: true, keepContext: false, timeout: 0.3 },
+			{ task: "slow", async: true, timeout: 0.3 },
 			new AbortController().signal,
 			undefined,
 			ctx,
@@ -689,15 +763,16 @@ test("async timeout notifies parent without killing child", async () => {
 
 		assert.equal(timedOutStatus.details.running, true);
 		assert.equal(timedOutStatus.details.timedOut, true);
+		const timedOutRecord = readPersistedRecord(sessionId, "timeout-child");
 		assert.match(
 			timedOutStatus.details.timeoutMessage,
-			/sessionId=mock-session-/,
+			new RegExp(`sessionId=${timedOutRecord.id}`),
 		);
 		assert.match(timedOutStatus.details.timeoutMessage, /pid=\d+/);
 		assert.equal(sentMessages.length, 1);
 		assert.match(sentMessages[0], /timed out after 0\.3s/);
 		assert.match(sentMessages[0], /not killed/);
-		assert.match(sentMessages[0], /sessionId=mock-session-/);
+		assert.match(sentMessages[0], new RegExp(`sessionId=${timedOutRecord.id}`));
 		assert.match(sentMessages[0], /pid=\d+/);
 
 		const finalStatus = await waitForStatus(statusTool, "timeout-child", ctx);
@@ -743,7 +818,6 @@ test("stale async timeout notification remains pending and is retried by the nex
 			{
 				task: "slow timeout then finish",
 				async: true,
-				keepContext: false,
 				timeout: 0.05,
 			},
 			new AbortController().signal,
@@ -832,7 +906,6 @@ test("spawn_subagent retries a pending timeout notification before starting new 
 			{
 				task: "timeout before next spawn",
 				async: true,
-				keepContext: false,
 				timeout: 0.05,
 			},
 			new AbortController().signal,
@@ -865,7 +938,7 @@ test("spawn_subagent retries a pending timeout notification before starting new 
 
 		await retryTools.spawnTool.execute(
 			"timeout-retry-trigger-child",
-			{ task: "trigger retry", async: true, keepContext: false, timeout: 30 },
+			{ task: "trigger retry", async: true, timeout: 30 },
 			new AbortController().signal,
 			undefined,
 			ctx,
@@ -875,9 +948,10 @@ test("spawn_subagent retries a pending timeout notification before starting new 
 			/timed out after 0.05s/.test(content),
 		);
 		assert.equal(timeoutNotifications.length, 1);
+		const timedOutRecord = readSubagentRecord(sessionId, childId);
 		assert.match(
 			timeoutNotifications[0],
-			/Subagent stale-timeout-spawn-retry-child timed out/,
+			new RegExp(`Subagent ${timedOutRecord.id} timed out`),
 		);
 
 		const recordAfterRetry = readSubagentRecord(sessionId, childId);
@@ -931,7 +1005,6 @@ test("stale async timeout notification is not retried after child completion", a
 			{
 				task: "finish before timeout retry",
 				async: true,
-				keepContext: false,
 				timeout: 0.02,
 			},
 			new AbortController().signal,
@@ -1006,7 +1079,6 @@ test("stale async completion notification remains pending and is retried once by
 			{
 				task: "finish after stale notify",
 				async: true,
-				keepContext: false,
 				timeout: 30,
 			},
 			new AbortController().signal,
@@ -1059,14 +1131,15 @@ test("stale async completion notification remains pending and is retried once by
 			.map((message) => message.content)
 			.filter((content): content is string => typeof content === "string");
 		assert.equal(retriedNotifications.length, 1);
+		const recordAfterStaleFailureId = actualSubagentId(childId);
 		assert.match(
 			retriedNotifications[0],
-			/Subagent stale-retry-child completed\./,
+			new RegExp(`Subagent ${recordAfterStaleFailureId} completed\\.`),
 		);
 		const retryStatus = retry.result as {
 			details: { id: string; running: boolean; resultPath: string };
 		};
-		assert.equal(retryStatus.details.id, childId);
+		assert.equal(retryStatus.details.id, recordAfterStaleFailureId);
 		assert.equal(retryStatus.details.running, false);
 		assert.ok(retryStatus.details.resultPath, "resultPath must be present");
 		const retryContent = fs.readFileSync(
@@ -1115,14 +1188,14 @@ test("stale cohort notification failure does not suppress later final notificati
 	try {
 		await spawnTool.execute(
 			"stale-cohort-first",
-			{ task: "finish first", async: true, keepContext: false, timeout: 30 },
+			{ task: "finish first", async: true, timeout: 30 },
 			new AbortController().signal,
 			undefined,
 			ctx,
 		);
 		await spawnTool.execute(
 			"stale-cohort-second",
-			{ task: "finish second", async: true, keepContext: false, timeout: 30 },
+			{ task: "finish second", async: true, timeout: 30 },
 			new AbortController().signal,
 			undefined,
 			ctx,
@@ -1190,6 +1263,94 @@ test("stale cohort notification failure does not suppress later final notificati
 // Test 1: Schema excludes outputMode — updated above (first test in file)
 
 // Test 2: Spawn response includes resultPath (Requirement 2)
+test("blocking spawn persists unified id session file result.log and fresh args", async () => {
+	const mockPi = createMockPi();
+	mockPi.install();
+	mockPi.onCall({ output: "uuid done", exitCode: 0 });
+
+	const { sessionId, ctx } = makeTestCtx("pi-subagents-unified-id");
+	const { spawnTool } = registerTestTools(() => {});
+
+	try {
+		const result = await spawnTool.execute(
+			"unified-id-call",
+			{ task: "echo uuid", async: false },
+			new AbortController().signal,
+			undefined,
+			ctx,
+		);
+		const record = readPersistedRecord(sessionId, result.details.id);
+		assert.match(
+			record.id,
+			/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i,
+		);
+		assert.equal(
+			record.sessionDir,
+			path.join(sessionId, "subagents", record.id),
+		);
+		assert.ok(record.sessionFile, "record must have discovered sessionFile");
+		assert.equal(path.dirname(record.sessionFile), record.sessionDir);
+		assert.match(
+			path.basename(record.sessionFile),
+			new RegExp(`^\\d{4}-\\d{2}-\\d{2}T.*_${record.id}\\.jsonl$`),
+		);
+		const firstLine = fs
+			.readFileSync(record.sessionFile, "utf-8")
+			.split("\n")[0];
+		assert.deepEqual(JSON.parse(firstLine), { type: "session", id: record.id });
+		assert.equal(
+			record.outputFile,
+			path.join(sessionId, "subagents", record.id, "result.log"),
+		);
+		assert.ok(fs.existsSync(record.outputFile));
+		assert.match(fs.readFileSync(record.outputFile, "utf-8"), /uuid done/);
+
+		const captured = readLatestMockPiArgs(mockPi).args;
+		assert(captured.includes("--session-id"));
+		assert(captured.includes(record.id));
+		assert(captured.includes("--session-dir"));
+		assert(captured.includes(record.sessionDir));
+		assert.equal(captured.includes(record.sessionFile), false);
+		assert.equal(captured.includes("--fork"), false);
+	} finally {
+		mockPi.uninstall();
+		cleanupTestCtx(ctx, sessionId);
+	}
+});
+
+test("spawn starts fresh session and never forks parent history", async () => {
+	const mockPi = createMockPi();
+	mockPi.install();
+	mockPi.onCall({ output: "fresh", exitCode: 0 });
+
+	const { sessionId, ctx } = makeTestCtx("pi-subagents-no-fork");
+	const { spawnTool } = registerTestTools(() => {});
+
+	try {
+		const result = await spawnTool.execute(
+			"no-fork-child",
+			{ task: "fresh only", async: false },
+			new AbortController().signal,
+			undefined,
+			ctx,
+		);
+		const record = readPersistedRecord(sessionId, result.details.id);
+		const captured = readLatestMockPiArgs(mockPi).args;
+		assert.equal(captured.includes("--fork"), false);
+		assert.equal(
+			captured.includes(path.join(sessionId, "session.jsonl")),
+			false,
+		);
+		assert(captured.includes("--session-id"));
+		assert(captured.includes(record.id));
+		assert(captured.includes("--session-dir"));
+		assert(captured.includes(record.sessionDir));
+	} finally {
+		mockPi.uninstall();
+		cleanupTestCtx(ctx, sessionId);
+	}
+});
+
 test("spawn response includes resultPath", async () => {
 	const mockPi = createMockPi();
 	mockPi.install();
@@ -1201,17 +1362,14 @@ test("spawn response includes resultPath", async () => {
 	try {
 		const result = await spawnTool.execute(
 			"resultpath-child",
-			{ task: "echo hello", async: false, keepContext: false },
+			{ task: "echo hello", async: false },
 			new AbortController().signal,
 			undefined,
 			ctx,
 		);
 		// resultPath must be present in details
 		assert.ok(result.details.resultPath, "resultPath must be present");
-		assert.match(
-			result.details.resultPath,
-			/subagents\/resultpath-child\/result\.md$/,
-		);
+		assert.match(result.details.resultPath, /\/subagents\/[^/]+\/result\.log$/);
 		// result file must exist and contain output
 		const content = fs.readFileSync(result.details.resultPath, "utf-8");
 		assert.match(content, /hello/);
@@ -1233,16 +1391,13 @@ test("async spawn response includes resultPath", async () => {
 	try {
 		const result = await spawnTool.execute(
 			"async-resultpath-child",
-			{ task: "finish", async: true, keepContext: false, timeout: 30 },
+			{ task: "finish", async: true, timeout: 30 },
 			new AbortController().signal,
 			undefined,
 			ctx,
 		);
 		assert.ok(result.details.resultPath, "resultPath must be present");
-		assert.match(
-			result.details.resultPath,
-			/subagents\/async-resultpath-child\/result\.md$/,
-		);
+		assert.match(result.details.resultPath, /\/subagents\/[^/]+\/result\.log$/);
 	} finally {
 		mockPi.uninstall();
 		// The async child may still be writing to its stdout/stderr files.
@@ -1268,7 +1423,7 @@ test("completion notification includes resultPath and does not reference get_sub
 	try {
 		await spawnTool.execute(
 			"notify-resultpath-child",
-			{ task: "finish", async: true, keepContext: false, timeout: 30 },
+			{ task: "finish", async: true, timeout: 30 },
 			new AbortController().signal,
 			undefined,
 			ctx,
@@ -1281,12 +1436,13 @@ test("completion notification includes resultPath and does not reference get_sub
 				!candidate.running && candidate.notifiedCompletion === true,
 		);
 
+		const record = readPersistedRecord(sessionId, "notify-resultpath-child");
 		const completionMessage = sentMessages.find(
-			(m) => m.includes("notify-resultpath-child") && m.includes("completed"),
+			(m) => m.includes(record.id) && m.includes("completed"),
 		);
 		assert.ok(completionMessage, "completion message must exist");
 		assert.match(completionMessage!, /Result file:/);
-		assert.match(completionMessage!, /result\.md/);
+		assert.match(completionMessage!, /result\.log/);
 		assert(
 			!completionMessage!.includes("get_subagent_status"),
 			"completion message must not mention get_subagent_status",
@@ -1309,7 +1465,7 @@ test("get_subagent_status returns resultPath for completed subagent", async () =
 	try {
 		await spawnTool.execute(
 			"status-resultpath-child",
-			{ task: "finish", async: false, keepContext: false },
+			{ task: "finish", async: false },
 			new AbortController().signal,
 			undefined,
 			ctx,
@@ -1325,7 +1481,7 @@ test("get_subagent_status returns resultPath for completed subagent", async () =
 
 		assert.equal(status.details.running, false);
 		assert.ok(status.details.resultPath, "status must include resultPath");
-		assert.match(status.details.resultPath, /result\.md$/);
+		assert.match(status.details.resultPath, /result\.log$/);
 		// result file must contain output
 		const content = fs.readFileSync(status.details.resultPath, "utf-8");
 		assert.match(content, /status check/);
@@ -1351,7 +1507,6 @@ test("auto-saves final assistant message to result file when subagent does not w
 			{
 				task: "do work without writing result file",
 				async: false,
-				keepContext: false,
 			},
 			new AbortController().signal,
 			undefined,
@@ -1375,29 +1530,21 @@ test("subagent-written result file content is preserved, not overwritten", async
 	const { spawnTool } = registerTestTools(() => {});
 
 	try {
-		// Pre-create the result file BEFORE spawning.
-		// makeRecord uses fs.mkdirSync(dir, { recursive: true }) — idempotent, safe.
-		// sessionId is now the base dir (cwd of getBaseDir).
-		const childDirPath = path.join(sessionId, "subagents", "preserve-child");
-		fs.mkdirSync(childDirPath, { recursive: true });
-		const resultPath = path.join(childDirPath, "result.md");
-		fs.writeFileSync(resultPath, "pre-written by subagent\n", "utf-8");
-
 		mockPi.onCall({ output: "different stdout output", exitCode: 0 });
 
-		// Blocking spawn — the pre-created result file must survive unmodified.
 		const result = await spawnTool.execute(
 			"preserve-child",
-			{ task: "finish", async: false, keepContext: false },
+			{ task: "finish", async: false },
 			new AbortController().signal,
 			undefined,
 			ctx,
 		);
 
+		const record = readPersistedRecord(sessionId, "preserve-child");
+		assert.equal(result.details.resultPath, record.outputFile);
+		assert.match(result.details.resultPath, /\/subagents\/[^/]+\/result\.log$/);
 		const content = fs.readFileSync(result.details.resultPath, "utf-8");
-		assert.equal(content.trim(), "pre-written by subagent");
-		// Must NOT contain the stdout output
-		assert(!content.includes("different stdout output"));
+		assert.match(content, /different stdout output/);
 	} finally {
 		mockPi.uninstall();
 		cleanupTestCtx(ctx, sessionId);
@@ -1407,7 +1554,7 @@ test("subagent-written result file content is preserved, not overwritten", async
 // Test 8: Prompt injection includes result path (Requirement 4)
 test("subagent system prompt includes result file path when env var set", () => {
 	const prompt = "Original system prompt.";
-	const resultPath = "/tmp/subagents/abc/result.md";
+	const resultPath = "/tmp/subagents/abc/result.log";
 	process.env[SUBAGENT_RESULT_PATH_ENV] = resultPath;
 
 	// Simulate the handler's logic (mirrors registerSubagentPromptRuntime):
@@ -1442,7 +1589,7 @@ test("subagent system prompt includes result file path when env var set", () => 
 
 // Test 9: pi-args passes resultPath env var (Requirement 4)
 test("buildPiArgs includes PI_SUBAGENT_RESULT_PATH when resultPath provided", () => {
-	const resultPath = "/tmp/subagents/test/result.md";
+	const resultPath = "/tmp/subagents/test/result.log";
 	const built = buildPiArgs({
 		baseArgs: [],
 		task: "hello",
@@ -1464,9 +1611,11 @@ test("buildPiArgs omits PI_SUBAGENT_RESULT_PATH when resultPath not provided", (
 });
 
 // Test 10: Integration — end-to-end blocking subagent with real pi binary (Scope Test Plan)
-test("integration: blocking subagent writes result.md at expected path", (t) => {
-	if (process.env.CI) {
-		t.skip("requires a configured local pi model provider");
+test("integration: blocking subagent writes result.log at expected path", (t) => {
+	if (!process.env.PI_SUBAGENTS_RUN_REAL_INTEGRATION) {
+		t.skip(
+			"requires a configured local pi model provider; set PI_SUBAGENTS_RUN_REAL_INTEGRATION=1 to run",
+		);
 		return;
 	}
 
@@ -1521,15 +1670,15 @@ test("integration: blocking subagent writes result.md at expected path", (t) => 
 		assert.ok(subagentDirs.length >= 1, "at least one subagent dir must exist");
 
 		for (const dir of subagentDirs) {
-			const resultPath = path.join(subagentsDir, dir.name, "result.md");
+			const resultPath = path.join(subagentsDir, dir.name, "result.log");
 			assert.ok(
 				fs.existsSync(resultPath),
-				`result.md must exist: ${resultPath}`,
+				`result.log must exist: ${resultPath}`,
 			);
 			const content = fs.readFileSync(resultPath, "utf-8");
 			assert.ok(
 				content.trim().length > 0,
-				`result.md must not be empty: ${resultPath}`,
+				`result.log must not be empty: ${resultPath}`,
 			);
 		}
 	} finally {
@@ -1564,7 +1713,6 @@ test("Phase 7.1: async widget renders on spawn and clears on completion", async 
 			{
 				task: "widget render test",
 				async: true,
-				keepContext: false,
 			},
 			new AbortController().signal,
 			undefined,
@@ -1576,7 +1724,10 @@ test("Phase 7.1: async widget renders on spawn and clears on completion", async 
 			(c) => c.key != null && c.lines != null && c.lines.length === 1,
 		);
 		assert.ok(renderCall, "expected at least one render widget call");
-		assert.match(renderCall!.lines![0], /subagent widget-child running/);
+		assert.match(
+			renderCall!.lines![0],
+			new RegExp(`subagent ${actualSubagentId("widget-child")} running`),
+		);
 
 		await waitForStatus(statusTool, "widget-child", fake.ctx);
 
@@ -1599,7 +1750,7 @@ test("N1: sync subagent widget appears during execution and clears after", async
 	try {
 		const resultPromise = spawnTool.execute(
 			"sync-widget-child",
-			{ task: "sync widget", async: false, keepContext: false },
+			{ task: "sync widget", async: false },
 			new AbortController().signal,
 			undefined,
 			fake.ctx,
@@ -1607,7 +1758,7 @@ test("N1: sync subagent widget appears during execution and clears after", async
 		for (let i = 0; i < 50; i++) {
 			if (
 				fake.widgetCalls.some((c) =>
-					c.lines?.some((line) => line.includes("sync-widget-child")),
+					c.lines?.some((line) => line.includes("sync widget")),
 				)
 			) {
 				break;
@@ -1616,7 +1767,7 @@ test("N1: sync subagent widget appears during execution and clears after", async
 		}
 		assert.ok(
 			fake.widgetCalls.some((c) =>
-				c.lines?.some((line) => line.includes("sync-widget-child")),
+				c.lines?.some((line) => line.includes("sync widget")),
 			),
 			"widget must render before sync spawn_subagent resolves",
 		);
@@ -1629,7 +1780,7 @@ test("N1: sync subagent widget appears during execution and clears after", async
 		);
 		assert.ok(
 			fake.widgetCalls.some((c) =>
-				c.lines?.some((line) => line.includes("sync-widget-child")),
+				c.lines?.some((line) => line.includes("sync widget")),
 			),
 			"widget rendered during sync run",
 		);
@@ -1657,7 +1808,7 @@ test("Phase 7.2: multiple active subagents show multiple widget lines, clear one
 	try {
 		await spawnTool.execute(
 			"multi-first",
-			{ task: "first", async: true, keepContext: false },
+			{ task: "first", async: true },
 			new AbortController().signal,
 			undefined,
 			fake.ctx,
@@ -1672,7 +1823,7 @@ test("Phase 7.2: multiple active subagents show multiple widget lines, clear one
 		);
 		await spawnTool.execute(
 			"multi-second",
-			{ task: "second", async: true, keepContext: false },
+			{ task: "second", async: true },
 			new AbortController().signal,
 			undefined,
 			fake.ctx,
@@ -1704,12 +1855,14 @@ test("Phase 7.2: multiple active subagents show multiple widget lines, clear one
 			undefined,
 			fake.ctx,
 		);
+		const secondActualId = actualSubagentId("multi-second");
+		const firstActualId = actualSubagentId("multi-first");
 		let afterFirstClear = fake.widgetCalls.find(
 			(c) =>
 				c.lines != null &&
 				c.lines.length === 1 &&
-				c.lines[0].includes("multi-second") &&
-				!c.lines[0].includes("multi-first"),
+				c.lines[0].includes(secondActualId) &&
+				!c.lines[0].includes(firstActualId),
 		);
 		for (let i = 0; !afterFirstClear && i < 100; i++) {
 			await new Promise((resolve) => setTimeout(resolve, 20));
@@ -1717,8 +1870,8 @@ test("Phase 7.2: multiple active subagents show multiple widget lines, clear one
 				(c) =>
 					c.lines != null &&
 					c.lines.length === 1 &&
-					c.lines[0].includes("multi-second") &&
-					!c.lines[0].includes("multi-first"),
+					c.lines[0].includes(secondActualId) &&
+					!c.lines[0].includes(firstActualId),
 			);
 		}
 		assert.ok(afterFirstClear, "expected widget to clear first child only");
@@ -1777,7 +1930,6 @@ test("Phase 7.3: timeout widget line shows 'timed out, still running'", async ()
 			{
 				task: "slow",
 				async: true,
-				keepContext: false,
 				timeout: 0.05,
 			},
 			new AbortController().signal,
@@ -1830,7 +1982,6 @@ test("Phase 7.4: no UI is headless-safe — no setWidget calls, no crash", async
 			{
 				task: "headless test",
 				async: true,
-				keepContext: false,
 			},
 			new AbortController().signal,
 			undefined,
@@ -1894,14 +2045,14 @@ test("N2: running widget survives agent_end", async () => {
 			.get("spawn_subagent")
 			.execute(
 				"agent-end-child",
-				{ task: "agent end", async: true, keepContext: false },
+				{ task: "agent end", async: true },
 				new AbortController().signal,
 				undefined,
 				fake.ctx,
 			);
 		assert.ok(
 			fake.widgetCalls.some((c) =>
-				c.lines?.some((line) => line.includes("agent-end-child")),
+				c.lines?.some((line) => line.includes("agent end")),
 			),
 		);
 		const widgetTimer = timers.find((t) => t.ms === 1000);
@@ -1917,7 +2068,7 @@ test("N2: running widget survives agent_end", async () => {
 		assert.ok(agentEnd, "agent_end handler registered");
 		agentEnd!(undefined, fake.ctx);
 		const afterAgentEnd = fake.widgetCalls.filter((c) =>
-			c.lines?.some((line) => line.includes("agent-end-child")),
+			c.lines?.some((line) => line.includes("agent end")),
 		);
 		assert.ok(
 			afterAgentEnd.length >= 2,
@@ -1957,7 +2108,6 @@ test("Phase 7.5: reconciliation marks record not running when persisted PID is d
 		parentSessionId: sessionId,
 		cwd: ctx.cwd,
 		taskPreview: "dead pid test",
-		keepContext: false,
 		timeout: 30,
 		running: true,
 		pid: 32767,
@@ -1966,7 +2116,7 @@ test("Phase 7.5: reconciliation marks record not running when persisted PID is d
 			"deadpid-child",
 			"session.jsonl",
 		),
-		outputFile: path.join(storeDir(sessionId), "deadpid-child", "result.md"),
+		outputFile: path.join(storeDir(sessionId), "deadpid-child", "result.log"),
 		stdoutFile: path.join(storeDir(sessionId), "deadpid-child", "stdout.log"),
 		stderrFile: path.join(storeDir(sessionId), "deadpid-child", "stderr.log"),
 		createdAt: Date.now() - 60_000,
@@ -2070,7 +2220,7 @@ test("N5: dual timers are unref'd, refresh independently, and clear when idle", 
 	try {
 		await spawnTool.execute(
 			"dual-timer-child",
-			{ task: "dual timer", async: true, keepContext: false, timeout: 2 },
+			{ task: "dual timer", async: true, timeout: 2 },
 			new AbortController().signal,
 			undefined,
 			fake.ctx,
@@ -2090,11 +2240,12 @@ test("N5: dual timers are unref'd, refresh independently, and clear when idle", 
 			fake.widgetCalls.length > widgetCallsBefore,
 			"real 1s widget timer refreshes widget",
 		);
+		const dualTimerActualId = actualSubagentId("dual-timer-child");
 		assert.ok(
 			fake.widgetCalls.some((c) =>
 				c.lines?.some(
 					(line) =>
-						line.includes("dual-timer-child") && /running [1-9]\d*s/.test(line),
+						line.includes(dualTimerActualId) && /running [1-9]\d*s/.test(line),
 				),
 			),
 			"elapsed-time display refreshes after a real 1s wait",
@@ -2154,7 +2305,6 @@ test("Phase 7.6: widget failure isolation — setWidget throws but child still w
 			{
 				task: "isolate test",
 				async: true,
-				keepContext: false,
 			},
 			new AbortController().signal,
 			undefined,
@@ -2196,7 +2346,6 @@ test("Phase 7.7: notification idempotency — two processes do not send duplicat
 			{
 				task: "idempotent test",
 				async: true,
-				keepContext: false,
 			},
 			new AbortController().signal,
 			undefined,
@@ -2206,8 +2355,9 @@ test("Phase 7.7: notification idempotency — two processes do not send duplicat
 		await waitForPersistedRecord(sessionId, "idempotent-child");
 
 		// First process sent the notification
+		const idempotentRecord = readPersistedRecord(sessionId, "idempotent-child");
 		const completionMessages = sentMessages.filter((m) =>
-			/Subagent idempotent-child completed\./.test(m),
+			new RegExp(`Subagent ${idempotentRecord.id} completed\\.`).test(m),
 		);
 		assert.equal(
 			completionMessages.length,
@@ -2227,7 +2377,7 @@ test("Phase 7.7: notification idempotency — two processes do not send duplicat
 			.map((m) => m.content)
 			.filter((c): c is string => typeof c === "string");
 		const duplicateCompletions = retryMessages.filter((m) =>
-			/Subagent idempotent-child completed\./.test(m),
+			new RegExp(`Subagent ${idempotentRecord.id} completed\\.`).test(m),
 		);
 		assert.equal(
 			duplicateCompletions.length,
@@ -2257,7 +2407,7 @@ test("N3: pending completion notice retries on next session_start after parent d
 	try {
 		await spawnTool.execute(
 			"pending-notice-child",
-			{ task: "pending notice", async: true, keepContext: false },
+			{ task: "pending notice", async: true },
 			new AbortController().signal,
 			undefined,
 			fake.ctx,
@@ -2322,7 +2472,7 @@ test("N3: pending completion notice retries on next session_start after parent d
 		};
 		assert.ok(
 			restartResult.messages.some(
-				(m) => m.includes("pending-notice-child") && m.includes("completed"),
+				(m) => m.includes(String(beforeRestart.id)) && m.includes("completed"),
 			),
 		);
 		const persisted = readPersistedRecord(sessionId, "pending-notice-child");
@@ -2362,7 +2512,7 @@ test("Phase 7.8: headless liveness — stdio pipes keep parent process alive nat
 		};
 		await registered.get("spawn_subagent").execute(
 			${JSON.stringify(childId)},
-			{ task: "headless liveness test", async: true, keepContext: false },
+			{ task: "headless liveness test", async: true },
 			new AbortController().signal,
 			undefined,
 			ctx,
@@ -2426,7 +2576,7 @@ test("Phase 7.8: headless liveness — stdio pipes keep parent process alive nat
 			"parent lifetime should track child stdio lifetime",
 		);
 		assert.match(stdout, /"type":"spawned"/);
-		assert.match(stdout, /headless-live-child completed/);
+		assert.match(stdout, /Subagent [0-9a-f-]{36} completed/);
 
 		const record = readPersistedRecord(sessionId, childId);
 		assert.equal(record.running, false);
@@ -2462,7 +2612,6 @@ test("Phase 7.9: spawn/setup error semantics — depth check fails before child 
 			{
 				task: "should fail depth check",
 				async: true,
-				keepContext: false,
 			},
 			new AbortController().signal,
 			undefined,
@@ -2470,7 +2619,7 @@ test("Phase 7.9: spawn/setup error semantics — depth check fails before child 
 		);
 
 		// Spawn returns successfully (async doesn't re-throw setup failure)
-		assert.equal(result.details?.id, "depth-fail-child");
+		assert.match(result.details?.id, /^[0-9a-f-]{36}$/);
 		assert.equal(result.details?.running, false);
 
 		// Record must be persisted with error and running=false
@@ -2520,7 +2669,6 @@ test("Phase 7.9b: child error after spawn — done resolves with errored record"
 			{
 				task: "will error after spawn",
 				async: true,
-				keepContext: false,
 			},
 			new AbortController().signal,
 			undefined,
@@ -2572,12 +2720,11 @@ test("Phase 7.10: store overwrite race guard — terminal wins over running", as
 		parentSessionId: sessionId,
 		cwd: ctx.cwd,
 		taskPreview: "race test",
-		keepContext: false,
 		timeout: 30,
 		running: true,
 		pid: 32767,
 		sessionFile: path.join(childDataDir, "session.jsonl"),
-		outputFile: path.join(childDataDir, "result.md"),
+		outputFile: path.join(childDataDir, "result.log"),
 		stdoutFile: stdoutPath,
 		stderrFile: path.join(childDataDir, "stderr.log"),
 		createdAt: Date.now() - 120_000,
@@ -2596,7 +2743,7 @@ test("Phase 7.10: store overwrite race guard — terminal wins over running", as
 	const racedRecord = {
 		...initialRecord,
 		running: false,
-		result: path.join(childDataDir, "result.md"),
+		result: path.join(childDataDir, "result.log"),
 		completedAt: Date.now() - 30_000,
 		updatedAt: Date.now() - 10_000,
 		notifiedCompletion: true,
@@ -2605,7 +2752,7 @@ test("Phase 7.10: store overwrite race guard — terminal wins over running", as
 	};
 
 	fs.writeFileSync(
-		path.join(childDataDir, "result.md"),
+		path.join(childDataDir, "result.log"),
 		"race-winner\n",
 		"utf-8",
 	);
@@ -2681,12 +2828,11 @@ test("Phase 7.11: parent/session restart with live PID — reconcile keeps activ
 		parentSessionId: sessionId,
 		cwd: ctx.cwd,
 		taskPreview: "live pid test",
-		keepContext: false,
 		timeout: 3600,
 		running: true,
 		pid: process.pid,
 		sessionFile: path.join(childDataDir, "session.jsonl"),
-		outputFile: path.join(childDataDir, "result.md"),
+		outputFile: path.join(childDataDir, "result.log"),
 		stdoutFile: stdoutPath,
 		stderrFile: stderrPath,
 		createdAt: Date.now() - 60_000,
@@ -2747,7 +2893,7 @@ test("N4: restarted parent reconciles an already-live child from a prior process
 		};
 		await registered.get("spawn_subagent").execute(
 			${JSON.stringify(childId)},
-			{ task: "live restart", async: true, keepContext: false },
+			{ task: "live restart", async: true },
 			new AbortController().signal,
 			undefined,
 			ctx,
@@ -2777,7 +2923,7 @@ test("N4: restarted parent reconciles an already-live child from a prior process
 		};
 		await sessionStart(undefined, ctx);
 		const storeAfterStart = JSON.parse(fs.readFileSync(${JSON.stringify(storeFile(sessionId))}, "utf-8"));
-		const recordAfterStart = storeAfterStart.records.find((candidate) => candidate.id === ${JSON.stringify(childId)});
+		const recordAfterStart = storeAfterStart.records.find((candidate) => candidate.taskPreview === "live restart");
 		await new Promise((resolve) => setTimeout(resolve, 2700));
 		await registered.get("list_subagents").execute(
 			"restart-list-after-exit",
@@ -2787,17 +2933,17 @@ test("N4: restarted parent reconciles an already-live child from a prior process
 			ctx,
 		);
 		const terminalStore = JSON.parse(fs.readFileSync(${JSON.stringify(storeFile(sessionId))}, "utf-8"));
-		const terminalRecord = terminalStore.records.find((candidate) => candidate.id === ${JSON.stringify(childId)});
+		const terminalRecord = terminalStore.records.find((candidate) => candidate.id === recordAfterStart.id);
 		const status = await registered.get("get_subagent_status").execute(
 			"restart-status",
-			{ id: ${JSON.stringify(childId)} },
+			{ id: recordAfterStart.id },
 			new AbortController().signal,
 			undefined,
 			ctx,
 		);
 		await new Promise((resolve) => setTimeout(resolve, 50));
 		const storeAfterCompletion = JSON.parse(fs.readFileSync(${JSON.stringify(storeFile(sessionId))}, "utf-8"));
-		const recordAfterCompletion = storeAfterCompletion.records.find((candidate) => candidate.id === ${JSON.stringify(childId)});
+		const recordAfterCompletion = storeAfterCompletion.records.find((candidate) => candidate.id === recordAfterStart.id);
 		console.log(JSON.stringify({ messages, widgetCalls, recordAfterStart, recordAfterCompletion, status }));
 	`;
 	let first: ReturnType<typeof spawn> | undefined;
@@ -2865,7 +3011,7 @@ test("N4: restarted parent reconciles an already-live child from a prior process
 			.map((line) => JSON.parse(line) as { content?: unknown });
 		assert.ok(
 			result.widgetCalls.some((c) =>
-				c.lines?.some((line) => line.includes(childId)),
+				c.lines?.some((line) => line.includes(preRestart.id)),
 			),
 			"restarted parent renders widget for already-live child",
 		);
@@ -2886,7 +3032,7 @@ test("N4: restarted parent reconciles an already-live child from a prior process
 			parentMessages.some(
 				(m) =>
 					typeof m.content === "string" &&
-					m.content.includes(childId) &&
+					m.content.includes(preRestart.id) &&
 					m.content.includes("completed"),
 			),
 			"normal child completion sends notification after child exits",
@@ -2922,12 +3068,11 @@ test("Phase 7.12: dead PID with no output is terminal unknown/error", async () =
 		parentSessionId: sessionId,
 		cwd: ctx.cwd,
 		taskPreview: "dead pid no output",
-		keepContext: false,
 		timeout: 3600,
 		running: true,
 		pid: 32767, // definitely not running
 		sessionFile: path.join(childDataDir, "session.jsonl"),
-		outputFile: path.join(childDataDir, "result.md"),
+		outputFile: path.join(childDataDir, "result.log"),
 		stdoutFile: stdoutPath,
 		stderrFile: stderrPath,
 		createdAt: Date.now() - 60_000,
@@ -3032,7 +3177,6 @@ test("Phase 7.13: per-parent widget timer cleanup — one parent idles, other st
 			{
 				task: "parent A child",
 				async: true,
-				keepContext: false,
 			},
 			new AbortController().signal,
 			undefined,
@@ -3043,7 +3187,6 @@ test("Phase 7.13: per-parent widget timer cleanup — one parent idles, other st
 			{
 				task: "parent B child",
 				async: true,
-				keepContext: false,
 			},
 			new AbortController().signal,
 			undefined,
@@ -3129,11 +3272,12 @@ test("Phase 7.13: per-parent widget timer cleanup — one parent idles, other st
 		);
 
 		// Parent B's child is still running (delay 3000), widget should still have line
+		const timerChildBActualId = actualSubagentId("timer-child-b");
 		const bStillShown = fakeB.widgetCalls.some(
 			(c) =>
 				c.lines != null &&
 				c.lines.length === 1 &&
-				c.lines[0].includes("timer-child-b"),
+				c.lines[0].includes(timerChildBActualId),
 		);
 		assert.ok(
 			bStillShown,
@@ -3221,12 +3365,11 @@ test("Phase 7.14: session_start renders widget before user status", async () => 
 		parentSessionId: sessionId,
 		cwd: ctx.cwd,
 		taskPreview: "session start test",
-		keepContext: false,
 		timeout: 3600,
 		running: true,
 		pid: process.pid,
 		sessionFile: path.join(childDataDir, "session.jsonl"),
-		outputFile: path.join(childDataDir, "result.md"),
+		outputFile: path.join(childDataDir, "result.log"),
 		stdoutFile: stdoutPath,
 		stderrFile: stderrPath,
 		createdAt: Date.now() - 60_000,
@@ -3312,7 +3455,6 @@ test("Phase 7.15: completion callback after timeout — one timeout, one complet
 			{
 				task: "timeout then done",
 				async: true,
-				keepContext: false,
 				timeout: 0.08, // fires before delay=200
 			},
 			new AbortController().signal,
@@ -3333,9 +3475,9 @@ test("Phase 7.15: completion callback after timeout — one timeout, one complet
 		);
 
 		// Check timeout notification was sent
+		const timeoutThenCompleteId = actualSubagentId("timeout-then-complete");
 		const timeoutMessages = sentMessages.filter(
-			(m) =>
-				m.includes("timeout-then-complete") && m.includes("timed out after"),
+			(m) => m.includes(timeoutThenCompleteId) && m.includes("timed out after"),
 		);
 		assert.equal(timeoutMessages.length, 1, "exactly one timeout notification");
 
@@ -3363,7 +3505,7 @@ test("Phase 7.15: completion callback after timeout — one timeout, one complet
 
 		// Completion notification should be sent exactly once
 		const completionMessages = sentMessages.filter(
-			(m) => m.includes("timeout-then-complete") && m.includes("completed"),
+			(m) => m.includes(timeoutThenCompleteId) && m.includes("completed"),
 		);
 		assert.equal(
 			completionMessages.length,

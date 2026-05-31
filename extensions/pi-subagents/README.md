@@ -15,7 +15,6 @@ spawn_subagent({
   task: string,
   async: boolean,
   timeout?: number,
-  keepContext: boolean,
   cwd?: string,
   outputMode: "inline" | "file",
   model?: string
@@ -24,12 +23,13 @@ spawn_subagent({
 
 - `async: false` blocks until the child finishes.
 - `async: true` returns immediately with an ID. Spawn multiple concurrent subagents by calling `spawn_subagent` multiple times.
+- The returned ID is also the child Pi session ID and can be used with Pi session lookup/resume behavior.
 - `timeout` is optional (default 3600s = 1 hour) and measured in seconds. When reached, the parent is informed that the child is still running; the child is **not killed**.
 - Give `timeout` a healthy margin above expected runtime because child execution time can be wildly unpredictable.
-- `keepContext: true` forks the current Pi session.
-- `keepContext: false` starts a fresh child session.
+- Subagents always start with fresh session history. Put any desired context explicitly in `task`.
 - `outputMode: "inline"` stores/returns the child result text.
-- `outputMode: "file"` writes the child result to a generated file and returns the file path.
+- `outputMode: "file"` writes the child result to a generated file path and returns that path.
+- Child subagent directories contain separate `result.log`, `stdout.log`, and `stderr.log` files.
 
 ### `get_subagent_status`
 
@@ -45,7 +45,7 @@ Returns:
 
 If the subagent is still running, the response includes a strong instruction not to poll.
 
-`result` is either raw text or a result-file path, depending on `outputMode`.
+`result` is either raw text or a generated result-file path, depending on `outputMode`. Result files are named `result.log` under the child subagent directory.
 
 ### `list_subagents`
 

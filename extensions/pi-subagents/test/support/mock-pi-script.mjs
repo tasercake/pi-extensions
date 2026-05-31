@@ -9,7 +9,8 @@ function fail(message, exitCode = 1) {
 }
 
 function listPendingFiles(dir) {
-	return fs.readdirSync(dir)
+	return fs
+		.readdirSync(dir)
 		.filter((name) => name.startsWith("pending-") && name.endsWith(".json"))
 		.sort();
 }
@@ -17,7 +18,10 @@ function listPendingFiles(dir) {
 function claimNextResponse(dir) {
 	for (const fileName of listPendingFiles(dir)) {
 		const sourcePath = path.join(dir, fileName);
-		const targetPath = path.join(dir, fileName.replace(/^pending-/, "consumed-"));
+		const targetPath = path.join(
+			dir,
+			fileName.replace(/^pending-/, "consumed-"),
+		);
 		try {
 			fs.renameSync(sourcePath, targetPath);
 			return JSON.parse(fs.readFileSync(targetPath, "utf-8"));
@@ -67,19 +71,69 @@ function isJsonMode(args) {
 	return false;
 }
 
+function getArgValue(args, name) {
+	const index = args.indexOf(name);
+	if (index === -1) return undefined;
+	return args[index + 1];
+}
+
+function formatManagedSessionTimestamp(date = new Date()) {
+	return date.toISOString().replace(/[:.]/g, "-");
+}
+
+function findManagedSessionFile(sessionDir, sessionId) {
+	if (!fs.existsSync(sessionDir)) return undefined;
+	const suffix = `_${sessionId}.jsonl`;
+	const matches = fs
+		.readdirSync(sessionDir)
+		.filter((name) => name.endsWith(suffix))
+		.sort();
+	const latest = matches.at(-1);
+	return latest ? path.join(sessionDir, latest) : undefined;
+}
+
+function writeSessionHeader(sessionFile, id) {
+	fs.mkdirSync(path.dirname(sessionFile), { recursive: true });
+	fs.writeFileSync(
+		sessionFile,
+		`${JSON.stringify({ type: "session", id })}\n`,
+		{ flag: "a" },
+	);
+}
+
 function writeSessionFile(args) {
-	for (let i = 0; i < args.length; i++) {
-		if (args[i] !== "--session") continue;
-		const sessionFile = args[i + 1];
-		if (!sessionFile) return;
-		fs.mkdirSync(path.dirname(sessionFile), { recursive: true });
-		fs.writeFileSync(
-			sessionFile,
-			`${JSON.stringify({ type: "session", id: `mock-session-${process.pid}` })}\n`,
-			{ flag: "a" },
-		);
+	const sessionId = getArgValue(args, "--session-id");
+	const sessionDir = getArgValue(args, "--session-dir");
+	if (sessionId) {
+		if (!sessionDir) return;
+		const sessionFile =
+			findManagedSessionFile(sessionDir, sessionId) ??
+			path.join(
+				sessionDir,
+				`${formatManagedSessionTimestamp()}_${sessionId}.jsonl`,
+			);
+		writeSessionHeader(sessionFile, sessionId);
 		return;
 	}
+
+	const sessionValue = getArgValue(args, "--session");
+	if (!sessionValue) return;
+	if (
+		sessionDir &&
+		!path.isAbsolute(sessionValue) &&
+		!sessionValue.includes(path.sep)
+	) {
+		const sessionFile =
+			findManagedSessionFile(sessionDir, sessionValue) ??
+			path.join(
+				sessionDir,
+				`${formatManagedSessionTimestamp()}_${sessionValue}.jsonl`,
+			);
+		writeSessionHeader(sessionFile, sessionValue);
+		return;
+	}
+
+	writeSessionHeader(sessionValue, `mock-session-${process.pid}`);
 }
 
 function writeJsonlLine(entry) {
@@ -90,11 +144,15 @@ function writeJsonlLine(entry) {
 function extractPlainText(entry) {
 	if (!entry || typeof entry !== "object") return "";
 	if (entry.type === "message_end") {
-		const text = entry.message?.content?.find?.((part) => part?.type === "text")?.text;
+		const text = entry.message?.content?.find?.(
+			(part) => part?.type === "text",
+		)?.text;
 		return typeof text === "string" ? text : "";
 	}
 	if (entry.type === "tool_result_end") {
-		const text = entry.message?.content?.find?.((part) => part?.type === "text")?.text;
+		const text = entry.message?.content?.find?.(
+			(part) => part?.type === "text",
+		)?.text;
 		return typeof text === "string" ? text : "";
 	}
 	return "";
@@ -113,14 +171,18 @@ function writeResponseEntries(entries, jsonMode) {
 
 async function main() {
 	if (!queueDir) fail("MOCK_PI_QUEUE_DIR is required.");
-	if (!fs.existsSync(queueDir)) fail(`Mock queue dir does not exist: ${queueDir}`);
+	if (!fs.existsSync(queueDir))
+		fail(`Mock queue dir does not exist: ${queueDir}`);
 
 	const args = process.argv.slice(2);
 	const jsonMode = isJsonMode(args);
 	const response = claimNextResponse(queueDir) ?? defaultResponse();
 	writeSessionFile(args);
 	fs.writeFileSync(
-		path.join(queueDir, `call-${Date.now()}-${process.pid}-${Math.random().toString(16).slice(2)}.json`),
+		path.join(
+			queueDir,
+			`call-${Date.now()}-${process.pid}-${Math.random().toString(16).slice(2)}.json`,
+		),
 		JSON.stringify({ args }),
 		"utf-8",
 	);
@@ -144,8 +206,11 @@ async function main() {
 	} else if (Array.isArray(response.jsonl) && response.jsonl.length > 0) {
 		writeResponseEntries(response.jsonl, jsonMode);
 	} else if (Array.isArray(response.echoEnv) && response.echoEnv.length > 0) {
-		const envSnapshot = Object.fromEntries(response.echoEnv.map((key) => [key, process.env[key] ?? null]));
-		if (jsonMode) writeJsonlLine(defaultAssistantMessage(JSON.stringify(envSnapshot)));
+		const envSnapshot = Object.fromEntries(
+			response.echoEnv.map((key) => [key, process.env[key] ?? null]),
+		);
+		if (jsonMode)
+			writeJsonlLine(defaultAssistantMessage(JSON.stringify(envSnapshot)));
 		else process.stdout.write(`${JSON.stringify(envSnapshot)}\n`);
 	} else if (typeof response.output === "string") {
 		if (jsonMode) writeJsonlLine(defaultAssistantMessage(response.output));
@@ -156,8 +221,13 @@ async function main() {
 		process.stderr.write(response.stderr);
 	}
 
-	if (typeof response.keepAliveAfterFinalMessageMs === "number" && response.keepAliveAfterFinalMessageMs > 0) {
-		await new Promise((resolve) => setTimeout(resolve, response.keepAliveAfterFinalMessageMs));
+	if (
+		typeof response.keepAliveAfterFinalMessageMs === "number" &&
+		response.keepAliveAfterFinalMessageMs > 0
+	) {
+		await new Promise((resolve) =>
+			setTimeout(resolve, response.keepAliveAfterFinalMessageMs),
+		);
 	}
 
 	process.exit(typeof response.exitCode === "number" ? response.exitCode : 0);

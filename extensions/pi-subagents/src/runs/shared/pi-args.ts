@@ -19,6 +19,7 @@ interface BuildPiArgsInput {
 	sessionEnabled: boolean;
 	sessionDir?: string;
 	sessionFile?: string;
+	sessionId?: string;
 	model?: string;
 	intercomSessionName?: string;
 	orchestratorIntercomTarget?: string;
@@ -46,7 +47,17 @@ export function buildPiArgs(input: BuildPiArgsInput): BuildPiArgsResult {
 		args.push("--session", input.sessionFile);
 	} else {
 		if (!input.sessionEnabled) args.push("--no-session");
-		if (input.sessionDir) {
+		if (input.sessionId) {
+			if (!input.sessionDir)
+				throw new Error("sessionDir is required when sessionId is provided");
+			fs.mkdirSync(input.sessionDir, { recursive: true });
+			args.push(
+				"--session-id",
+				input.sessionId,
+				"--session-dir",
+				input.sessionDir,
+			);
+		} else if (input.sessionDir) {
 			fs.mkdirSync(input.sessionDir, { recursive: true });
 			args.push("--session-dir", input.sessionDir);
 		}
