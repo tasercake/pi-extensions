@@ -16,10 +16,6 @@ export const SpawnSubagentParams = Type.Object(
 					"Optional timeout in seconds (default 3600 = 1 hour). When the timeout is reached, the parent is informed that the subagent is still running; the subagent is not killed. Do not kill subagents autonomously to enforce this timeout. Give a healthy timeout margin on top of expected execution time because subagent runtime may be wildly unpredictable.",
 			}),
 		),
-		keepContext: Type.Boolean({
-			description:
-				"Fork the current Pi session when true; start a fresh child session when false.",
-		}),
 		cwd: Type.Optional(
 			Type.String({
 				description:
@@ -49,7 +45,6 @@ export interface SpawnSubagentParamsLike {
 	task: string;
 	async: boolean;
 	timeout?: number;
-	keepContext: boolean;
 	cwd?: string;
 	model?: string;
 }

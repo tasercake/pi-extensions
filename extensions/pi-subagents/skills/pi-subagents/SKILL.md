@@ -9,9 +9,11 @@ Use these tools to launch unrestricted child Pi sessions. The caller must includ
 
 ## Tools
 
-- `spawn_subagent({ task, async, keepContext, outputMode, timeout?, cwd?, model? })`
+- `spawn_subagent({ task, async, timeout?, cwd?, model? })`
   - `timeout` is optional; default is `3600` seconds (1 hour).
   - Timeout is only a notification threshold: the parent is informed that the child is still running; the child is not killed.
+  - The returned subagent id is also the child Pi session id.
+  - Child output is written to `result.log` under the child subagent directory.
 - `get_subagent_status({ id })`
 - `list_subagents({})`
 
@@ -24,8 +26,6 @@ spawn_subagent({
   task: "You are a focused reviewer. Inspect ... Return ...",
   async: false,
   timeout: 600, // optional; defaults to 3600
-  keepContext: false,
-  outputMode: "inline",
 });
 ```
 
@@ -36,15 +36,11 @@ spawn_subagent({
   task: "Worker A full instructions...",
   async: true,
   timeout: 900,
-  keepContext: false,
-  outputMode: "inline",
 });
 spawn_subagent({
   task: "Worker B full instructions...",
   async: true,
   timeout: 900,
-  keepContext: false,
-  outputMode: "inline",
 });
 ```
 
@@ -68,6 +64,8 @@ list_subagents({});
 - If `get_subagent_status` returns `running: true`, do not poll repeatedly; wait for the completion notification.
 - Child Pi receives normal tools, skills, extensions, and project context.
 - Child Pi gets only one automatic system line: `You are a Pi subagent controlled by another Pi agent.`
+- Child Pi does not inherit parent session history. Put all parent-provided role context, constraints, and task details explicitly in `task`.
+- Subagent final result file is named `result.log`.
 - Recursion is allowed until the depth limit is reached.
 
 ## Maintenance Procedure

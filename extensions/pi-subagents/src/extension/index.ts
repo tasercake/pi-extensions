@@ -1,6 +1,7 @@
 /** Minimal recursive Pi subagent extension surface. */
 
 import { spawn, type ChildProcess } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -11,7 +12,6 @@ import type {
 	ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
-import { createForkContextResolver } from "../shared/fork-context.ts";
 import {
 	checkSubagentDepth,
 	getSubagentDepthEnv,
@@ -29,9 +29,15 @@ import {
 
 interface ToolDetails {
 	id?: string;
+	sessionId?: string;
+	sessionFile?: string;
 	running?: boolean;
 	result?: string;
+	resultPath?: string;
 	error?: string;
+	timedOut?: boolean;
+	timeoutAt?: number;
+	timeoutMessage?: string;
 	subagents?: Array<{ id: string; running: boolean }>;
 }
 
@@ -40,11 +46,12 @@ interface PersistedSubagentRecord {
 	parentSessionId: string;
 	cwd: string;
 	taskPreview: string;
-	keepContext: boolean;
+	keepContext?: boolean;
 	timeout: number;
 	model?: string;
 	running: boolean;
 	pid?: number;
+	sessionDir?: string;
 	sessionFile?: string;
 	outputFile?: string;
 	stdoutFile: string;
@@ -335,7 +342,10 @@ function refreshRecordFromDisk(
 	record: PersistedSubagentRecord,
 ): PersistedSubagentRecord {
 	const { record: refreshed, changed } = refreshRecord(record);
-	if (changed) upsertRecord(refreshed);
+	const beforeSessionFile = refreshed.sessionFile;
+	if (refreshed.sessionDir) recordDiscoveredSessionFile(refreshed);
+	if (changed || refreshed.sessionFile !== beforeSessionFile)
+		upsertRecord(refreshed);
 	return refreshed;
 }
 
@@ -383,10 +393,10 @@ function mergeRecord(
 					pid: refreshed.pid ?? latest.pid,
 					cwd: refreshed.cwd,
 					taskPreview: refreshed.taskPreview,
-					keepContext: refreshed.keepContext,
 					timeout: refreshed.timeout,
 					model: refreshed.model ?? latest.model,
 					running: refreshed.running,
+					sessionDir: refreshed.sessionDir ?? latest.sessionDir,
 					sessionFile: refreshed.sessionFile ?? latest.sessionFile,
 					outputFile: refreshed.outputFile ?? latest.outputFile,
 					stdoutFile: refreshed.stdoutFile,
@@ -586,7 +596,10 @@ function formatRunningLine(record: PersistedSubagentRecord): string {
 }
 
 function resultForRecord(record: PersistedSubagentRecord): string | undefined {
-	return record.outputFile;
+	return (
+		record.outputFile ??
+		path.join(childDir(record.parentSessionId, record.id), "result.log")
+	);
 }
 
 function subagentSessionId(
@@ -611,8 +624,8 @@ function timeoutMessage(record: PersistedSubagentRecord): string {
 	const details = [
 		`Subagent ${record.id} timed out after ${record.timeout}s; still running; not killed`,
 	];
-	const sessionId = subagentSessionId(record);
-	if (sessionId) details.push(`sessionId=${sessionId}`);
+	const sessionId = subagentSessionId(record) ?? record.id;
+	details.push(`sessionId=${sessionId}`);
 	if (record.pid) details.push(`pid=${record.pid}`);
 	return `${details.join("; ")}.`;
 }
@@ -634,7 +647,11 @@ function formatStatus(
 				text: JSON.stringify(
 					{
 						id: refreshed.id,
+						sessionId: refreshed.id,
 						running: refreshed.running,
+						...(refreshed.sessionFile
+							? { sessionFile: refreshed.sessionFile }
+							: {}),
 						...(result ? { resultPath: result } : {}),
 						...(timedOut
 							? {
@@ -655,7 +672,9 @@ function formatStatus(
 		],
 		details: {
 			id: refreshed.id,
+			sessionId: refreshed.id,
 			running: refreshed.running,
+			...(refreshed.sessionFile ? { sessionFile: refreshed.sessionFile } : {}),
 			...(result ? { resultPath: result } : {}),
 			...(timedOut
 				? {
@@ -673,11 +692,32 @@ function childDir(parentId: string, id: string): string {
 	return path.join(parentId, "subagents", id);
 }
 
+function discoverManagedSessionFile(
+	sessionDir: string,
+	id: string,
+): string | undefined {
+	if (!fs.existsSync(sessionDir)) return undefined;
+	const suffix = `_${id}.jsonl`;
+	const matches = fs
+		.readdirSync(sessionDir)
+		.filter((name) => name.endsWith(suffix))
+		.sort();
+	const latest = matches.at(-1);
+	return latest ? path.join(sessionDir, latest) : undefined;
+}
+
+function recordDiscoveredSessionFile(record: PersistedSubagentRecord): void {
+	if (!record.sessionDir)
+		record.sessionDir = childDir(record.parentSessionId, record.id);
+	const discovered = discoverManagedSessionFile(record.sessionDir, record.id);
+	if (discovered) record.sessionFile = discovered;
+}
+
 function makeRecord(
 	ctx: ExtensionContext,
 	params: SpawnSubagentParamsLike,
-	id: string,
 ): PersistedSubagentRecord {
+	const id = randomUUID();
 	const parentId = parentSessionId(ctx);
 	const dir = childDir(parentId, id);
 	fs.mkdirSync(dir, { recursive: true });
@@ -686,12 +726,11 @@ function makeRecord(
 		parentSessionId: parentId,
 		cwd: params.cwd ? path.resolve(ctx.cwd, params.cwd) : ctx.cwd,
 		taskPreview: params.task.slice(0, 500),
-		keepContext: params.keepContext,
 		timeout: params.timeout ?? DEFAULT_TIMEOUT_SECONDS,
 		...(params.model ? { model: params.model } : {}),
 		running: false,
-		sessionFile: path.join(dir, "session.jsonl"),
-		outputFile: path.join(dir, "result.md"),
+		sessionDir: dir,
+		outputFile: path.join(dir, "result.log"),
 		stdoutFile: path.join(dir, "stdout.log"),
 		stderrFile: path.join(dir, "stderr.log"),
 		createdAt: Date.now(),
@@ -700,7 +739,7 @@ function makeRecord(
 }
 
 function buildArgsForRecord(
-	ctx: ExtensionContext,
+	_ctx: ExtensionContext,
 	record: PersistedSubagentRecord,
 	task: string,
 ): {
@@ -708,17 +747,14 @@ function buildArgsForRecord(
 	env: Record<string, string | undefined>;
 	tempDir?: string;
 } {
-	let sessionFile = record.sessionFile;
-	if (record.keepContext) {
-		const resolver = createForkContextResolver(ctx.sessionManager, "fork");
-		sessionFile = resolver.sessionFileForIndex(0) ?? sessionFile;
-		record.sessionFile = sessionFile;
-	}
+	record.sessionDir ??= childDir(record.parentSessionId, record.id);
+	fs.mkdirSync(record.sessionDir, { recursive: true });
 	return buildPiArgs({
 		baseArgs: [],
 		task,
 		sessionEnabled: true,
-		sessionFile,
+		sessionDir: record.sessionDir,
+		sessionId: record.id,
 		model: record.model,
 		intercomSessionName: `subagent-${record.id}`,
 		runId: record.id,
@@ -994,6 +1030,7 @@ function startChild(
 	record.pid = child.pid;
 	record.running = true;
 	record.updatedAt = Date.now();
+	recordDiscoveredSessionFile(record);
 	upsertRecord(record);
 	runningChildren.set(record.id, child);
 	hooks?.onRunning?.(record);
@@ -1068,6 +1105,7 @@ function startChild(
 				}
 			}
 			record.result = record.outputFile;
+			recordDiscoveredSessionFile(record);
 
 			upsertRecord(record);
 
@@ -1105,10 +1143,11 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 			_onUpdate: ((result: AgentToolResult<ToolDetails>) => void) | undefined,
 			ctx: ExtensionContext,
 		) {
+			void id;
 			const parentId = parentSessionId(ctx);
 			retryPendingNotices(pi, parentId);
 			rememberUiContext(ctx);
-			const record = makeRecord(ctx, params, id);
+			const record = makeRecord(ctx, params);
 			if (params.async) {
 				const hooks: StartChildHooks = {
 					onRunning(_r) {
