@@ -649,9 +649,6 @@ function formatStatus(
 						id: refreshed.id,
 						sessionId: refreshed.id,
 						running: refreshed.running,
-						...(refreshed.sessionFile
-							? { sessionFile: refreshed.sessionFile }
-							: {}),
 						...(result ? { resultPath: result } : {}),
 						...(timedOut
 							? {
@@ -674,7 +671,6 @@ function formatStatus(
 			id: refreshed.id,
 			sessionId: refreshed.id,
 			running: refreshed.running,
-			...(refreshed.sessionFile ? { sessionFile: refreshed.sessionFile } : {}),
 			...(result ? { resultPath: result } : {}),
 			...(timedOut
 				? {
