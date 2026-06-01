@@ -1369,6 +1369,12 @@ test("spawn response includes resultPath", async () => {
 		);
 		// resultPath must be present in details
 		assert.ok(result.details.resultPath, "resultPath must be present");
+		assert.equal(
+			"sessionFile" in result.details,
+			false,
+			"spawn response must not expose sessionFile to parent",
+		);
+		assert(!result.content[0].text.includes("sessionFile"));
 		assert.match(result.details.resultPath, /\/subagents\/[^/]+\/result\.log$/);
 		// result file must exist and contain output
 		const content = fs.readFileSync(result.details.resultPath, "utf-8");
@@ -1481,6 +1487,12 @@ test("get_subagent_status returns resultPath for completed subagent", async () =
 
 		assert.equal(status.details.running, false);
 		assert.ok(status.details.resultPath, "status must include resultPath");
+		assert.equal(
+			"sessionFile" in status.details,
+			false,
+			"status response must not expose sessionFile to parent",
+		);
+		assert(!status.content[0].text.includes("sessionFile"));
 		assert.match(status.details.resultPath, /result\.log$/);
 		// result file must contain output
 		const content = fs.readFileSync(status.details.resultPath, "utf-8");
