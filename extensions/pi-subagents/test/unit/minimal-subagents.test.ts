@@ -1404,6 +1404,11 @@ test("async spawn response includes resultPath", async () => {
 		);
 		assert.ok(result.details.resultPath, "resultPath must be present");
 		assert.match(result.details.resultPath, /\/subagents\/[^/]+\/result\.log$/);
+		const responseText = result.content
+			.map((item: { text?: string }) => item.text ?? "")
+			.join("\n");
+		assert.match(responseText, /Do not poll/i);
+		assert.match(responseText, /Do not sleep/i);
 	} finally {
 		mockPi.uninstall();
 		// The async child may still be writing to its stdout/stderr files.

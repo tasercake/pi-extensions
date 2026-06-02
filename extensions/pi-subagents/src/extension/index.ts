@@ -638,7 +638,7 @@ function formatStatus(
 	const timedOut = Boolean(refreshed.timeoutAt);
 	const timedOutMessage = timedOut ? timeoutMessage(refreshed) : undefined;
 	const doNotPollNotice = refreshed.running
-		? "Do not poll for the result. You will be notified when the subagent completes."
+		? "Do not poll for the result. Do not sleep for the result. You will be notified when the subagent completes."
 		: undefined;
 	return {
 		content: [
@@ -1183,7 +1183,7 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 					content: [
 						{
 							type: "text",
-							text: `Spawned subagent ${started.record.id}. Result will be at: ${started.record.outputFile}. You will be notified when this subagent completes. Do not poll for result - continue with whatever other work you may have.`,
+							text: `Spawned subagent ${started.record.id}. Result will be at: ${started.record.outputFile}. You will be notified when this subagent completes. Do not poll for result. Do not sleep for result. Continue with whatever other work you may have.`,
 						},
 					],
 					details: {
@@ -1250,7 +1250,7 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 		name: "get_subagent_status",
 		label: "Get subagent status",
 		description:
-			"Get the status and result (or result file path) for a subagent. If the subagent is still running, the response will instruct you not to poll.",
+			"Get the status and result (or result file path) for a subagent. If the subagent is still running, the response will instruct you not to poll or sleep for the result.",
 		parameters: GetSubagentStatusParams,
 		async execute(
 			_toolCallId: string,
