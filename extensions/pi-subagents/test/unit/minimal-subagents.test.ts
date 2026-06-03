@@ -1454,6 +1454,10 @@ test("completion notification includes resultPath and does not reference get_sub
 		assert.ok(completionMessage, "completion message must exist");
 		assert.match(completionMessage!, /Result file:/);
 		assert.match(completionMessage!, /result\.log/);
+		assert.match(
+			completionMessage!,
+			/You must read the result file at the path above/i,
+		);
 		assert(
 			!completionMessage!.includes("get_subagent_status"),
 			"completion message must not mention get_subagent_status",

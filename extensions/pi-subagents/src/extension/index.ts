@@ -762,6 +762,7 @@ function completionMessage(record: PersistedSubagentRecord): string {
 	return [
 		`Subagent ${record.id} completed.`,
 		`Result file: ${record.outputFile}`,
+		"You must read the result file at the path above.",
 	].join("\n");
 }
 
