@@ -8,7 +8,7 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import * as os from "node:os";
-import { scanContent } from "./content-scanner.js";
+import { scanContent } from "../memory/content-scanner.js";
 import {
   buildSkillId,
   exists,
@@ -20,7 +20,7 @@ import {
   today,
   tokenizeForSimilarity,
 } from "./skill-utils.js";
-import type { SkillDocument, SkillIndex, SkillResult, SkillScope } from "../types.js";
+import type { SkillDocument, SkillIndex, SkillResult, SkillScope } from "../runtime/types.js";
 
 interface SkillStoreOptions {
   globalSkillsDir?: string;

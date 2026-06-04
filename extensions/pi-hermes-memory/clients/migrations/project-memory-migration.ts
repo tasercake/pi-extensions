@@ -1,6 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
-import { ENTRY_DELIMITER, MEMORY_FILE } from "./constants.js";
+import { ENTRY_DELIMITER, MEMORY_FILE } from "../runtime/constants.js";
 
 export interface ProjectMemoryMigrationResult {
   scanned: number;

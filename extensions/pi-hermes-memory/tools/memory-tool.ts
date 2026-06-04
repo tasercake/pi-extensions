@@ -7,17 +7,17 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { StringEnum } from "@earendil-works/pi-ai";
-import { MemoryStore } from "../store/memory-store.js";
-import { DatabaseManager } from "../store/db.js";
+import { MemoryStore } from "../clients/memory/memory-store.js";
+import { DatabaseManager } from "../clients/memory/db.js";
 import {
   formatFailureMemoryContent,
   removeExactSyncedMemories,
   removeSyncedMemories,
   replaceSyncedMemories,
   syncMemoryEntry,
-} from "../store/sqlite-memory-store.js";
-import { MEMORY_TOOL_DESCRIPTION } from "../constants.js";
-import type { MemoryCategory, MemoryResult } from "../types.js";
+} from "../clients/memory/sqlite-memory-store.js";
+import { MEMORY_TOOL_DESCRIPTION } from "../clients/runtime/constants.js";
+import type { MemoryCategory, MemoryResult } from "../clients/runtime/types.js";
 
 function appendSyncWarning(result: MemoryResult, warning: string): MemoryResult {
   const warnings = [...(((result as any).warnings ?? []) as string[]), warning];

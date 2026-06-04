@@ -6,8 +6,8 @@ import { createHash } from "node:crypto";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { ExtensionAPI, ExtensionCommandContext, Theme } from "@earendil-works/pi-coding-agent";
-import { SkillStore } from "../store/skill-store.js";
-import type { SkillIndex, SkillResult, SkillScope } from "../types.js";
+import { SkillStore } from "../clients/skills/skill-store.js";
+import type { SkillIndex, SkillResult, SkillScope } from "../clients/runtime/types.js";
 import {
   Input,
   Key,

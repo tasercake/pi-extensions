@@ -6,8 +6,8 @@ import path from 'node:path';
 import fs from 'node:fs';
 import os from 'node:os';
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
-import { DatabaseManager } from '../store/db.js';
-import { indexAllSessions, getSessionStats } from '../store/session-indexer.js';
+import { DatabaseManager } from '../clients/memory/db.js';
+import { indexAllSessions, getSessionStats } from '../clients/sessions/session-indexer.js';
 
 const SESSIONS_DIR = path.join(os.homedir(), '.pi', 'agent', 'sessions');
 

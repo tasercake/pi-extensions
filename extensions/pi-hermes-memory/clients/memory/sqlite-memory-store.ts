@@ -1,7 +1,7 @@
 import { DatabaseManager } from './db.js';
 import { isFts5QueryError, normalizeFts5Query } from './fts-query.js';
 import { normalizeMemoryLookupText } from './memory-lookup.js';
-import type { MemoryCategory } from '../types.js';
+import type { MemoryCategory } from '../runtime/types.js';
 
 const MEMORY_SELECT_COLUMNS = `
   id,

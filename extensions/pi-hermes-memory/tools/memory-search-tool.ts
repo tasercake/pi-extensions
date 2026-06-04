@@ -1,9 +1,9 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { StringEnum } from "@earendil-works/pi-ai";
-import { DatabaseManager } from '../store/db.js';
-import { searchMemories, getMemoryStats } from '../store/sqlite-memory-store.js';
-import type { MemoryCategory } from '../types.js';
+import { DatabaseManager } from '../clients/memory/db.js';
+import { searchMemories, getMemoryStats } from '../clients/memory/sqlite-memory-store.js';
+import type { MemoryCategory } from '../clients/runtime/types.js';
 
 interface SearchResult {
   success: boolean;

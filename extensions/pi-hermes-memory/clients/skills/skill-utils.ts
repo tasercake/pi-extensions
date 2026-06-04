@@ -1,5 +1,5 @@
 import * as fs from "node:fs/promises";
-import type { SkillDocument, SkillScope } from "../types.js";
+import type { SkillDocument, SkillScope } from "../runtime/types.js";
 
 export interface ParsedSkillFile {
   meta: Record<string, string>;

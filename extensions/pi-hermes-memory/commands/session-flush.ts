@@ -5,9 +5,9 @@
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { MemoryStore } from "../store/memory-store.js";
-import { FLUSH_PROMPT } from "../constants.js";
-import type { MemoryConfig } from "../types.js";
+import { MemoryStore } from "../clients/memory/memory-store.js";
+import { FLUSH_PROMPT } from "../clients/runtime/constants.js";
+import type { MemoryConfig } from "../clients/runtime/types.js";
 import { collectMessageParts } from "./message-parts.js";
 import { execChildPrompt } from "./pi-child-process.js";
 

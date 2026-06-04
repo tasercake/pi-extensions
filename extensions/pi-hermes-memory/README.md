@@ -107,7 +107,7 @@ pi install git:github:chandra447/pi-hermes-memory
 Or test locally without installing:
 
 ```bash
-pi -e /path/to/pi-hermes-memory/src/index.ts
+pi -e /path/to/pi-hermes-memory/index.ts
 ```
 
 ## Two-Tier Memory Architecture

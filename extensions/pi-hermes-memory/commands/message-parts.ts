@@ -1,4 +1,4 @@
-import { getMessageText } from "../types.js";
+import { getMessageText } from "../clients/runtime/types.js";
 
 export function applyRecentMessageLimit(parts: string[], recentMessages = 0): string[] {
   if (Number.isFinite(recentMessages) && recentMessages > 0) {

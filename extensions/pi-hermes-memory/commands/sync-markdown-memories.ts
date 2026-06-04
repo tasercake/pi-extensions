@@ -6,13 +6,13 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
-import { DatabaseManager } from '../store/db.js';
+import { DatabaseManager } from '../clients/memory/db.js';
 import {
   parseMarkdownMemoryEntry,
   syncMemoryEntry,
-} from '../store/sqlite-memory-store.js';
-import { ENTRY_DELIMITER, MEMORY_FILE, USER_FILE } from '../constants.js';
-import { AGENT_ROOT } from '../paths.js';
+} from '../clients/memory/sqlite-memory-store.js';
+import { ENTRY_DELIMITER, MEMORY_FILE, USER_FILE } from '../clients/runtime/constants.js';
+import { AGENT_ROOT } from '../clients/runtime/paths.js';
 
 export interface BackfillCounters {
   filesScanned: number;

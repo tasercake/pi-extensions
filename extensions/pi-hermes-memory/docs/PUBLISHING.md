@@ -31,7 +31,12 @@ Target state:
     "hermes"
   ],
   "files": [
+    "index.ts",
     "src",
+    "clients",
+    "commands",
+    "tools",
+    "tsconfig.json",
     "README.md",
     "LICENSE"
   ],
@@ -41,7 +46,7 @@ Target state:
     "url": "https://github.com/chandra447/pi-hermes-memory"
   },
   "pi": {
-    "extensions": ["./src/index.ts"],
+    "extensions": ["./index.ts"],
     "image": "https://raw.githubusercontent.com/chandra447/pi-hermes-memory/main/docs/assets/hermes-memory-preview.png"
   },
   "peerDependencies": {
@@ -52,8 +57,8 @@ Target state:
 
 Key changes:
 - `"keywords": ["pi-package", ...]` — **required** for pi.dev listing
-- `"pi": { "extensions": ["./src/index.ts"] }` — tells Pi where the entry point is
-- `"files": ["src", "README.md", "LICENSE"]` — only publish what's needed
+- `"pi": { "extensions": ["./index.ts"] }` — tells Pi where the entry point is
+- `"files": ["index.ts", "src", "clients", "commands", "tools", "tsconfig.json", "README.md", "LICENSE"]` — only publish what's needed
 - `"peerDependencies"` — Pi provides the API, no runtime deps needed
 - `"pi": { "image": "..." }` — optional preview image for the gallery
 

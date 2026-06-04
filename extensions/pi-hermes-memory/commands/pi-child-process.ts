@@ -1,5 +1,5 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import type { MemoryConfig, ThinkingLevel } from "../types.js";
+import type { MemoryConfig, ThinkingLevel } from "../clients/runtime/types.js";
 
 type ChildLlmConfig = Pick<MemoryConfig, "llmModelOverride" | "llmThinkingOverride">;
 

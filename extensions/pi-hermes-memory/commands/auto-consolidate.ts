@@ -8,9 +8,9 @@
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { MemoryStore } from "../store/memory-store.js";
-import { CONSOLIDATION_PROMPT, ENTRY_DELIMITER } from "../constants.js";
-import type { ConsolidationResult, MemoryConfig } from "../types.js";
+import { MemoryStore } from "../clients/memory/memory-store.js";
+import { CONSOLIDATION_PROMPT, ENTRY_DELIMITER } from "../clients/runtime/constants.js";
+import type { ConsolidationResult, MemoryConfig } from "../clients/runtime/types.js";
 import { execChildPrompt } from "./pi-child-process.js";
 
 type MemoryTarget = "memory" | "user" | "failure";

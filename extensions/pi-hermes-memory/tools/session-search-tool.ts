@@ -3,11 +3,11 @@ import * as os from 'node:os';
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { StringEnum } from "@earendil-works/pi-ai";
-import { DatabaseManager } from '../store/db.js';
-import { searchSessions, getIndexedMessageCount } from '../store/session-search.js';
-import { searchSessionAnchors } from '../store/session-anchor-search.js';
-import type { SessionAnchorRange, SessionAnchorSearchResult } from '../store/session-anchor-search.js';
-import type { SessionSearchConfig } from '../types.js';
+import { DatabaseManager } from '../clients/memory/db.js';
+import { searchSessions, getIndexedMessageCount } from '../clients/sessions/session-search.js';
+import { searchSessionAnchors } from '../clients/sessions/session-anchor-search.js';
+import type { SessionAnchorRange, SessionAnchorSearchResult } from '../clients/sessions/session-anchor-search.js';
+import type { SessionSearchConfig } from '../clients/runtime/types.js';
 
 interface SearchResult {
   success: boolean;

@@ -4,9 +4,9 @@
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { MemoryStore } from "../store/memory-store.js";
-import { resolveMemoryPolicyPrompt } from "../prompt-context.js";
-import type { MemoryConfig } from "../types.js";
+import { MemoryStore } from "../clients/memory/memory-store.js";
+import { resolveMemoryPolicyPrompt } from "../clients/runtime/prompt-context.js";
+import type { MemoryConfig } from "../clients/runtime/types.js";
 
 export function registerPreviewContextCommand(
   pi: ExtensionAPI,

@@ -3,16 +3,21 @@
   "version": "0.7.14",
   "description": "🧠 Persistent memory + 🔍 session search + 🛡️ secret scanning for Pi. Token-aware policy-only memory by default, SQLite FTS5 search, auto-consolidation, procedural skills. 368 tests. Ported from Hermes agent.",
   "type": "module",
-  "main": "src/index.ts",
+  "main": "index.ts",
   "files": [
+    "index.ts",
     "src",
+    "clients",
+    "commands",
+    "tools",
+    "tsconfig.json",
     "README.md",
     "LICENSE",
     "docs"
   ],
   "pi": {
     "extensions": [
-      "./src/index.ts"
+      "./index.ts"
     ]
   },
   "scripts": {

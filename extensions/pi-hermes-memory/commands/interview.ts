@@ -7,8 +7,8 @@
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { MemoryStore } from "../store/memory-store.js";
-import { INTERVIEW_PROMPT } from "../constants.js";
+import { MemoryStore } from "../clients/memory/memory-store.js";
+import { INTERVIEW_PROMPT } from "../clients/runtime/constants.js";
 
 export function registerInterviewCommand(
   pi: ExtensionAPI,

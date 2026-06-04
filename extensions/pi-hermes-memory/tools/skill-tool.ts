@@ -6,8 +6,8 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { StringEnum } from "@earendil-works/pi-ai";
-import { SkillStore } from "../store/skill-store.js";
-import { SKILL_TOOL_DESCRIPTION } from "../constants.js";
+import { SkillStore } from "../clients/skills/skill-store.js";
+import { SKILL_TOOL_DESCRIPTION } from "../clients/runtime/constants.js";
 
 function normalizeTextList(value: unknown): string[] {
   if (!Array.isArray(value)) return [];

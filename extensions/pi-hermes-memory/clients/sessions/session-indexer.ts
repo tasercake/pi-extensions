@@ -1,4 +1,4 @@
-import { DatabaseManager } from './db.js';
+import { DatabaseManager } from '../memory/db.js';
 import { parseSessionFile, getSessionFiles, type ParsedSession } from './session-parser.js';
 
 /**

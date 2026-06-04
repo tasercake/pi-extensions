@@ -1,5 +1,5 @@
-import { DatabaseManager } from './db.js';
-import { isFts5QueryError, normalizeFts5Query } from './fts-query.js';
+import { DatabaseManager } from '../memory/db.js';
+import { isFts5QueryError, normalizeFts5Query } from '../memory/fts-query.js';
 
 /**
  * Search result from session history.

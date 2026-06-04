@@ -9,12 +9,12 @@
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { MemoryStore } from "../store/memory-store.js";
-import { DatabaseManager } from "../store/db.js";
+import { MemoryStore } from "../clients/memory/memory-store.js";
+import { DatabaseManager } from "../clients/memory/db.js";
 import {
   formatFailureMemoryContent,
   syncMemoryEntry,
-} from "../store/sqlite-memory-store.js";
+} from "../clients/memory/sqlite-memory-store.js";
 import {
   CORRECTION_SAVE_PROMPT,
   CORRECTION_STRONG_PATTERNS,
@@ -22,9 +22,9 @@ import {
   CORRECTION_NEGATIVE_PATTERNS,
   CORRECTION_DIRECTIVE_WORDS,
   ENTRY_DELIMITER,
-} from "../constants.js";
-import type { MemoryConfig } from "../types.js";
-import { getMessageText } from "../types.js";
+} from "../clients/runtime/constants.js";
+import type { MemoryConfig } from "../clients/runtime/types.js";
+import { getMessageText } from "../clients/runtime/types.js";
 import { execChildPrompt } from "./pi-child-process.js";
 
 /**
