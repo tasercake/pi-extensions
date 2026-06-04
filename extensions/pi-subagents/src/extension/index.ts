@@ -20,10 +20,7 @@ import {
 import { getPiSpawnCommand } from "../runs/shared/pi-spawn.ts";
 import { buildPiArgs, cleanupTempDir } from "../runs/shared/pi-args.ts";
 import {
-	GetSubagentStatusParams,
-	ListSubagentsParams,
 	SpawnSubagentParams,
-	type GetSubagentStatusParamsLike,
 	type SpawnSubagentParamsLike,
 } from "./schemas.ts";
 
@@ -1244,75 +1241,7 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 		},
 	};
 
-	const statusTool: ToolDefinition<
-		typeof GetSubagentStatusParams,
-		ToolDetails
-	> = {
-		name: "get_subagent_status",
-		label: "Get subagent status",
-		description:
-			"Get the status and result (or result file path) for a subagent. If the subagent is still running, the response will instruct you not to poll or sleep for the result.",
-		parameters: GetSubagentStatusParams,
-		async execute(
-			_toolCallId: string,
-			params: GetSubagentStatusParamsLike,
-			_signal: AbortSignal,
-			_onUpdate: ((result: AgentToolResult<ToolDetails>) => void) | undefined,
-			ctx: ExtensionContext,
-		) {
-			const parentId = parentSessionId(ctx);
-			rememberUiContext(ctx);
-			retryPendingNotices(pi, parentId);
-			const record = findRecord(parentId, params.id);
-			if (!record) throw new Error(`Unknown subagent id: ${params.id}`);
-			maybeRenderRunningWidget(ctx, parentId);
-			return formatStatus(record);
-		},
-		renderCall(args, theme) {
-			return new Text(
-				`${theme.fg("toolTitle", theme.bold("get_subagent_status "))}${theme.fg("accent", args.id)}`,
-				0,
-				0,
-			);
-		},
-	};
-
-	const listTool: ToolDefinition<typeof ListSubagentsParams, ToolDetails> = {
-		name: "list_subagents",
-		label: "List subagents",
-		description:
-			"List subagents for the current parent session. Data is persisted on disk across session restarts.",
-		parameters: ListSubagentsParams,
-		async execute(
-			_toolCallId: string,
-			_params: Record<string, never>,
-			_signal: AbortSignal,
-			_onUpdate: ((result: AgentToolResult<ToolDetails>) => void) | undefined,
-			ctx: ExtensionContext,
-		) {
-			const parentId = parentSessionId(ctx);
-			rememberUiContext(ctx);
-			retryPendingNotices(pi, parentId);
-			const { records } = reconcileStore(parentId);
-			const subagents = records.map((r) => ({ id: r.id, running: r.running }));
-			maybeRenderRunningWidget(ctx, parentId);
-			return {
-				content: [{ type: "text", text: JSON.stringify(subagents, null, 2) }],
-				details: { subagents },
-			};
-		},
-		renderCall(_args, theme) {
-			return new Text(
-				theme.fg("toolTitle", theme.bold("list_subagents")),
-				0,
-				0,
-			);
-		},
-	};
-
 	pi.registerTool(spawnTool);
-	pi.registerTool(statusTool);
-	pi.registerTool(listTool);
 
 	if (typeof pi.on === "function") {
 		pi.on("session_start", (_event, ctx) => {

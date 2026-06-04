@@ -5,7 +5,7 @@ description: Spawn minimal recursive child Pi agents with no predefined roles. U
 
 # Minimal Pi Subagents
 
-Use these tools to launch unrestricted child Pi sessions. The caller must include all role, task, constraints, and output instructions in `task`.
+Use this tool to launch unrestricted child Pi sessions. The caller must include all role, task, constraints, and output instructions in `task`.
 
 ## Tools
 
@@ -14,8 +14,6 @@ Use these tools to launch unrestricted child Pi sessions. The caller must includ
   - Timeout is only a notification threshold: the parent is informed that the child is still running; the child is not killed.
   - The returned subagent id is also the child Pi session id.
   - Child output is written to `result.log` under the child subagent directory.
-- `get_subagent_status({ id })`
-- `list_subagents({})`
 
 ## Usage
 
@@ -44,24 +42,18 @@ spawn_subagent({
 });
 ```
 
-Retrieve results:
-
-```ts
-get_subagent_status({ id: "..." });
-list_subagents({});
-```
+Async calls return immediately; the parent will be notified when each subagent completes.
 
 ## Rules
 
-- Available subagent tools are exactly the three listed above.
+- Available subagent tool is exactly `spawn_subagent`.
 - No subagent types exist.
 - No chain or parallel-list mode exists.
 - `timeout` is optional and measured in seconds; omitted timeout defaults to 1 hour.
 - When `timeout` expires, the parent is informed that the subagent is still running; the child is not killed.
 - Do not kill subagents autonomously to enforce `timeout`.
 - Give explicit `timeout` values a healthy margin above expected runtime because child execution time can be wildly unpredictable.
-- For async launches, tell the user/caller in second person that they **will be notified** when the subagent completes; do not imply they need to poll.
-- If `get_subagent_status` returns `running: true`, do not poll repeatedly; wait for the completion notification.
+- For async launches, tell the user/caller in second person that they **will be notified** when the subagent completes.
 - Child Pi receives normal tools, skills, extensions, and project context.
 - Child Pi gets only one automatic system line: `You are a Pi subagent controlled by another Pi agent.`
 - Child Pi does not inherit parent session history. Put all parent-provided role context, constraints, and task details explicitly in `task`.
@@ -72,8 +64,8 @@ list_subagents({});
 
 When changing the pi-subagents extension contract, update every surface together:
 
-1. Tool schema in `extensions/pi-subagents/src/extension/schemas.ts`.
-2. Runtime defaults/validation and user-facing messages in `extensions/pi-subagents/src/extension/index.ts`.
+1. Spawn tool schema in `extensions/pi-subagents/src/extension/schemas.ts`.
+2. Spawn runtime defaults/validation and user-facing messages in `extensions/pi-subagents/src/extension/index.ts`.
 3. Skill docs in `extensions/pi-subagents/skills/pi-subagents/SKILL.md`.
 4. GitHub issues/PR text exactly as requested by the user; do not fabricate details.
 
@@ -82,5 +74,4 @@ For timeout semantics specifically:
 - Make schema and runtime agree that `timeout` is optional.
 - Apply `timeout ?? 3600` before constructing persisted records or timers.
 - Phrase async launch responses in second person: “you will be notified…” when the subagent completes.
-- Phrase running status responses to discourage polling and state the caller will be notified on completion.
 - Preserve existing timeout behavior: timeout only notifies/marks timeout; it must not kill the child process.
