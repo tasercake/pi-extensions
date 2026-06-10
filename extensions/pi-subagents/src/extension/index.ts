@@ -843,7 +843,6 @@ function notifyCompletion(
 		content = completionMessage(pendingRecord);
 	} else if (finalCohort) {
 		content = [
-			`Subagent ${pendingRecord.id} completed.`,
 			`All ${refreshedCohort.length} subagents have completed.`,
 			"Result files:",
 			...refreshedCohort.map((r) => `- ${r.id}: ${r.outputFile}`),

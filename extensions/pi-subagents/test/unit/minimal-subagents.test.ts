@@ -1202,6 +1202,7 @@ test("cohort: same turn async spawns share cohort and final lists all result fil
 		assert.equal(messages.length, 1, "only final cohort notification is sent");
 		const final = messages.find((m) => m.includes("All 3 subagents have completed."));
 		assert.ok(final);
+		assert.equal(final.startsWith("Subagent "), false);
 		assert.ok(final.includes("Result files:"));
 		for (const r of records) assert.ok(final.includes(String(r.outputFile)));
 	} finally {
