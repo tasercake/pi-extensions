@@ -1198,8 +1198,8 @@ test("cohort: same turn async spawns share cohort and final lists all result fil
 		assert.ok(records[0].cohortId);
 		assert.equal(new Set(records.map((r) => r.cohortId)).size, 1);
 		assert.ok(records.every((r) => typeof r.cohortCreatedAt === "number"));
-		assert.ok(messages.some((m) => m.includes("1 out of 3 subagents have completed")));
-		assert.ok(messages.some((m) => m.includes("2 out of 3 subagents have completed")));
+		assert.equal(messages.some((m) => m.includes("out of 3 subagents have completed")), false);
+		assert.equal(messages.length, 1, "only final cohort notification is sent");
 		const final = messages.find((m) => m.includes("All 3 subagents have completed."));
 		assert.ok(final);
 		assert.ok(final.includes("Result files:"));
@@ -1232,7 +1232,7 @@ test("cohort: turn_end starts a new cohort", async () => {
 		const c = readPersistedRecord(sessionId, "turn-c");
 		assert.equal(a.cohortId, b.cohortId);
 		assert.notEqual(a.cohortId, c.cohortId);
-		assert.ok(messages.some((m) => m.includes("1 out of 2 subagents have completed")));
+		assert.equal(messages.some((m) => m.includes("out of 2 subagents have completed")), false);
 		assert.ok(messages.some((m) => m.includes("All 2 subagents have completed.")));
 		assert.ok(messages.some((m) => m.includes(`Subagent ${c.id} completed.`) && m.includes("Result file:") && !m.includes("out of")));
 		assert.equal(messages.some((m) => m.includes("out of 3") || m.includes("All 3")), false);

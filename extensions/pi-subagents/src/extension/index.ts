@@ -833,8 +833,11 @@ function notifyCompletion(
 	const cohort = completionCohort(parentId, pendingRecord);
 	const refreshedCohort = cohort.map(refreshRecordFromDisk);
 	const active = refreshedCohort.filter((r) => r.running);
-	const completed = refreshedCohort.filter((r) => !r.running);
 	const finalCohort = active.length === 0 && refreshedCohort.length > 1;
+	if (refreshedCohort.length > 1 && !finalCohort) {
+		markCompletionNoticeSent(pendingRecord);
+		return true;
+	}
 	let content: string;
 	if (refreshedCohort.length === 1) {
 		content = completionMessage(pendingRecord);
@@ -847,12 +850,7 @@ function notifyCompletion(
 			"You must read the result files at the paths above.",
 		].join("\n");
 	} else {
-		content = [
-			`Subagent ${pendingRecord.id} completed.`,
-			`${completed.length} out of ${refreshedCohort.length} subagents have completed. You will be notified when all complete.`,
-			`Result file: ${pendingRecord.outputFile}`,
-			"You must read the result file at the path above.",
-		].join("\n");
+		content = completionMessage(pendingRecord);
 	}
 	try {
 		pi.sendMessage(
