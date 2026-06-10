@@ -8,7 +8,7 @@ created: 2026-05-30
 ## Procedure
 
 ### 1. Choose the scope file path
-Decide on a file path for the scope document. Convention: `.spec/<slug>/SCOPE.md`, where `<slug>` is the feature slug selected for the workflow. Use the same slug for PLAN and TODO in later phases. Create the directory if it doesn't exist, and ensure `.spec` is added to `.gitignore` if not already present.
+Decide on a file path for the scope document. Convention: `.spec/<slug>/SCOPE.md`, where `<slug>` is the feature slug selected for the workflow. Use the same slug for PLAN and TODO in later phases. Create the directory if it doesn't exist, ensure `.spec` is added to `.gitignore` if not already present, and ensure `.spec` is not tracked in version control.
 
 ### 2. Write the initial scope document
 Write the first scope document as a faithful capture of the user's stated idea. Preserve the user's intent and wording as much as possible. Do **not** infer missing requirements, add clever improvements, or fill gaps from your own judgment.
