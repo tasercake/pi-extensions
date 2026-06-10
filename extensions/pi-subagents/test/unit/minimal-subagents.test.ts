@@ -696,6 +696,43 @@ test("N1: sync subagent widget appears during execution and clears after", async
 	}
 });
 
+test("running widget omits internal ids, uses subtle color, and fits one-line prompt preview", async () => {
+	const mockPi = createMockPi();
+	mockPi.install();
+	mockPi.onCall({ output: "preview widget done", exitCode: 0, delay: 120 });
+	const originalColumns = process.stdout.columns;
+	Object.defineProperty(process.stdout, "columns", { value: 64, configurable: true });
+	const { sessionId, ctx } = makeTestCtx("pi-subagents-widget-preview");
+	const fake = makeFakeCtx(sessionId, ctx.cwd, true);
+	const { spawnTool } = registerTestTools();
+	try {
+		await spawnTool.execute(
+			"preview-child",
+			{ task: "first line\nsecond line with more text", async: true },
+			new AbortController().signal,
+			undefined,
+			fake.ctx,
+		);
+		const rendered = fake.widgetCalls
+			.flatMap((c) => c.lines ?? [])
+			.find((line) => line.includes("first line"));
+		assert.ok(rendered, "widget rendered prompt preview");
+		assert.equal(rendered.includes("preview-child"), false);
+		assert.equal(rendered.includes("pid="), false);
+		assert.equal(rendered.includes("\n"), false);
+		assert.ok(rendered.includes("first line second line"));
+		const visible = rendered.replace(/\x1b\[[0-9;]*m/g, "");
+		assert.ok(visible.length <= 64);
+		assert.match(rendered, /\x1b\[/, "widget line uses ANSI color styling");
+		await waitForPersistedRecord(sessionId, "preview-child", (record) => !record.running);
+	} finally {
+		if (originalColumns === undefined) delete (process.stdout as any).columns;
+		else Object.defineProperty(process.stdout, "columns", { value: originalColumns, configurable: true });
+		mockPi.uninstall();
+		cleanupTestCtx(ctx, sessionId);
+	}
+});
+
 test("N2: running widget survives agent_end", async () => {
 	const originalSetInterval = globalThis.setInterval;
 	const originalClearInterval = globalThis.clearInterval;
@@ -1128,7 +1165,7 @@ test("Phase 7.14: session_start renders widget before user status", async () => 
 	);
 
 	const activeWidget = widgetAfterStart.find((c) =>
-		c.lines?.some((line) => line.includes(recordId)),
+		c.lines?.some((line) => line.includes("session start test")),
 	);
 	assert.ok(
 		activeWidget,

@@ -576,8 +576,24 @@ function runningWidgetKey(parentId: string): string {
 	return `pi-subagents-running:${safeName(parentId)}`;
 }
 
+function terminalWidth(): number {
+	const columns = process.stdout.columns;
+	return Number.isFinite(columns) && columns > 0 ? columns : 80;
+}
+
+function visibleLength(text: string): number {
+	return text.replace(/\x1b\[[0-9;]*m/g, "").length;
+}
+
+function fitToWidth(text: string, width: number): string {
+	if (width <= 0) return "";
+	if (text.length <= width) return text;
+	if (width === 1) return "…";
+	return `${text.slice(0, width - 1)}…`;
+}
+
 function sanitizePreview(text: string): string {
-	return text.split("\n")[0].trim().slice(0, 100);
+	return text.replace(/[\r\n]+/g, " ").replace(/\s+/g, " ").trim();
 }
 
 function formatRunningLine(record: PersistedSubagentRecord): string {
@@ -586,10 +602,12 @@ function formatRunningLine(record: PersistedSubagentRecord): string {
 	const statusText = timedOut
 		? "timed out, still running"
 		: `running ${elapsed}s`;
-	const pidPart = record.pid ? ` pid=${record.pid}` : "";
+	const prefix = `⏳ subagent ${statusText}`;
 	const preview = sanitizePreview(record.taskPreview);
-	const previewPart = preview ? ` — ${preview}` : "";
-	return `⏳ subagent ${record.id} ${statusText}${pidPart}${previewPart}`;
+	const separator = preview ? " — " : "";
+	const available = Math.max(0, terminalWidth() - visibleLength(prefix) - separator.length);
+	const line = `${prefix}${separator}${fitToWidth(preview, available)}`;
+	return `\x1b[2m${line}\x1b[22m`;
 }
 
 function resultForRecord(record: PersistedSubagentRecord): string | undefined {
