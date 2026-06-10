@@ -10,7 +10,7 @@ Use this tool to launch unrestricted child Pi sessions. The caller must include 
 ## Tools
 
 - `spawn_subagent({ task, async, timeout?, cwd?, model? })`
-  - `timeout` is optional; default is `3600` seconds (1 hour).
+  - `timeout` is optional; default is `600` seconds (10 minutes).
   - Timeout is only a notification threshold: the parent is informed that the child is still running; the child is not killed.
   - The returned subagent id is also the child Pi session id.
   - Child output is written to `result.log` under the child subagent directory.
@@ -23,7 +23,7 @@ Blocking:
 spawn_subagent({
   task: "You are a focused reviewer. Inspect ... Return ...",
   async: false,
-  timeout: 600, // optional; defaults to 3600
+  timeout: 600, // optional; defaults to 600
 });
 ```
 
@@ -49,7 +49,7 @@ Async calls return immediately; the parent will be notified when each subagent c
 - Available subagent tool is exactly `spawn_subagent`.
 - No subagent types exist.
 - No chain or parallel-list mode exists.
-- `timeout` is optional and measured in seconds; omitted timeout defaults to 1 hour.
+- `timeout` is optional and measured in seconds; omitted timeout defaults to 10 minutes.
 - When `timeout` expires, the parent is informed that the subagent is still running; the child is not killed.
 - Do not kill subagents autonomously to enforce `timeout`.
 - Give explicit `timeout` values a healthy margin above expected runtime because child execution time can be wildly unpredictable.
@@ -72,6 +72,6 @@ When changing the pi-subagents extension contract, update every surface together
 For timeout semantics specifically:
 
 - Make schema and runtime agree that `timeout` is optional.
-- Apply `timeout ?? 3600` before constructing persisted records or timers.
+- Apply `timeout ?? 600` before constructing persisted records or timers.
 - Phrase async launch responses in second person: “you will be notified…” when the subagent completes.
 - Preserve existing timeout behavior: timeout only notifies/marks timeout; it must not kill the child process.

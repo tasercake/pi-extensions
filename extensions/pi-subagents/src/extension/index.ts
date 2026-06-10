@@ -89,7 +89,7 @@ interface StartChildHooks {
 	onSetupFailure?(record: PersistedSubagentRecord, error: unknown): void;
 }
 
-const DEFAULT_TIMEOUT_SECONDS = 3600;
+const DEFAULT_TIMEOUT_SECONDS = 600;
 const runningChildren = new Map<string, ChildProcess>();
 const activeCohorts = new Map<
 	string,
@@ -1188,7 +1188,7 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 		name: "spawn_subagent",
 		label: "Spawn subagent",
 		description:
-			"Spawn a child Pi subagent for one task. timeout is optional and measured in seconds (default 3600 = 1 hour). When async is true, this returns immediately, allowing the parent to spawn multiple concurrent subagents by calling spawn_subagent multiple times. Do not kill subagents autonomously to enforce timeout; the parent will be informed when timeout expires. Give a healthy timeout margin above expected runtime because subagent execution may be wildly unpredictable.",
+			"Spawn a child Pi subagent for one task. timeout is optional and measured in seconds (default 600 = 10 minutes). When async is true, this returns immediately, allowing the parent to spawn multiple concurrent subagents by calling spawn_subagent multiple times. Do not kill subagents autonomously to enforce timeout; the parent will be informed when timeout expires. Give a healthy timeout margin above expected runtime because subagent execution may be wildly unpredictable.",
 		parameters: SpawnSubagentParams,
 		async execute(
 			id,
