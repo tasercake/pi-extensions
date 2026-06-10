@@ -13,7 +13,7 @@ export const SpawnSubagentParams = Type.Object(
 			Type.Number({
 				minimum: 0.001,
 				description:
-					"Optional timeout in seconds (default 3600 = 1 hour). When the timeout is reached, the parent is informed that the subagent is still running; the subagent is not killed. Do not kill subagents autonomously to enforce this timeout. Give a healthy timeout margin on top of expected execution time because subagent runtime may be wildly unpredictable.",
+					"Optional timeout in seconds (default 600 = 10 minutes). When the timeout is reached, the parent is informed that the subagent is still running; the subagent is not killed. Do not kill subagents autonomously to enforce this timeout. Give a healthy timeout margin on top of expected execution time because subagent runtime may be wildly unpredictable.",
 			}),
 		),
 		cwd: Type.Optional(
