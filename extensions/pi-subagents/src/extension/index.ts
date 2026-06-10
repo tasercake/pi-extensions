@@ -69,6 +69,8 @@ interface PersistedSubagentRecord {
 	notifyError?: string;
 	notifiedAt?: number;
 	cohortFinalNotified?: boolean;
+	cohortId?: string;
+	cohortCreatedAt?: number;
 }
 
 interface StoreFile {
@@ -89,6 +91,25 @@ interface StartChildHooks {
 
 const DEFAULT_TIMEOUT_SECONDS = 3600;
 const runningChildren = new Map<string, ChildProcess>();
+const activeCohorts = new Map<
+	string,
+	{ id: string; createdAt: number; turnIndex?: number }
+>();
+
+function getOrCreateActiveCohort(
+	parentId: string,
+	turnIndex?: number,
+): { id: string; createdAt: number; turnIndex?: number } {
+	const existing = activeCohorts.get(parentId);
+	if (existing) return existing;
+	const cohort = { id: randomUUID(), createdAt: Date.now(), turnIndex };
+	activeCohorts.set(parentId, cohort);
+	return cohort;
+}
+
+function closeActiveCohort(parentId: string): void {
+	activeCohorts.delete(parentId);
+}
 
 // Widget state: parentId -> latest UI-capable ExtensionContext
 const uiParents = new Map<string, ExtensionContext>();
@@ -404,6 +425,9 @@ function mergeRecord(
 					updatedAt: refreshed.updatedAt,
 					completedAt: refreshed.completedAt ?? latest.completedAt,
 					timeoutAt: refreshed.timeoutAt ?? latest.timeoutAt,
+					cohortId: refreshed.cohortId ?? latest.cohortId,
+					cohortCreatedAt:
+						refreshed.cohortCreatedAt ?? latest.cohortCreatedAt,
 				}
 			: latest;
 	return applyNotificationFields(latest, refreshed, base);
@@ -781,6 +805,21 @@ function completionMessage(record: PersistedSubagentRecord): string {
 	].join("\n");
 }
 
+function completionCohort(
+	parentId: string,
+	pendingRecord: PersistedSubagentRecord,
+): PersistedSubagentRecord[] {
+	const store = readStore(parentId);
+	if (!pendingRecord.cohortId) {
+		const match = store.records.find((r) => r.id === pendingRecord.id);
+		return match ? [match] : [pendingRecord];
+	}
+	const cohort = store.records.filter(
+		(r) => r.cohortId === pendingRecord.cohortId && !r.cohortFinalNotified,
+	);
+	return cohort.length > 0 ? cohort : [pendingRecord];
+}
+
 function notifyCompletion(
 	pi: ExtensionAPI,
 	record: PersistedSubagentRecord,
@@ -791,44 +830,50 @@ function notifyCompletion(
 			? record
 			: markCompletionNoticePending(record);
 	const parentId = pendingRecord.parentSessionId;
-	const store = readStore(parentId);
-	const cohort = store.records.filter(
-		(r) =>
-			r.createdAt >= pendingRecord.createdAt - 60_000 && !r.cohortFinalNotified,
-	);
-	const active = cohort.filter((r) => refreshRecordFromDisk(r).running);
-	const completed = cohort.filter((r) => !refreshRecordFromDisk(r).running);
-	const parts = completionMessage(pendingRecord).split("\n");
-	const finalCohort = active.length === 0 && cohort.length > 1;
-	if (active.length > 0) {
-		parts.splice(
-			1,
-			0,
-			`${completed.length} out of ${cohort.length} subagents have completed. You will be notified when all complete.`,
-		);
+	const cohort = completionCohort(parentId, pendingRecord);
+	const refreshedCohort = cohort.map(refreshRecordFromDisk);
+	const active = refreshedCohort.filter((r) => r.running);
+	const completed = refreshedCohort.filter((r) => !r.running);
+	const finalCohort = active.length === 0 && refreshedCohort.length > 1;
+	let content: string;
+	if (refreshedCohort.length === 1) {
+		content = completionMessage(pendingRecord);
 	} else if (finalCohort) {
-		parts.splice(1, 0, `All ${cohort.length} subagents have completed.`);
+		content = [
+			`Subagent ${pendingRecord.id} completed.`,
+			`All ${refreshedCohort.length} subagents have completed.`,
+			"Result files:",
+			...refreshedCohort.map((r) => `- ${r.id}: ${r.outputFile}`),
+			"You must read the result files at the paths above.",
+		].join("\n");
+	} else {
+		content = [
+			`Subagent ${pendingRecord.id} completed.`,
+			`${completed.length} out of ${refreshedCohort.length} subagents have completed. You will be notified when all complete.`,
+			`Result file: ${pendingRecord.outputFile}`,
+			"You must read the result file at the path above.",
+		].join("\n");
 	}
 	try {
 		pi.sendMessage(
 			{
 				customType: "subagent-notify",
-				content: parts.join("\n"),
+				content,
 				display: true,
 			},
 			{ triggerTurn: true },
 		);
 	} catch (error) {
 		if (finalCohort) {
-			for (const r of cohort) markCompletionNoticePending(r, error);
+			for (const r of refreshedCohort) markCompletionNoticePending(r, error);
 		} else {
 			markCompletionNoticePending(pendingRecord, error);
 		}
 		return false;
 	}
 	if (finalCohort) {
-		for (const r of cohort) markCompletionNoticeSent(r);
-		for (const r of cohort) {
+		for (const r of refreshedCohort) markCompletionNoticeSent(r);
+		for (const r of refreshedCohort) {
 			updateRecordFields(parentId, r.id, (latest) => {
 				latest.cohortFinalNotified = true;
 			});
@@ -1161,6 +1206,9 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 			rememberUiContext(ctx);
 			const record = makeRecord(ctx, params);
 			if (params.async) {
+				const cohort = getOrCreateActiveCohort(parentId);
+				record.cohortId = cohort.id;
+				record.cohortCreatedAt = cohort.createdAt;
 				const hooks: StartChildHooks = {
 					onRunning(_r) {
 						rememberUiContext(ctx);
@@ -1273,9 +1321,14 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 			retryPendingNotices(pi, parentId);
 		});
 
+		pi.on("turn_end", (_event, ctx) => {
+			closeActiveCohort(parentSessionId(ctx));
+		});
+
 		pi.on("agent_end", (_event, ctx) => {
 			rememberUiContext(ctx);
 			const parentId = parentSessionId(ctx);
+			closeActiveCohort(parentId);
 			if (hasUiWidget(ctx)) {
 				renderRunningWidget(ctx, parentId);
 				scheduleWidgetRefresh(parentId);
@@ -1292,6 +1345,7 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 		pi.on("session_shutdown", (_event, _ctx) => {
 			// Clear all widget refresh timers to prevent stale UI state across extension instances.
 			stopAllWidgetRefreshForInstance();
+			activeCohorts.clear();
 		});
 	}
 }

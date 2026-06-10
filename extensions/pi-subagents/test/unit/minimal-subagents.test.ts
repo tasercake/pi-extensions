@@ -128,17 +128,22 @@ function readLatestMockPiArgs(mockPi: { dir: string }) {
 	) as { args: string[] };
 }
 
-function registerTestTools(sendMessage: (...args: unknown[]) => void) {
+function registerTestTools(sendMessage: (...args: unknown[]) => void = () => {}) {
 	const registered = new Map<string, any>();
+	const handlers = new Map<string, any>();
 	const fakePi = {
 		registerTool(tool: { name: string }) {
 			registered.set(tool.name, tool);
 		},
 		sendMessage,
+		on(event: string, handler: any) {
+			handlers.set(event, handler);
+		},
 	};
 	registerSubagentExtension(fakePi as never);
 	const rawSpawnTool = registered.get("spawn_subagent");
 	return {
+		handlers,
 		spawnTool: {
 			...rawSpawnTool,
 			async execute(callId: string, ...args: any[]) {
@@ -1173,4 +1178,135 @@ test("Phase 7.14: session_start renders widget before user status", async () => 
 	);
 
 	cleanupTestCtx(ctx, sessionId);
+});
+
+test("cohort: same turn async spawns share cohort and final lists all result files", async () => {
+	const mockPi = createMockPi();
+	mockPi.install();
+	mockPi.onCall({ output: "one", exitCode: 0, delay: 30 });
+	mockPi.onCall({ output: "two", exitCode: 0, delay: 60 });
+	mockPi.onCall({ output: "three", exitCode: 0, delay: 90 });
+	const { sessionId, ctx } = makeTestCtx("pi-subagents-cohort-same-turn");
+	const fake = makeFakeCtx(sessionId, ctx.cwd, false);
+	const messages: string[] = [];
+	const { spawnTool } = registerTestTools((message: any) => messages.push(String(message.content)));
+	try {
+		const ids = ["cohort-a", "cohort-b", "cohort-c"];
+		for (const id of ids) await spawnTool.execute(id, { task: id, async: true }, new AbortController().signal, undefined, fake.ctx);
+		await Promise.all(ids.map((id) => waitForPersistedRecord(sessionId, id)));
+		const records = ids.map((id) => readPersistedRecord(sessionId, id));
+		assert.ok(records[0].cohortId);
+		assert.equal(new Set(records.map((r) => r.cohortId)).size, 1);
+		assert.ok(records.every((r) => typeof r.cohortCreatedAt === "number"));
+		assert.ok(messages.some((m) => m.includes("1 out of 3 subagents have completed")));
+		assert.ok(messages.some((m) => m.includes("2 out of 3 subagents have completed")));
+		const final = messages.find((m) => m.includes("All 3 subagents have completed."));
+		assert.ok(final);
+		assert.ok(final.includes("Result files:"));
+		for (const r of records) assert.ok(final.includes(String(r.outputFile)));
+	} finally {
+		mockPi.uninstall();
+		cleanupTestCtx(ctx, sessionId);
+	}
+});
+
+test("cohort: turn_end starts a new cohort", async () => {
+	const mockPi = createMockPi();
+	mockPi.install();
+	mockPi.onCall({ output: "one", exitCode: 0, delay: 80 });
+	mockPi.onCall({ output: "two", exitCode: 0, delay: 100 });
+	mockPi.onCall({ output: "three", exitCode: 0, delay: 120 });
+	const { sessionId, ctx } = makeTestCtx("pi-subagents-cohort-turn-end");
+	const fake = makeFakeCtx(sessionId, ctx.cwd, false);
+	const messages: string[] = [];
+	const { spawnTool, handlers } = registerTestTools((message: any) => messages.push(String(message.content)));
+	try {
+		await spawnTool.execute("turn-a", { task: "a", async: true }, new AbortController().signal, undefined, fake.ctx);
+		await spawnTool.execute("turn-b", { task: "b", async: true }, new AbortController().signal, undefined, fake.ctx);
+		assert.ok(handlers.get("turn_end"), "turn_end handler registered");
+		await handlers.get("turn_end")(undefined, fake.ctx);
+		await spawnTool.execute("turn-c", { task: "c", async: true }, new AbortController().signal, undefined, fake.ctx);
+		await Promise.all(["turn-a", "turn-b", "turn-c"].map((id) => waitForPersistedRecord(sessionId, id)));
+		const a = readPersistedRecord(sessionId, "turn-a");
+		const b = readPersistedRecord(sessionId, "turn-b");
+		const c = readPersistedRecord(sessionId, "turn-c");
+		assert.equal(a.cohortId, b.cohortId);
+		assert.notEqual(a.cohortId, c.cohortId);
+		assert.ok(messages.some((m) => m.includes("1 out of 2 subagents have completed")));
+		assert.ok(messages.some((m) => m.includes("All 2 subagents have completed.")));
+		assert.ok(messages.some((m) => m.includes(`Subagent ${c.id} completed.`) && m.includes("Result file:") && !m.includes("out of")));
+		assert.equal(messages.some((m) => m.includes("out of 3") || m.includes("All 3")), false);
+	} finally {
+		mockPi.uninstall();
+		cleanupTestCtx(ctx, sessionId);
+	}
+});
+
+test("cohort: legacy records without cohortId notify solo", async () => {
+	const { sessionId, ctx } = makeTestCtx("pi-subagents-cohort-legacy");
+	const fake = makeFakeCtx(sessionId, ctx.cwd, false);
+	const dir = path.join(sessionId, "subagents");
+	fs.mkdirSync(dir, { recursive: true });
+	const now = Date.now();
+	const records = ["legacy-a", "legacy-b"].map((id, index) => {
+		const child = path.join(dir, id);
+		fs.mkdirSync(child, { recursive: true });
+		const outputFile = path.join(child, "result.log");
+		fs.writeFileSync(outputFile, `${id}\n`);
+		return { id, parentSessionId: sessionId, cwd: ctx.cwd, taskPreview: id, timeout: 3600, running: false, outputFile, stdoutFile: path.join(child, "stdout.log"), stderrFile: path.join(child, "stderr.log"), createdAt: now + index, updatedAt: now + index, completedAt: now + index, pendingCompletionNotice: id === "legacy-a" };
+	});
+	fs.writeFileSync(storeFile(sessionId), JSON.stringify({ records }, null, 2));
+	const messages: string[] = [];
+	const { handlers } = registerTestTools((message: any) => messages.push(String(message.content)));
+	try {
+		await handlers.get("session_start")(undefined, fake.ctx);
+		assert.equal(messages.length, 1);
+		assert.equal(messages[0].includes("out of 2") || messages[0].includes("All 2"), false);
+		const a = readPersistedRecord(sessionId, "legacy-a");
+		const b = readPersistedRecord(sessionId, "legacy-b");
+		assert.equal(a.notifiedCompletion, true);
+		assert.equal(b.notifiedCompletion, undefined);
+	} finally {
+		cleanupTestCtx(ctx, sessionId);
+	}
+});
+
+test("cohort: agent_end closes active cohort", async () => {
+	const mockPi = createMockPi();
+	mockPi.install();
+	mockPi.onCall({ output: "one", exitCode: 0, delay: 100 });
+	mockPi.onCall({ output: "two", exitCode: 0, delay: 100 });
+	const { sessionId, ctx } = makeTestCtx("pi-subagents-cohort-agent-end");
+	const fake = makeFakeCtx(sessionId, ctx.cwd, false);
+	const { spawnTool, handlers } = registerTestTools(() => {});
+	try {
+		await spawnTool.execute("agent-a", { task: "a", async: true }, new AbortController().signal, undefined, fake.ctx);
+		await handlers.get("agent_end")(undefined, fake.ctx);
+		await spawnTool.execute("agent-b", { task: "b", async: true }, new AbortController().signal, undefined, fake.ctx);
+		await Promise.all(["agent-a", "agent-b"].map((id) => waitForPersistedRecord(sessionId, id)));
+		assert.notEqual(readPersistedRecord(sessionId, "agent-a").cohortId, readPersistedRecord(sessionId, "agent-b").cohortId);
+	} finally {
+		mockPi.uninstall();
+		cleanupTestCtx(ctx, sessionId);
+	}
+});
+
+test("cohort: reconcile preserves cohort metadata", async () => {
+	const { sessionId, ctx } = makeTestCtx("pi-subagents-cohort-reconcile");
+	const fake = makeFakeCtx(sessionId, ctx.cwd, false);
+	const dir = path.join(sessionId, "subagents", "reconcile-a");
+	fs.mkdirSync(dir, { recursive: true });
+	const record = { id: "reconcile-a", parentSessionId: sessionId, cwd: ctx.cwd, taskPreview: "x", timeout: 3600, running: true, outputFile: path.join(dir, "result.log"), stdoutFile: path.join(dir, "stdout.log"), stderrFile: path.join(dir, "stderr.log"), createdAt: Date.now(), updatedAt: Date.now(), cohortId: "cohort-keep", cohortCreatedAt: 12345 };
+	fs.writeFileSync(record.stdoutFile, "");
+	fs.writeFileSync(record.stderrFile, "");
+	fs.writeFileSync(storeFile(sessionId), JSON.stringify({ records: [record] }, null, 2));
+	const { handlers } = registerTestTools(() => {});
+	try {
+		await handlers.get("session_start")(undefined, fake.ctx);
+		const persisted = readPersistedRecord(sessionId, "reconcile-a");
+		assert.equal(persisted.cohortId, "cohort-keep");
+		assert.equal(persisted.cohortCreatedAt, 12345);
+	} finally {
+		cleanupTestCtx(ctx, sessionId);
+	}
 });
