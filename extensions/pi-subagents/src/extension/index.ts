@@ -822,6 +822,56 @@ function completionMessage(record: PersistedSubagentRecord): string {
 	].join("\n");
 }
 
+function shortErrorSummary(error: unknown): string {
+	const summary = String(error ?? "")
+		.replace(/\s+/g, " ")
+		.trim();
+	if (!summary) return "failed";
+	const maxLength = 160;
+	return summary.length > maxLength
+		? `${summary.slice(0, maxLength - 1)}…`
+		: summary;
+}
+
+function failedCohortEntry(record: PersistedSubagentRecord): string {
+	return [
+		`- ${record.id}:`,
+		`  error: ${shortErrorSummary(record.error)}`,
+		`  result: ${record.outputFile}`,
+		`  stderr: ${record.stderrFile}`,
+	].join("\n");
+}
+
+function cohortCompletionMessage(records: PersistedSubagentRecord[]): string {
+	const failed = records.filter((r) => r.error);
+	if (failed.length === 0) {
+		return [
+			`All ${records.length} subagents completed successfully.`,
+			"Result files:",
+			...records.map((r) => `- ${r.id}: ${r.outputFile}`),
+			"You must read the result files at the paths above.",
+		].join("\n");
+	}
+
+	if (failed.length === records.length) {
+		return [
+			`All ${records.length} subagents finished with errors.`,
+			"Subagents:",
+			...records.map(failedCohortEntry),
+			"You must read stderr logs and result files at the paths above.",
+		].join("\n");
+	}
+
+	return [
+		`${records.length} subagents finished; ${failed.length} failed.`,
+		"Subagents:",
+		...records.map((r) =>
+			r.error ? failedCohortEntry(r) : `- ${r.id}: ${r.outputFile}`,
+		),
+		"You must read result files at the paths above, and read stderr logs for failures.",
+	].join("\n");
+}
+
 function completionCohort(
 	parentId: string,
 	pendingRecord: PersistedSubagentRecord,
@@ -859,12 +909,7 @@ function notifyCompletion(
 	if (refreshedCohort.length === 1) {
 		content = completionMessage(pendingRecord);
 	} else if (finalCohort) {
-		content = [
-			`All ${refreshedCohort.length} subagents have completed.`,
-			"Result files:",
-			...refreshedCohort.map((r) => `- ${r.id}: ${r.outputFile}`),
-			"You must read the result files at the paths above.",
-		].join("\n");
+		content = cohortCompletionMessage(refreshedCohort);
 	} else {
 		content = completionMessage(pendingRecord);
 	}

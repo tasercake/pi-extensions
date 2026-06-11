@@ -1200,11 +1200,74 @@ test("cohort: same turn async spawns share cohort and final lists all result fil
 		assert.ok(records.every((r) => typeof r.cohortCreatedAt === "number"));
 		assert.equal(messages.some((m) => m.includes("out of 3 subagents have completed")), false);
 		assert.equal(messages.length, 1, "only final cohort notification is sent");
-		const final = messages.find((m) => m.includes("All 3 subagents have completed."));
+		const final = messages.find((m) => m.includes("All 3 subagents completed successfully."));
 		assert.ok(final);
 		assert.equal(final.startsWith("Subagent "), false);
 		assert.ok(final.includes("Result files:"));
-		for (const r of records) assert.ok(final.includes(String(r.outputFile)));
+		assert.ok(final.includes("You must read the result files at the paths above."));
+		for (const r of records) assert.ok(final.includes(`- ${r.id}: ${r.outputFile}`));
+	} finally {
+		mockPi.uninstall();
+		cleanupTestCtx(ctx, sessionId);
+	}
+});
+
+test("cohort: mixed failures warn with stderr paths and fire once", async () => {
+	const mockPi = createMockPi();
+	mockPi.install();
+	mockPi.onCall({ output: "one", exitCode: 0, delay: 30 });
+	mockPi.onCall({ output: "two", stderr: "boom stderr", exitCode: 2, delay: 60 });
+	mockPi.onCall({ output: "three", exitCode: 0, delay: 90 });
+	const { sessionId, ctx } = makeTestCtx("pi-subagents-cohort-mixed-failure");
+	const fake = makeFakeCtx(sessionId, ctx.cwd, false);
+	const messages: string[] = [];
+	const { spawnTool } = registerTestTools((message: any) => messages.push(String(message.content)));
+	try {
+		const ids = ["mixed-a", "mixed-b", "mixed-c"];
+		for (const id of ids) await spawnTool.execute(id, { task: id, async: true }, new AbortController().signal, undefined, fake.ctx);
+		await Promise.all(ids.map((id) => waitForPersistedRecord(sessionId, id)));
+		const records = ids.map((id) => readPersistedRecord(sessionId, id));
+		assert.equal(messages.length, 1, "only final cohort notification is sent");
+		const final = messages[0]!;
+		assert.ok(final.includes("3 subagents finished; 1 failed."));
+		assert.equal(final.includes("completed successfully"), false);
+		const successful = records.filter((r) => !r.error);
+		const failed = records.find((r) => r.error)!;
+		for (const r of successful) assert.ok(final.includes(`- ${r.id}: ${r.outputFile}`));
+		assert.ok(final.includes(`- ${failed.id}:`));
+		assert.ok(final.includes("error: boom stderr"));
+		assert.ok(final.includes(`result: ${failed.outputFile}`));
+		assert.ok(final.includes(`stderr: ${failed.stderrFile}`));
+		assert.ok(final.includes("read stderr logs for failures"));
+	} finally {
+		mockPi.uninstall();
+		cleanupTestCtx(ctx, sessionId);
+	}
+});
+
+test("cohort: all failures report all-failed wording", async () => {
+	const mockPi = createMockPi();
+	mockPi.install();
+	mockPi.onCall({ output: "one", stderr: "first", exitCode: 1, delay: 30 });
+	mockPi.onCall({ output: "two", stderr: "second", exitCode: 2, delay: 60 });
+	const { sessionId, ctx } = makeTestCtx("pi-subagents-cohort-all-failed");
+	const fake = makeFakeCtx(sessionId, ctx.cwd, false);
+	const messages: string[] = [];
+	const { spawnTool } = registerTestTools((message: any) => messages.push(String(message.content)));
+	try {
+		const ids = ["failed-a", "failed-b"];
+		for (const id of ids) await spawnTool.execute(id, { task: id, async: true }, new AbortController().signal, undefined, fake.ctx);
+		await Promise.all(ids.map((id) => waitForPersistedRecord(sessionId, id)));
+		const records = ids.map((id) => readPersistedRecord(sessionId, id));
+		assert.equal(messages.length, 1, "only final cohort notification is sent");
+		const final = messages[0]!;
+		assert.ok(final.includes("All 2 subagents finished with errors."));
+		for (const r of records) {
+			assert.ok(final.includes(`- ${r.id}:`));
+			assert.ok(final.includes(`result: ${r.outputFile}`));
+			assert.ok(final.includes(`stderr: ${r.stderrFile}`));
+		}
+		assert.ok(final.includes("read stderr logs and result files"));
 	} finally {
 		mockPi.uninstall();
 		cleanupTestCtx(ctx, sessionId);
@@ -1266,7 +1329,7 @@ test("cohort: turn_end starts a new cohort", async () => {
 		assert.equal(a.cohortId, b.cohortId);
 		assert.notEqual(a.cohortId, c.cohortId);
 		assert.equal(messages.some((m) => m.includes("out of 2 subagents have completed")), false);
-		assert.ok(messages.some((m) => m.includes("All 2 subagents have completed.")));
+		assert.ok(messages.some((m) => m.includes("All 2 subagents completed successfully.")));
 		assert.ok(messages.some((m) => m.includes(`Subagent ${c.id} completed.`) && m.includes("Result file:") && !m.includes("out of")));
 		assert.equal(messages.some((m) => m.includes("out of 3") || m.includes("All 3")), false);
 	} finally {
