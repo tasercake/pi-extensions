@@ -491,6 +491,18 @@ function activeRecordsForParent(parentId: string): PersistedSubagentRecord[] {
 	return readStore(parentId).records.filter((r) => r.running === true);
 }
 
+function widgetRecordsForParent(parentId: string): PersistedSubagentRecord[] {
+	const records = readStore(parentId).records;
+	const activeCohortIds = new Set(
+		records
+			.filter((r) => r.running === true && r.cohortId)
+			.map((r) => r.cohortId!),
+	);
+	return records
+		.filter((r) => r.running === true || (r.cohortId && activeCohortIds.has(r.cohortId)))
+		.sort((a, b) => a.createdAt - b.createdAt);
+}
+
 function hasUiWidget(ctx: ExtensionContext): boolean {
 	return Boolean(ctx.hasUI && ctx.ui && typeof ctx.ui.setWidget === "function");
 }
@@ -577,14 +589,14 @@ function stopAllWidgetRefreshForInstance(): void {
 }
 
 function renderRunningWidget(ctx: ExtensionContext, parentId: string): void {
-	const active = activeRecordsForParent(parentId);
+	const records = widgetRecordsForParent(parentId);
 	const key = runningWidgetKey(parentId);
-	if (active.length === 0) {
+	if (records.length === 0) {
 		safeSetWidget(ctx, key, undefined);
 		stopWidgetRefreshIfIdle(parentId);
 		return;
 	}
-	const lines = active.map((r) => formatRunningLine(r));
+	const lines = records.map((r) => formatRunningLine(r));
 	safeSetWidget(ctx, key, lines);
 }
 
@@ -623,10 +635,15 @@ function sanitizePreview(text: string): string {
 function formatRunningLine(record: PersistedSubagentRecord): string {
 	const elapsed = Math.floor((Date.now() - record.createdAt) / 1000);
 	const timedOut = Boolean(record.timeoutAt);
-	const statusText = timedOut
-		? "timed out, still running"
-		: `running ${elapsed}s`;
-	const prefix = `⏳ subagent ${statusText}`;
+	const statusText = record.running
+		? timedOut
+			? "timed out, still running"
+			: `running ${elapsed}s`
+		: record.error
+			? "failed"
+			: "complete";
+	const icon = record.running ? "⏳" : record.error ? "✖" : "✓";
+	const prefix = `${icon} subagent ${statusText}`;
 	const preview = sanitizePreview(record.taskPreview);
 	const separator = preview ? " — " : "";
 	const available = Math.max(0, terminalWidth() - visibleLength(prefix) - separator.length);

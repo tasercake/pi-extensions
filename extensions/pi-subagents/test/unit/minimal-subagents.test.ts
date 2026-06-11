@@ -1211,6 +1211,38 @@ test("cohort: same turn async spawns share cohort and final lists all result fil
 	}
 });
 
+test("cohort: widget keeps completed cohort members visible while siblings run", async () => {
+	const mockPi = createMockPi();
+	mockPi.install();
+	mockPi.onCall({ output: "fast", exitCode: 0, delay: 30 });
+	mockPi.onCall({ output: "slow", exitCode: 0, delay: 220 });
+	const { sessionId, ctx } = makeTestCtx("pi-subagents-cohort-widget-completed");
+	const fake = makeFakeCtx(sessionId, ctx.cwd, true);
+	const { spawnTool } = registerTestTools(() => {});
+	try {
+		await spawnTool.execute("widget-fast", { task: "fast task", async: true }, new AbortController().signal, undefined, fake.ctx);
+		await spawnTool.execute("widget-slow", { task: "slow task", async: true }, new AbortController().signal, undefined, fake.ctx);
+		await waitForPersistedRecord(sessionId, "widget-fast", (record) => record.running === false);
+		await waitForPersistedRecord(sessionId, "widget-slow", (record) => record.running === true);
+
+		const visible = fake.widgetCalls
+			.filter((call) => call.lines)
+			.map((call) => call.lines!.join("\n"));
+		assert.ok(
+			visible.some((text) => text.includes("complete") && text.includes("fast task") && text.includes("running") && text.includes("slow task")),
+			"completed cohort member stays visible while sibling remains running",
+		);
+	} finally {
+		try {
+			await waitForPersistedRecord(sessionId, "widget-slow", (record) => record.running === false);
+		} catch {
+			// Best-effort cleanup: the assertion path may run before the record exists.
+		}
+		mockPi.uninstall();
+		cleanupTestCtx(ctx, sessionId);
+	}
+});
+
 test("cohort: turn_end starts a new cohort", async () => {
 	const mockPi = createMockPi();
 	mockPi.install();
