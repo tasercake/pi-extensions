@@ -16,17 +16,25 @@ Prerequisites:
 
 ## Procedure
 
-### Phase 1: Load Approved Artifacts
+### Phase 1: Load Approved Artifacts and Resume State
 
 #### 1. Read the approved workflow artifacts
-Parent reads SCOPE, PLAN, and TODO from `.spec/<slug>/`:
+Parent reads SCOPE, PLAN, and TODO from `.spec/<slug>/` at the start of every invocation or resume:
 - `.spec/<slug>/SCOPE.md`
 - `.spec/<slug>/PLAN.md`
 - `.spec/<slug>/TODO.md`
 
 The execute phase must not generate, rewrite, reorganize, or reinterpret TODO.
 
-Parent follows TODO phase ordering, dependencies, and allowed parallelism exactly as written. TODO is the source of progress truth. PLAN is the source of work-detail truth. SCOPE is the source of goal/constraint truth.
+Parent treats TODO as the source of execution state on every invocation. Parent follows TODO phase ordering, dependencies, and allowed parallelism exactly as written. TODO is the source of progress truth. PLAN is the source of work-detail truth. SCOPE is the source of goal/constraint truth.
+
+Resume rules:
+- Continue from the first TODO item that is not `[x]` and whose dependencies are satisfied.
+- Never redo `[x]` items.
+- Treat `[~]` as interrupted or in-progress state.
+- For `[~]` items, inspect any recorded implementation subagent ID, reviewer subagent ID, and available subagent/reviewer results before deciding the next action.
+- If a `[~]` implementation completed but has no approving reviewer, spawn or resume the reviewer step.
+- If a `[~]` item has `CHANGES NEEDED`, send that feedback back through the implementation loop and re-review after fixes.
 
 ### Phase 2: Execute
 
@@ -158,6 +166,9 @@ When the final reviewer returns PASS:
 3. **No task is done without review.** Every implementation change must be verified by a neutral reviewer subagent.
 4. **Reviewers are neutral.** Give them only file paths. No extra context, no hints, no nudging.
 5. **Reviewers find problems, never suggest fixes.** Their output is a list of discrepancies, period.
+6. **TODO is resume state.** On every invocation, read TODO and continue from the first item that is not `[x]`; never redo `[x]` items.
+7. **Do not stop on progress while work remains.** If TODO contains any `[ ]` or `[~]` items, do not end the turn with only a natural-language progress/status message. The next assistant action must be an execution-relevant tool call, such as reading TODO, updating TODO, spawning an implementation subagent, spawning a reviewer subagent, or inspecting a subagent result.
+8. **Final message only after final PASS.** Only emit the final completion message after all TODO items are `[x]` and final verification has passed.
 
 ## Pitfalls
 - Do NOT create TODO during execution.
@@ -167,12 +178,18 @@ When the final reviewer returns PASS:
 - Do NOT skip the reviewer. Even "trivial" changes must be reviewed.
 - Do NOT spawn a reviewer that also wrote the code. Reviewers must be fresh subagents.
 - Do NOT check off TODO items based on implementation subagent self-report alone. Always verify through reviewer.
+- Do NOT redo TODO items already marked `[x]` when resuming.
+- Do NOT treat `[~]` as fresh work until recorded subagent/reviewer results have been inspected, if available.
+- Do NOT emit a progress-only assistant message while TODO still has `[ ]` or `[~]` items; make the next execution-relevant tool call instead.
 - Do NOT implement anything not in the plan. If you discover a gap, surface it to the user—do not improvise.
 - Do NOT modify scope, plan, or TODO outside the defined process. They are the contract.
 - If reviewer and implementer disagree, prefer the reviewer. The reviewer's job is to enforce the contract.
 
 ## Verification
 - TODO existed before execution.
+- Parent read TODO at start/resume and used it as execution state.
+- Parent never redid `[x]` items.
+- Parent inspected available recorded subagent/reviewer results before acting on `[~]` items.
 - Parent performed all TODO progress updates.
 - No execution or review subagent modified SCOPE, PLAN, or TODO.
 - All TODO items are `[x]` with reviewer verification.
