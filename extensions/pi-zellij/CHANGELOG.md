@@ -20,7 +20,8 @@
 - Pane highlights now clear on the next submitted input or when the pane is focused again after being elsewhere, instead of waiting for the next agent start event. Aborted runs no longer apply the done-state tint.
 - Pane focus polling no longer writes transient zellij query timeout warnings into the Pi editor; refocus-based clearing is skipped if focus state cannot be queried reliably.
 - Done-state pane tint is now only applied while the Pi pane is unfocused, so the editor is reset immediately instead of staying green while typing in the active pane.
-- Simplified `/zcv` and `/zch` to open Pi in the same working directory without handoff prompts or session files.
+- `/zcv` and `/zch` now mirror `/zv` and `/zj` split behavior while starting `pi --fork <current-session>` instead of a fresh session.
+- Simplified `/zcv` and `/zch` to open Pi in the same working directory without handoff prompts.
 
 ### Removed
 

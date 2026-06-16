@@ -61,8 +61,12 @@ export function shellEscape(value: string): string {
 	return `'${value.replace(/'/g, `'\\''`)}'`;
 }
 
-export function buildPiCommand(cwd: string, options?: { prompt?: string }): string {
+export function buildPiCommand(cwd: string, options?: { prompt?: string; fork?: string }): string {
 	const commandParts = ["cd", shellEscape(cwd), "&&", "exec", "pi"];
+	const fork = options?.fork?.trim();
+	if (fork) {
+		commandParts.push("--fork", shellEscape(fork));
+	}
 	const prompt = options?.prompt?.trim();
 	if (prompt) {
 		commandParts.push(shellEscape(prompt));

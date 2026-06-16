@@ -12,8 +12,20 @@ async function openContinueSplit(
 	pi: ExtensionAPI,
 	ctx: ExtensionCommandContext,
 	direction: SplitDirection,
+	args: string,
 ): Promise<PaneOpenResult> {
-	return openCommandInNewSplit(pi, direction, buildPiCommand(ctx.cwd));
+	const currentSessionFile = ctx.sessionManager.getSessionFile();
+	if (!currentSessionFile) {
+		return { ok: false, error: "Current Pi session is not saved; cannot fork it" };
+	}
+	return openCommandInNewSplit(
+		pi,
+		direction,
+		buildPiCommand(ctx.cwd, {
+			fork: currentSessionFile,
+			prompt: args.trim().length > 0 ? args : undefined,
+		}),
+	);
 }
 
 function registerContinueCommand(
@@ -25,8 +37,8 @@ function registerContinueCommand(
 ): void {
 	pi.registerCommand(name, {
 		description,
-		handler: async (_args, ctx) => {
-			const result = await openContinueSplit(pi, ctx, direction);
+		handler: async (args, ctx) => {
+			const result = await openContinueSplit(pi, ctx, direction, args);
 			if (result.ok) {
 				ctx.ui.notify(formatPaneSuccessMessage(successMessage, result.paneId), "info");
 			} else {
@@ -41,7 +53,7 @@ export default function zvContinueExtension(pi: ExtensionAPI) {
 		pi,
 		"zcv",
 		"right",
-		"Open a new right split and start Pi in the same working directory",
+		"Open a new right split and start a fork of the current Pi session",
 		"Opened a Pi split to the right",
 	);
 
@@ -49,7 +61,7 @@ export default function zvContinueExtension(pi: ExtensionAPI) {
 		pi,
 		"zch",
 		"down",
-		"Open a new lower split and start Pi in the same working directory",
+		"Open a new lower split and start a fork of the current Pi session",
 		"Opened a Pi split below",
 	);
 }
