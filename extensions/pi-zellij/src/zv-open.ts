@@ -48,8 +48,6 @@ const RESERVED_COMMAND_NAMES = new Set([
 	"zt",
 	"zo",
 	"zoh",
-	"zz",
-	"zzh",
 	"zcv",
 	"zch",
 ]);

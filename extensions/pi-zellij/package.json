@@ -24,7 +24,7 @@
     "pi-zellij": "install.mjs"
   },
   "files": [
-    "extensions/",
+    "src/",
     "install.mjs",
     "README.md",
     "CHANGELOG.md"
@@ -34,7 +34,7 @@
   },
   "pi": {
     "extensions": [
-      "./extensions/index.ts"
+      "./src/index.ts"
     ]
   },
   "peerDependencies": {

@@ -10,7 +10,7 @@ Pi package with [zellij](https://zellij.dev)-powered terminal integrations for [
 
 [Pi](https://pi.dev) works well in the terminal, but pane orchestration is better handled by a terminal multiplexer. `pi-zellij` adds zellij-native split workflows for Pi.
 
-It includes split and tab commands, generic tool launchers, settings-driven floating app shortcuts, opt-in pane highlighting for completed agent turns, zoxide jumps, and split-based task handoff.
+It includes split and tab commands, generic tool launchers, settings-driven floating app shortcuts, opt-in pane highlighting for completed agent turns, and split-based task handoff.
 
 ## Usage
 
@@ -36,7 +36,6 @@ If pi is already running, use:
 
 - `zellij` must be installed
 - pane, tab, and floating commands must be run from inside an active zellij session
-- `zoxide` is required for the zoxide commands
 
 ### Recommended zellij version
 
@@ -53,8 +52,6 @@ If pi is already running, use:
   - start a fresh Pi session in a new right pane, lower pane, or tab
 - `/zo <command...>`, `/zoh <command...>`
   - run any shell command in a new right pane or lower pane
-- `/zz <query>`, `/zzh <query>`
-  - jump to a zoxide match or direct directory path and start Pi there
 
 ### Floating tools
 
@@ -74,7 +71,6 @@ Extensions:
 - `zv-split`
 - `zv-open`
 - `zv-highlight`
-- `zv-zoxide`
 - `zv-continue`
 
 ## Commands
@@ -182,7 +178,7 @@ Then you can use:
 /zg
 ```
 
-Configured command names cannot reuse built-in Pi commands such as `/settings`, `/model`, or `/reload`, and they also cannot replace pi-zellij's own slash commands such as `/zv`, `/zj`, `/zt`, `/zz`, or `/zcv`.
+Configured command names cannot reuse built-in Pi commands such as `/settings`, `/model`, or `/reload`, and they also cannot replace pi-zellij's own slash commands such as `/zv`, `/zj`, `/zt`, or `/zcv`.
 
 If the same command exists in both global and project settings, the project setting wins. After changing settings, run `/reload` in Pi.
 
@@ -232,25 +228,6 @@ Supported keys:
   - optional pane colors to apply while Pi is working; if omitted, `pi-zellij` resets the pane to its default colors when the next input is submitted or when the pane is focused again after being elsewhere
 
 When enabled, `pi-zellij` resets the pane color on session start, session switch, the next submitted input, pane refocus when zellij focus state is available, and session shutdown so completed-turn highlights do not linger across sessions. If the pane is already focused when a turn completes, the done-state tint is skipped so the Pi editor does not stay tinted while you type. Aborted runs do not apply the done-state tint. After changing these settings, run `/reload` in Pi.
-
-### Zoxide jump commands
-
-- `/zz <query>`
-  - resolves the query with `zoxide query`
-  - opens a new pane to the right
-  - starts a fresh pi session in the matched directory
-- `/zzh <query>`
-  - resolves the query with `zoxide query`
-  - opens a new pane below
-  - starts a fresh pi session in the matched directory
-
-Example:
-
-```text
-/zz mono
-```
-
-If the argument is already a valid directory path, `/zz` and `/zzh` use it directly instead of querying zoxide.
 
 ### Continuation and worktree helpers
 

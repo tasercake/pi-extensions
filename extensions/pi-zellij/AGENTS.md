@@ -5,10 +5,9 @@
 This repository contains `pi-zellij`, a small Pi package that adds zellij-powered terminal workflows to Pi.
 
 Current extensions:
-- `extensions/zv-split.ts` — adds split and tab commands that open a new zellij pane or tab and start a fresh Pi session in the same working directory
-- `extensions/zv-open.ts` — adds generic shell split commands plus configurable floating app shortcuts from settings
-- `extensions/zv-zoxide.ts` — adds zoxide-based pane commands that jump to a matched directory and start Pi there
-- `extensions/zv-continue.ts` — adds split-based continuation and worktree handoff commands
+- `src/zv-split.ts` — adds split and tab commands that open a new zellij pane or tab and start a fresh Pi session in the same working directory
+- `src/zv-open.ts` — adds generic shell split commands plus configurable floating app shortcuts from settings
+- `src/zv-continue.ts` — adds split-based continuation and worktree handoff commands
 
 Other important files:
 - `README.md` — user-facing package documentation
@@ -19,7 +18,7 @@ Other important files:
 ## How the repo works
 
 - This is a TypeScript-based Pi package, but the repo currently does not include a local TypeScript toolchain or build step.
-- Extensions are loaded from `./extensions` via the `pi.extensions` entry in `package.json`.
+- Extensions are loaded from `./src/index.ts` via the `pi.extensions` entry in `package.json`.
 - The package is published to npm and installed in Pi via `pi install npm:pi-zellij` or `npx pi-zellij`.
 
 ## Editing guidelines
