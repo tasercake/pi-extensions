@@ -63,7 +63,7 @@ If pi is already running, use:
 ### Quick Pi splits
 
 - `/zcv`, `/zch`
-  - open Pi in a split using the same working directory
+  - open a fork of the current Pi session in a split using the same working directory
 
 ## Bundled extensions and resources
 
@@ -233,17 +233,18 @@ When enabled, `pi-zellij` resets the pane color on session start, session switch
 
 - `/zcv`
   - opens a new pane to the right
-  - starts `pi` in the same `cwd`
+  - starts `pi --fork <current-session>` in the same `cwd`
 - `/zch`
   - opens a new pane below
-  - starts `pi` in the same `cwd`
+  - starts `pi --fork <current-session>` in the same `cwd`
 
-These commands do not create session files, prompts, summaries, or git worktrees.
+Both commands accept optional initial prompt text like `/zv` and `/zj`. They use Pi's built-in session fork support and do not create summaries, handoff prompts, or git worktrees.
 
 Examples:
 
 ```text
 /zcv
+/zcv Continue reviewing this file
 /zch
 ```
 
