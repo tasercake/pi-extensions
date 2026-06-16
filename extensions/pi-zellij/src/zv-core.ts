@@ -61,11 +61,8 @@ export function shellEscape(value: string): string {
 	return `'${value.replace(/'/g, `'\\''`)}'`;
 }
 
-export function buildPiCommand(cwd: string, options?: { sessionFile?: string; prompt?: string }): string {
+export function buildPiCommand(cwd: string, options?: { prompt?: string }): string {
 	const commandParts = ["cd", shellEscape(cwd), "&&", "exec", "pi"];
-	if (options?.sessionFile) {
-		commandParts.push("--session", shellEscape(options.sessionFile));
-	}
 	const prompt = options?.prompt?.trim();
 	if (prompt) {
 		commandParts.push(shellEscape(prompt));

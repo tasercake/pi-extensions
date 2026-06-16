@@ -10,7 +10,7 @@
 - Added configurable floating app commands via `pi-zellij.commands` in Pi `settings.json`, including shorthand entries such as `"zh": "hx"` and `"zg": "lazygit"`, plus object entries with `acceptArgs` support.
 - Added compatibility fallback for legacy `pi-zv.commands` settings during the rename to `pi-zellij`.
 - Reserved Pi built-in slash commands such as `/settings`, `/model`, and `/reload` so configured floating commands cannot shadow them.
-- Added `zv-continue` with `/zcv` and `/zch` for split-based task handoff in the current checkout or by creating a git worktree branch with `-c <branch>`.
+- Added `zv-continue` with `/zcv` and `/zch` for opening Pi in right/down zellij splits.
 - Added opt-in `paneHighlight` settings so Pi can tint the current zellij pane when an agent turn completes, with optional working-state colors.
 
 ### Changed
@@ -20,8 +20,10 @@
 - Pane highlights now clear on the next submitted input or when the pane is focused again after being elsewhere, instead of waiting for the next agent start event. Aborted runs no longer apply the done-state tint.
 - Pane focus polling no longer writes transient zellij query timeout warnings into the Pi editor; refocus-based clearing is skipped if focus state cannot be queried reliably.
 - Done-state pane tint is now only applied while the Pi pane is unfocused, so the editor is reset immediately instead of staying green while typing in the active pane.
+- Simplified `/zcv` and `/zch` to open Pi in the same working directory without handoff prompts or session files.
 
 ### Removed
 
 - Removed jump commands for directory matches.
 - Removed the bundled `zv-notify` extension so `pi-zellij` does not conflict with separate notification packages or user-specific notification setups.
+- Removed git worktree creation, context summaries, focus notes, and handoff prompt templates from `/zcv` and `/zch`.

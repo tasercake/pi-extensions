@@ -7,7 +7,7 @@ This repository contains `pi-zellij`, a small Pi package that adds zellij-powere
 Current extensions:
 - `src/zv-split.ts` — adds split and tab commands that open a new zellij pane or tab and start a fresh Pi session in the same working directory
 - `src/zv-open.ts` — adds generic shell split commands plus configurable floating app shortcuts from settings
-- `src/zv-continue.ts` — adds split-based continuation and worktree handoff commands
+- `src/zv-continue.ts` — adds simple right/down split commands that start Pi in the same working directory
 
 Other important files:
 - `README.md` — user-facing package documentation

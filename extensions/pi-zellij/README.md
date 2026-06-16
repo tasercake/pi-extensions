@@ -10,7 +10,7 @@ Pi package with [zellij](https://zellij.dev)-powered terminal integrations for [
 
 [Pi](https://pi.dev) works well in the terminal, but pane orchestration is better handled by a terminal multiplexer. `pi-zellij` adds zellij-native split workflows for Pi.
 
-It includes split and tab commands, generic tool launchers, settings-driven floating app shortcuts, opt-in pane highlighting for completed agent turns, and split-based task handoff.
+It includes split and tab commands, generic tool launchers, settings-driven floating app shortcuts, opt-in pane highlighting for completed agent turns, and quick Pi split commands.
 
 ## Usage
 
@@ -60,10 +60,10 @@ If pi is already running, use:
 - `pi-zellij.paneHighlight` in `settings.json`
   - optionally tints the current zellij pane when Pi finishes a turn and is waiting for input
 
-### Handoff workflows
+### Quick Pi splits
 
 - `/zcv`, `/zch`
-  - open continuation sessions in a split, optionally in a new git worktree
+  - open Pi in a split using the same working directory
 
 ## Bundled extensions and resources
 
@@ -229,32 +229,22 @@ Supported keys:
 
 When enabled, `pi-zellij` resets the pane color on session start, session switch, the next submitted input, pane refocus when zellij focus state is available, and session shutdown so completed-turn highlights do not linger across sessions. If the pane is already focused when a turn completes, the done-state tint is skipped so the Pi editor does not stay tinted while you type. Aborted runs do not apply the done-state tint. After changing these settings, run `/reload` in Pi.
 
-### Continuation and worktree helpers
+### Quick Pi split commands
 
 - `/zcv`
   - opens a new pane to the right
-  - creates a related handoff session in the current checkout
+  - starts `pi` in the same `cwd`
 - `/zch`
   - opens a new pane below
-  - creates a related handoff session in the current checkout
-- `/zcv <note>` / `/zch <note>`
-  - same as above, but adds a focus note to the handoff context
-- `/zcv -c <branch>` / `/zch -c <branch>`
-  - creates a new branch worktree from the current `HEAD`, then opens a new pane there
-- `/zcv -c <branch> --from <ref>` / `/zch -c <branch> --from <ref>`
-  - creates a new branch worktree from an explicit base ref such as `main` or `origin/main`
-- `/zcv -c <branch> [--from <ref>] <note...>` / `/zch -c <branch> [--from <ref>] <note...>`
-  - same as above, but also adds a focus note to the worktree handoff
+  - starts `pi` in the same `cwd`
+
+These commands do not create session files, prompts, summaries, or git worktrees.
 
 Examples:
 
 ```text
 /zcv
-/zcv focus on tests
-/zcv -c fix/notify-bug
-/zcv -c fix/notify-bug --from main
-/zcv -c fix/notify-bug --from main review the existing changes first
-/zch -c feature/review-ui focus on edge cases
+/zch
 ```
 
 
