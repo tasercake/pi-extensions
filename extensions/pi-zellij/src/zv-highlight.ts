@@ -493,14 +493,6 @@ export default function zvHighlightExtension(pi: ExtensionAPI) {
 		await refreshConfig(ctx.cwd);
 	});
 
-	pi.on("session_switch", async (_event, ctx) => {
-		await refreshConfig(ctx.cwd);
-	});
-
-	pi.on("session_fork", async (_event, ctx) => {
-		await refreshConfig(ctx.cwd);
-	});
-
 	pi.on("session_tree", async (_event, ctx) => {
 		await refreshConfig(ctx.cwd);
 	});
