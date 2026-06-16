@@ -1,3 +1,4 @@
+/** Registers commands that open fresh Pi sessions in new Zellij panes or tabs. */
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import {
 	buildPiCommand,

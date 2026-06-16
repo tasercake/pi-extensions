@@ -1,3 +1,4 @@
+/** Bundles all pi-zellij extension modules into one Pi extension entrypoint. */
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import zvSplitExtension from "./zv-split.ts";
 import zvZoxideExtension from "./zv-zoxide.ts";

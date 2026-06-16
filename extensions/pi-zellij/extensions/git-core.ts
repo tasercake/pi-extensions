@@ -1,3 +1,4 @@
+/** Git repository discovery, status summarization, and worktree creation helpers for pi-zellij handoffs. */
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { basename, dirname, join } from "node:path";
 import { existsSync, mkdirSync } from "node:fs";

@@ -1,3 +1,4 @@
+/** Shared Zellij command builders, shell escaping, pane opening, and pane color utilities. */
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 const ZELLIJ_TIMEOUT_MS = 5000;

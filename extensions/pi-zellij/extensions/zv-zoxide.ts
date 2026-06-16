@@ -1,3 +1,4 @@
+/** Registers zoxide-backed commands that open Pi sessions in matched directories. */
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { execFileSync } from "node:child_process";
 import { existsSync, statSync } from "node:fs";

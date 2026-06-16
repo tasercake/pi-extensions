@@ -1,3 +1,4 @@
+/** Registers Zellij split shell commands and settings-driven floating tool launchers. */
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";

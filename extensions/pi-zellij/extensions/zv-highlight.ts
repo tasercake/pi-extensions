@@ -1,3 +1,4 @@
+/** Tints the current Zellij pane while Pi works and after completed turns. */
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";

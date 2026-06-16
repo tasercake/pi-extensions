@@ -1,3 +1,4 @@
+/** Registers split-based continuation and git worktree handoff commands for active Pi sessions. */
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
