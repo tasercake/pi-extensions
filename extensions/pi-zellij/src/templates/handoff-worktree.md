@@ -1,1 +1,0 @@
-Continue the current task in this git worktree for branch {{TARGET_BRANCH}}.{{FOCUS_NOTE_SENTENCE}} Use the handoff summary already present in this session. First confirm the branch and repository state in this worktree, then proceed with the highest-priority next step.
