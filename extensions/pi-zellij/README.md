@@ -10,7 +10,7 @@ Pi package with [zellij](https://zellij.dev)-powered terminal integrations for [
 
 [Pi](https://pi.dev) works well in the terminal, but pane orchestration is better handled by a terminal multiplexer. `pi-zellij` adds zellij-native split workflows for Pi.
 
-It includes split and tab commands, generic tool launchers, settings-driven floating app shortcuts, opt-in pane highlighting for completed agent turns, zoxide jumps, review workflows, and split-based task handoff.
+It includes split and tab commands, generic tool launchers, settings-driven floating app shortcuts, opt-in pane highlighting for completed agent turns, zoxide jumps, and split-based task handoff.
 
 ## Usage
 
@@ -63,16 +63,10 @@ If pi is already running, use:
 - `pi-zellij.paneHighlight` in `settings.json`
   - optionally tints the current zellij pane when Pi finishes a turn and is waiting for input
 
-### Review and handoff workflows
+### Handoff workflows
 
 - `/zcv`, `/zch`
   - open continuation sessions in a split, optionally in a new git worktree
-- `/review <target>`, `/review-diff [focus-or-pr-url]`
-  - expand bundled review prompts in the current pane
-- `/zrv`, `/zrh`, plus review flags
-  - open review-focused Pi sessions in a split
-- `/skill:code-review`
-  - loads the bundled structured review skill for files, directories, diffs, and PRs
 
 ## Bundled extensions and resources
 
@@ -81,13 +75,7 @@ Extensions:
 - `zv-open`
 - `zv-highlight`
 - `zv-zoxide`
-- `zv-review`
 - `zv-continue`
-
-Other bundled resources:
-- `code-review` skill
-- `/review` prompt template
-- `/review-diff` prompt template
 
 ## Commands
 
@@ -292,44 +280,4 @@ Examples:
 /zch -c feature/review-ui focus on edge cases
 ```
 
-### Review helpers
-
-`pi-zellij` also bundles a reusable `code-review` skill plus prompt templates for in-place review:
-
-- `/review <target>`
-  - prompt template for reviewing a file, directory, or GitHub pull request URL in the current pane
-- `/review-diff [focus-or-pr-url]`
-  - prompt template for reviewing the current git diff in the current pane, or a GitHub pull request URL via `gh`
-
-Split review commands:
-
-- `/zrv`
-  - with no arguments, reviews the current git diff in a new right pane
-- `/zrh`
-  - with no arguments, reviews the current git diff in a new lower pane
-- `/zrv [--bugs|--refactor|--tests] <target>` or `/zrv --diff [focus]`
-  - opens a new pane to the right
-  - starts a fresh pi review session in the same `cwd`
-- `/zrh [--bugs|--refactor|--tests] <target>` or `/zrh --diff [focus]`
-  - opens a new pane below
-  - starts a fresh pi review session in the same `cwd`
-
-`--diff` is the default, so `/zrv` and `/zrh` usually do not need the flag.
-
-There are no `/review-v` or `/review-h` aliases in `pi-zellij`, so it can coexist more cleanly with other Pi packages.
-
-Examples:
-
-```text
-/zrv
-/zrh
-/zrv src/auth.ts
-/zrv --bugs src/auth.ts
-/zrh --refactor src/auth/
-/zrv --diff
-/zrh --diff focus on token refresh and retries
-/zrv https://github.com/owner/repo/pull/123
-```
-
-If the target is a GitHub pull request URL, the review workflow switches to PR review and instructs pi to inspect the pull request with `gh pr view` and `gh pr diff`.
 

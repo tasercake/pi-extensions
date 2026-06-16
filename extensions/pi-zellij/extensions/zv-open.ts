@@ -42,8 +42,6 @@ const RESERVED_COMMAND_NAMES = new Set([
 	"quit",
 	"exit",
 	"help",
-	"review",
-	"review-diff",
 	"zv",
 	"zj",
 	"zt",
@@ -51,8 +49,6 @@ const RESERVED_COMMAND_NAMES = new Set([
 	"zoh",
 	"zz",
 	"zzh",
-	"zrv",
-	"zrh",
 	"zcv",
 	"zch",
 ]);

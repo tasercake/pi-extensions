@@ -8,7 +8,6 @@ Current extensions:
 - `extensions/zv-split.ts` — adds split and tab commands that open a new zellij pane or tab and start a fresh Pi session in the same working directory
 - `extensions/zv-open.ts` — adds generic shell split commands plus configurable floating app shortcuts from settings
 - `extensions/zv-zoxide.ts` — adds zoxide-based pane commands that jump to a matched directory and start Pi there
-- `extensions/zv-review.ts` — adds split review commands for diffs, files, directories, and GitHub pull requests
 - `extensions/zv-continue.ts` — adds split-based continuation and worktree handoff commands
 
 Other important files:

@@ -11,13 +11,12 @@
 - Added compatibility fallback for legacy `pi-zv.commands` settings during the rename to `pi-zellij`.
 - Reserved Pi built-in slash commands such as `/settings`, `/model`, and `/reload` so configured floating commands cannot shadow them.
 - Added `/zz` and `/zzh` to open a new pane from a zoxide match or direct directory path and start Pi there.
-- Added `zv-review` with `/zrv` and `/zrh`, plus bundled `code-review` skill and `/review` / `/review-diff` prompt templates for focused review workflows, including GitHub pull request review via `gh` when given a PR URL.
 - Added `zv-continue` with `/zcv` and `/zch` for split-based task handoff in the current checkout or by creating a git worktree branch with `-c <branch>`.
 - Added opt-in `paneHighlight` settings so Pi can tint the current zellij pane when an agent turn completes, with optional working-state colors.
 
 ### Changed
 
-- When zellij reports created pane or tab IDs, `pi-zellij` now shows them in success notifications for split, floating, zoxide, review, continuation, and tab commands.
+- When zellij reports created pane or tab IDs, `pi-zellij` now shows them in success notifications for split, floating, zoxide, continuation, and tab commands.
 - `/zt` now uses `zellij action new-tab -- <command>` when available instead of always simulating typed input, while keeping the previous typed-input path as a compatibility fallback.
 - Pane highlights now clear on the next submitted input or when the pane is focused again after being elsewhere, instead of waiting for the next agent start event. Aborted runs no longer apply the done-state tint.
 - Pane focus polling no longer writes transient zellij query timeout warnings into the Pi editor; refocus-based clearing is skipped if focus state cannot be queried reliably.

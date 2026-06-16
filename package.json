@@ -15,9 +15,6 @@
     ],
     "skills": [
       "extensions/*/skills"
-    ],
-    "prompts": [
-      "extensions/*/prompts"
     ]
   },
   "peerDependencies": {
