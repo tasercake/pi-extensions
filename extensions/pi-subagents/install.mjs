@@ -92,7 +92,7 @@ if (fs.existsSync(EXTENSION_DIR)) {
 
 console.log(`
 The extension is now available in pi. Tool added:
-  • spawn_subagent - Spawn one child Pi task (blocking or async)
+  • spawn_subagent - Spawn one child Pi task and return immediately
 
 Documentation: ${EXTENSION_DIR}/README.md
 `);

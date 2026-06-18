@@ -156,18 +156,22 @@ function registerTestTools(sendMessage: (...args: unknown[]) => void = () => {})
 	};
 }
 
-test("spawn rejects keepContext as additional property", () => {
+test("spawn schema accepts task only and rejects removed properties", () => {
+	assert.equal(Value.Check(SpawnSubagentParams, { task: "x" }), true);
 	assert.equal(
-		Value.Check(SpawnSubagentParams, {
-			task: "x",
-			async: false,
-			keepContext: false,
-		}),
+		Value.Check(SpawnSubagentParams, { task: "x", ["async"]: true }),
 		false,
 	);
 	assert.equal(
-		Value.Check(SpawnSubagentParams, { task: "x", async: false }),
-		true,
+		Value.Check(SpawnSubagentParams, { task: "x", ["async"]: false }),
+		false,
+	);
+	assert.equal(
+		Value.Check(SpawnSubagentParams, {
+			task: "x",
+			keepContext: false,
+		}),
+		false,
 	);
 });
 
@@ -197,6 +201,9 @@ test("user-facing packaged docs do not expose removed API concepts", () => {
 		"Queues a message for a running subagent",
 		"resumes a stopped subagent",
 		"replacement",
+		`async: ${"true"}`,
+		`async: ${"false"}`,
+		"outputmode",
 	];
 
 	for (const relativePath of files) {
@@ -292,7 +299,7 @@ test("async completion persists success and pending metadata when stale notifica
 	try {
 		await spawnTool.execute(
 			"stale-notify-child",
-			{ task: "finish", async: true, timeout: 30 },
+			{ task: "finish", timeout: 30 },
 			new AbortController().signal,
 			undefined,
 			ctx,
@@ -323,7 +330,7 @@ test("async completion persists success and pending metadata when stale notifica
 	}
 });
 
-test("blocking spawn persists unified id session file result.log and fresh args", async () => {
+test("spawn persists unified id session file result.log and fresh args", async () => {
 	const mockPi = createMockPi();
 	mockPi.install();
 	mockPi.onCall({ output: "uuid done", exitCode: 0 });
@@ -334,12 +341,12 @@ test("blocking spawn persists unified id session file result.log and fresh args"
 	try {
 		const result = await spawnTool.execute(
 			"unified-id-call",
-			{ task: "echo uuid", async: false },
+			{ task: "echo uuid" },
 			new AbortController().signal,
 			undefined,
 			ctx,
 		);
-		const record = readPersistedRecord(sessionId, result.details.id);
+		const record = await waitForPersistedRecord(sessionId, result.details.id);
 		assert.match(
 			record.id,
 			/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i,
@@ -389,12 +396,12 @@ test("spawn starts fresh session and never forks parent history", async () => {
 	try {
 		const result = await spawnTool.execute(
 			"no-fork-child",
-			{ task: "fresh only", async: false },
+			{ task: "fresh only" },
 			new AbortController().signal,
 			undefined,
 			ctx,
 		);
-		const record = readPersistedRecord(sessionId, result.details.id);
+		const record = await waitForPersistedRecord(sessionId, result.details.id);
 		const captured = readLatestMockPiArgs(mockPi).args;
 		assert.equal(captured.includes("--fork"), false);
 		assert.equal(
@@ -422,7 +429,7 @@ test("spawn response includes resultPath", async () => {
 	try {
 		const result = await spawnTool.execute(
 			"resultpath-child",
-			{ task: "echo hello", async: false },
+			{ task: "echo hello" },
 			new AbortController().signal,
 			undefined,
 			ctx,
@@ -436,6 +443,7 @@ test("spawn response includes resultPath", async () => {
 		);
 		assert(!result.content[0].text.includes("sessionFile"));
 		assert.match(result.details.resultPath, /\/subagents\/[^/]+\/result\.log$/);
+		await waitForPersistedRecord(sessionId, result.details.id);
 		// result file must exist and contain output
 		const content = fs.readFileSync(result.details.resultPath, "utf-8");
 		assert.match(content, /hello/);
@@ -446,6 +454,39 @@ test("spawn response includes resultPath", async () => {
 });
 
 // Test 3: Async spawn response includes resultPath (Requirement 2)
+test("spawn returns before child completes and persists final result later", async () => {
+	const mockPi = createMockPi();
+	mockPi.install();
+	mockPi.onCall({ output: "delayed done", exitCode: 0, delay: 120 });
+
+	const { sessionId, ctx } = makeTestCtx("pi-subagents-immediate-return");
+	const { spawnTool } = registerTestTools(() => {});
+
+	try {
+		const startedAt = Date.now();
+		const result = await spawnTool.execute(
+			"immediate-child",
+			{ task: "delayed work" },
+			new AbortController().signal,
+			undefined,
+			ctx,
+		);
+		assert.ok(Date.now() - startedAt < 100, "execute must return before child completes");
+		assert.match(result.content[0].text, /Spawned subagent/);
+		assert.match(result.content[0].text, /notified/);
+		assert.ok(result.details.resultPath);
+		const running = readPersistedRecord(sessionId, result.details.id);
+		assert.equal(running.running, true);
+
+		const completed = await waitForPersistedRecord(sessionId, result.details.id);
+		assert.equal(completed.running, false);
+		assert.match(fs.readFileSync(result.details.resultPath, "utf-8"), /delayed done/);
+	} finally {
+		mockPi.uninstall();
+		cleanupTestCtx(ctx, sessionId);
+	}
+});
+
 test("auto-saves final assistant message to result file when subagent does not write to it", async () => {
 	const mockPi = createMockPi();
 	mockPi.install();
@@ -460,13 +501,13 @@ test("auto-saves final assistant message to result file when subagent does not w
 			"autosave-child",
 			{
 				task: "do work without writing result file",
-				async: false,
 			},
 			new AbortController().signal,
 			undefined,
 			ctx,
 		);
 
+		await waitForPersistedRecord(sessionId, result.details.id);
 		const content = fs.readFileSync(result.details.resultPath, "utf-8");
 		assert.match(content, /auto-saved output/);
 	} finally {
@@ -488,13 +529,13 @@ test("subagent-written result file content is preserved, not overwritten", async
 
 		const result = await spawnTool.execute(
 			"preserve-child",
-			{ task: "finish", async: false },
+			{ task: "finish" },
 			new AbortController().signal,
 			undefined,
 			ctx,
 		);
 
-		const record = readPersistedRecord(sessionId, "preserve-child");
+		const record = await waitForPersistedRecord(sessionId, "preserve-child");
 		assert.equal(result.details.resultPath, record.outputFile);
 		assert.match(result.details.resultPath, /\/subagents\/[^/]+\/result\.log$/);
 		const content = fs.readFileSync(result.details.resultPath, "utf-8");
@@ -564,8 +605,8 @@ test("buildPiArgs omits PI_SUBAGENT_RESULT_PATH when resultPath not provided", (
 	assert.equal(built.env[SUBAGENT_RESULT_PATH_ENV], undefined);
 });
 
-// Test 10: Integration — end-to-end blocking subagent with real pi binary (Scope Test Plan)
-test("integration: blocking subagent writes result.log at expected path", (t) => {
+// Test 10: Integration — end-to-end background subagent with real pi binary (Scope Test Plan)
+test("integration: background subagent writes result.log at expected path", (t) => {
 	if (!process.env.PI_SUBAGENTS_RUN_REAL_INTEGRATION) {
 		t.skip(
 			"requires a configured local pi model provider; set PI_SUBAGENTS_RUN_REAL_INTEGRATION=1 to run",
@@ -580,7 +621,7 @@ test("integration: blocking subagent writes result.log at expected path", (t) =>
 	const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagent-int-"));
 	const sessionFile = path.join(tmpDir, "session.jsonl");
 	try {
-		// Run pi with a prompt that spawns a blocking subagent.
+		// Run pi with a prompt that spawns a background subagent.
 		// --no-extensions avoids tool-name conflict with a pre-loaded subagents extension.
 		const result = spawnSync(
 			piBin,
@@ -593,7 +634,7 @@ test("integration: blocking subagent writes result.log at expected path", (t) =>
 				"--no-extensions",
 				"--extension",
 				path.join(projectRoot, "src", "index.ts"),
-				"Spawn a blocking subagent to echo hello world. Use spawn_subagent with async: false. Then read the result file at the path given in resultPath.",
+				"Spawn a background subagent to echo hello world. Use spawn_subagent. It returns resultPath immediately; wait for notification, then read that file.",
 			],
 			{
 				cwd: tmpDir,
@@ -647,17 +688,17 @@ test("integration: blocking subagent writes result.log at expected path", (t) =>
 
 // ── Phase 7: widget / reconciliation / headless tests ──
 
-test("N1: sync subagent widget appears during execution and clears after", async () => {
+test("N1: background subagent widget appears during execution and clears after", async () => {
 	const mockPi = createMockPi();
 	mockPi.install();
-	mockPi.onCall({ output: "sync widget done", exitCode: 0, delay: 80 });
+	mockPi.onCall({ output: "background widget done", exitCode: 0, delay: 80 });
 	const { sessionId, ctx } = makeTestCtx("pi-subagents-sync-widget-n1");
 	const fake = makeFakeCtx(sessionId, ctx.cwd, true);
 	const { spawnTool } = registerTestTools(() => {});
 	try {
 		const resultPromise = spawnTool.execute(
 			"sync-widget-child",
-			{ task: "sync widget", async: false },
+			{ task: "background widget" },
 			new AbortController().signal,
 			undefined,
 			fake.ctx,
@@ -665,7 +706,7 @@ test("N1: sync subagent widget appears during execution and clears after", async
 		for (let i = 0; i < 50; i++) {
 			if (
 				fake.widgetCalls.some((c) =>
-					c.lines?.some((line) => line.includes("sync widget")),
+					c.lines?.some((line) => line.includes("background widget")),
 				)
 			) {
 				break;
@@ -674,26 +715,28 @@ test("N1: sync subagent widget appears during execution and clears after", async
 		}
 		assert.ok(
 			fake.widgetCalls.some((c) =>
-				c.lines?.some((line) => line.includes("sync widget")),
+				c.lines?.some((line) => line.includes("background widget")),
 			),
-			"widget must render before sync spawn_subagent resolves",
+			"widget must render during child execution",
 		);
 		const result = await resultPromise;
-		assert.equal(result.details.running, false);
+		assert.equal(result.details.running, true);
 		assert.ok(result.details.resultPath);
+		const completed = await waitForPersistedRecord(sessionId, result.details.id);
+		assert.equal(completed.running, false);
 		assert.equal(
 			fs.readFileSync(result.details.resultPath, "utf-8").trim(),
-			"sync widget done",
+			"background widget done",
 		);
 		assert.ok(
 			fake.widgetCalls.some((c) =>
-				c.lines?.some((line) => line.includes("sync widget")),
+				c.lines?.some((line) => line.includes("background widget")),
 			),
-			"widget rendered during sync run",
+			"widget rendered during background run",
 		);
 		assert.ok(
 			fake.widgetCalls.some((c) => c.lines === undefined),
-			"widget cleared after sync run",
+			"widget cleared after background run",
 		);
 	} finally {
 		mockPi.uninstall();
@@ -713,7 +756,7 @@ test("running widget omits internal ids, uses subtle color, and fits one-line pr
 	try {
 		await spawnTool.execute(
 			"preview-child",
-			{ task: "first line\nsecond line with more text", async: true },
+			{ task: "first line\nsecond line with more text" },
 			new AbortController().signal,
 			undefined,
 			fake.ctx,
@@ -779,7 +822,7 @@ test("N2: running widget survives agent_end", async () => {
 			.get("spawn_subagent")
 			.execute(
 				"agent-end-child",
-				{ task: "agent end", async: true },
+				{ task: "agent end" },
 				new AbortController().signal,
 				undefined,
 				fake.ctx,
@@ -850,7 +893,7 @@ test("N3: pending completion notice retries on next session_start after parent d
 	try {
 		await spawnTool.execute(
 			"pending-notice-child",
-			{ task: "pending notice", async: true },
+			{ task: "pending notice" },
 			new AbortController().signal,
 			undefined,
 			fake.ctx,
@@ -955,7 +998,7 @@ test("Phase 7.8: headless liveness — stdio pipes keep parent process alive nat
 		};
 		await registered.get("spawn_subagent").execute(
 			${JSON.stringify(childId)},
-			{ task: "headless liveness test", async: true },
+			{ task: "headless liveness test" },
 			new AbortController().signal,
 			undefined,
 			ctx,
@@ -1054,7 +1097,6 @@ test("Phase 7.9: spawn/setup error semantics — depth check fails before child 
 			"depth-fail-child",
 			{
 				task: "should fail depth check",
-				async: true,
 			},
 			new AbortController().signal,
 			undefined,
@@ -1192,7 +1234,7 @@ test("cohort: same turn async spawns share cohort and final lists all result fil
 	const { spawnTool } = registerTestTools((message: any) => messages.push(String(message.content)));
 	try {
 		const ids = ["cohort-a", "cohort-b", "cohort-c"];
-		for (const id of ids) await spawnTool.execute(id, { task: id, async: true }, new AbortController().signal, undefined, fake.ctx);
+		for (const id of ids) await spawnTool.execute(id, { task: id }, new AbortController().signal, undefined, fake.ctx);
 		await Promise.all(ids.map((id) => waitForPersistedRecord(sessionId, id)));
 		const records = ids.map((id) => readPersistedRecord(sessionId, id));
 		assert.ok(records[0].cohortId);
@@ -1224,7 +1266,7 @@ test("cohort: mixed failures warn with stderr paths and fire once", async () => 
 	const { spawnTool } = registerTestTools((message: any) => messages.push(String(message.content)));
 	try {
 		const ids = ["mixed-a", "mixed-b", "mixed-c"];
-		for (const id of ids) await spawnTool.execute(id, { task: id, async: true }, new AbortController().signal, undefined, fake.ctx);
+		for (const id of ids) await spawnTool.execute(id, { task: id }, new AbortController().signal, undefined, fake.ctx);
 		await Promise.all(ids.map((id) => waitForPersistedRecord(sessionId, id)));
 		const records = ids.map((id) => readPersistedRecord(sessionId, id));
 		assert.equal(messages.length, 1, "only final cohort notification is sent");
@@ -1256,7 +1298,7 @@ test("cohort: all failures report all-failed wording", async () => {
 	const { spawnTool } = registerTestTools((message: any) => messages.push(String(message.content)));
 	try {
 		const ids = ["failed-a", "failed-b"];
-		for (const id of ids) await spawnTool.execute(id, { task: id, async: true }, new AbortController().signal, undefined, fake.ctx);
+		for (const id of ids) await spawnTool.execute(id, { task: id }, new AbortController().signal, undefined, fake.ctx);
 		await Promise.all(ids.map((id) => waitForPersistedRecord(sessionId, id)));
 		const records = ids.map((id) => readPersistedRecord(sessionId, id));
 		assert.equal(messages.length, 1, "only final cohort notification is sent");
@@ -1283,8 +1325,8 @@ test("cohort: widget keeps completed cohort members visible while siblings run",
 	const fake = makeFakeCtx(sessionId, ctx.cwd, true);
 	const { spawnTool } = registerTestTools(() => {});
 	try {
-		await spawnTool.execute("widget-fast", { task: "fast task", async: true }, new AbortController().signal, undefined, fake.ctx);
-		await spawnTool.execute("widget-slow", { task: "slow task", async: true }, new AbortController().signal, undefined, fake.ctx);
+		await spawnTool.execute("widget-fast", { task: "fast task" }, new AbortController().signal, undefined, fake.ctx);
+		await spawnTool.execute("widget-slow", { task: "slow task" }, new AbortController().signal, undefined, fake.ctx);
 		await waitForPersistedRecord(sessionId, "widget-fast", (record) => record.running === false);
 		await waitForPersistedRecord(sessionId, "widget-slow", (record) => record.running === true);
 
@@ -1317,11 +1359,11 @@ test("cohort: turn_end starts a new cohort", async () => {
 	const messages: string[] = [];
 	const { spawnTool, handlers } = registerTestTools((message: any) => messages.push(String(message.content)));
 	try {
-		await spawnTool.execute("turn-a", { task: "a", async: true }, new AbortController().signal, undefined, fake.ctx);
-		await spawnTool.execute("turn-b", { task: "b", async: true }, new AbortController().signal, undefined, fake.ctx);
+		await spawnTool.execute("turn-a", { task: "a" }, new AbortController().signal, undefined, fake.ctx);
+		await spawnTool.execute("turn-b", { task: "b" }, new AbortController().signal, undefined, fake.ctx);
 		assert.ok(handlers.get("turn_end"), "turn_end handler registered");
 		await handlers.get("turn_end")(undefined, fake.ctx);
-		await spawnTool.execute("turn-c", { task: "c", async: true }, new AbortController().signal, undefined, fake.ctx);
+		await spawnTool.execute("turn-c", { task: "c" }, new AbortController().signal, undefined, fake.ctx);
 		await Promise.all(["turn-a", "turn-b", "turn-c"].map((id) => waitForPersistedRecord(sessionId, id)));
 		const a = readPersistedRecord(sessionId, "turn-a");
 		const b = readPersistedRecord(sessionId, "turn-b");
@@ -1376,9 +1418,9 @@ test("cohort: agent_end closes active cohort", async () => {
 	const fake = makeFakeCtx(sessionId, ctx.cwd, false);
 	const { spawnTool, handlers } = registerTestTools(() => {});
 	try {
-		await spawnTool.execute("agent-a", { task: "a", async: true }, new AbortController().signal, undefined, fake.ctx);
+		await spawnTool.execute("agent-a", { task: "a" }, new AbortController().signal, undefined, fake.ctx);
 		await handlers.get("agent_end")(undefined, fake.ctx);
-		await spawnTool.execute("agent-b", { task: "b", async: true }, new AbortController().signal, undefined, fake.ctx);
+		await spawnTool.execute("agent-b", { task: "b" }, new AbortController().signal, undefined, fake.ctx);
 		await Promise.all(["agent-a", "agent-b"].map((id) => waitForPersistedRecord(sessionId, id)));
 		assert.notEqual(readPersistedRecord(sessionId, "agent-a").cohortId, readPersistedRecord(sessionId, "agent-b").cohortId);
 	} finally {

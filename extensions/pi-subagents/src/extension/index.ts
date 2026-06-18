@@ -1250,7 +1250,7 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 		name: "spawn_subagent",
 		label: "Spawn subagent",
 		description:
-			"Spawn a child Pi subagent for one task. timeout is optional and measured in seconds (default 600 = 10 minutes). When async is true, this returns immediately, allowing the parent to spawn multiple concurrent subagents by calling spawn_subagent multiple times. Do not kill subagents autonomously to enforce timeout; the parent will be informed when timeout expires. Give a healthy timeout margin above expected runtime because subagent execution may be wildly unpredictable.",
+			"Spawn a child Pi subagent for one task. timeout is optional and measured in seconds (default 600 = 10 minutes). This returns immediately, allowing the parent to spawn multiple concurrent subagents by calling spawn_subagent multiple times. Do not kill subagents autonomously to enforce timeout; the parent will be informed when timeout expires. Give a healthy timeout margin above expected runtime because subagent execution may be wildly unpredictable.",
 		parameters: SpawnSubagentParams,
 		async execute(
 			id,
@@ -1264,60 +1264,9 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 			retryPendingNotices(pi, parentId);
 			rememberUiContext(ctx);
 			const record = makeRecord(ctx, params);
-			if (params.async) {
-				const cohort = getOrCreateActiveCohort(parentId);
-				record.cohortId = cohort.id;
-				record.cohortCreatedAt = cohort.createdAt;
-				const hooks: StartChildHooks = {
-					onRunning(_r) {
-						rememberUiContext(ctx);
-						renderRunningWidget(ctx, parentId);
-						scheduleWidgetRefresh(parentId);
-					},
-					onTimeout(_r) {
-						renderRunningWidget(ctx, parentId);
-					},
-					onTerminal(_r) {
-						renderRunningWidget(ctx, parentId);
-						stopWidgetRefreshIfIdle(parentId);
-					},
-					onSetupFailure(_r, _error) {
-						renderRunningWidget(ctx, parentId);
-						stopWidgetRefreshIfIdle(parentId);
-					},
-				};
-				const started = startChild(pi, ctx, record, params.task, true, hooks);
-				const timeoutTimer = startTimeoutTimer(pi, started.record, true);
-				void started.done
-					.catch((error) => {
-						record.running = false;
-						record.error =
-							error instanceof Error ? error.message : String(error);
-						record.updatedAt = Date.now();
-						record.completedAt = Date.now();
-						upsertRecord(record);
-						notifyCompletionBestEffort(pi, record, {
-							markPendingBeforeSend: false,
-						});
-					})
-					.catch(() => {})
-					.finally(() => clearTimeout(timeoutTimer));
-				return {
-					content: [
-						{
-							type: "text",
-							text: `Spawned subagent ${started.record.id}. Result will be at: ${started.record.outputFile}. You will be notified when this subagent completes. Do not poll for result. Do not sleep for result. Continue with whatever other work you may have.`,
-						},
-					],
-					details: {
-						id: started.record.id,
-						running: started.record.running,
-						resultPath: started.record.outputFile,
-					},
-				};
-			}
-
-			// Sync path
+			const cohort = getOrCreateActiveCohort(parentId);
+			record.cohortId = cohort.id;
+			record.cohortCreatedAt = cohort.createdAt;
 			const hooks: StartChildHooks = {
 				onRunning(_r) {
 					rememberUiContext(ctx);
@@ -1336,30 +1285,39 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 					stopWidgetRefreshIfIdle(parentId);
 				},
 			};
-			const started = startChild(pi, ctx, record, params.task, false, hooks);
-
-			let timeoutResolve: ((r: PersistedSubagentRecord) => void) | undefined;
-			const timeoutTimer = setTimeout(function onSyncSubagentTimeout() {
-				const timedOut = markTimedOut(started.record, false);
-				timeoutResolve?.(timedOut);
-			}, started.record.timeout * 1000);
-			timeoutTimer.unref();
-
-			const timeoutPromise = new Promise<PersistedSubagentRecord>((resolve) => {
-				timeoutResolve = resolve;
-			});
-
-			try {
-				const completed = await Promise.race([started.done, timeoutPromise]);
-				return formatStatus(completed);
-			} finally {
-				clearTimeout(timeoutTimer);
-				timeoutResolve = undefined;
-			}
+			const started = startChild(pi, ctx, record, params.task, true, hooks);
+			const timeoutTimer = startTimeoutTimer(pi, started.record, true);
+			void started.done
+				.catch((error) => {
+					record.running = false;
+					record.error =
+						error instanceof Error ? error.message : String(error);
+					record.updatedAt = Date.now();
+					record.completedAt = Date.now();
+					upsertRecord(record);
+					notifyCompletionBestEffort(pi, record, {
+						markPendingBeforeSend: false,
+					});
+				})
+				.catch(() => {})
+				.finally(() => clearTimeout(timeoutTimer));
+			return {
+				content: [
+					{
+						type: "text",
+						text: `Spawned subagent ${started.record.id}. Result will be at: ${started.record.outputFile}. You will be notified when this subagent completes. Do not poll for result. Do not sleep for result. Continue with whatever other work you may have.`,
+					},
+				],
+				details: {
+					id: started.record.id,
+					running: started.record.running,
+					resultPath: started.record.outputFile,
+				},
+			};
 		},
-		renderCall(args, theme) {
+		renderCall(_args, theme) {
 			return new Text(
-				`${theme.fg("toolTitle", theme.bold("spawn_subagent "))}${args.async ? theme.fg("warning", "async") : "blocking"}`,
+				theme.fg("toolTitle", theme.bold("spawn_subagent background")),
 				0,
 				0,
 			);
