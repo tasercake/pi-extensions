@@ -13,23 +13,18 @@ Spawn one child Pi process. This is the only exposed model-callable tool.
 ```ts
 spawn_subagent({
   task: string,
-  async: boolean,
   timeout?: number,
   cwd?: string,
-  outputMode: "inline" | "file",
   model?: string
 })
 ```
 
-- `async: false` blocks until the child finishes.
-- `async: true` returns immediately with an ID. Spawn multiple concurrent subagents by calling `spawn_subagent` multiple times.
+- No wait-for-completion mode exists; calls always return immediately with an ID and resultPath.
 - You will be notified when the subagent completes.
 - The returned ID is also the child Pi session ID and can be used with Pi session lookup/resume behavior.
-- `timeout` is optional (default 3600s = 1 hour) and measured in seconds. When reached, the parent is informed that the child is still running; the child is **not killed**.
+- `timeout` is optional (default 600s = 10 minutes) and measured in seconds. When reached, the parent is informed that the child is still running; the child is **not killed**.
 - Give `timeout` a healthy margin above expected runtime because child execution time can be wildly unpredictable.
 - Subagents always start with fresh session history. Put any desired context explicitly in `task`.
-- `outputMode: "inline"` stores/returns the child result text for blocking calls.
-- `outputMode: "file"` writes the child result to a generated file path and returns that path for blocking calls.
 - Child subagent directories contain separate `result.log`, `stdout.log`, and `stderr.log` files.
 
 Completed children are final. Running children continue their original task until completion or failure. The extension exposes only the spawn tool.

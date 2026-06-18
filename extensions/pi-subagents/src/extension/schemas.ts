@@ -5,10 +5,6 @@ import { Type } from "typebox";
 export const SpawnSubagentParams = Type.Object(
 	{
 		task: Type.String({ description: "Task for the child Pi to perform." }),
-		async: Type.Boolean({
-			description:
-				"Run in the background. Spawn multiple concurrent subagents by calling spawn_subagent multiple times with async: true.",
-		}),
 		timeout: Type.Optional(
 			Type.Number({
 				minimum: 0.001,
@@ -43,7 +39,6 @@ export const ListSubagentsParams = Type.Object(
 
 export interface SpawnSubagentParamsLike {
 	task: string;
-	async: boolean;
 	timeout?: number;
 	cwd?: string;
 	model?: string;
