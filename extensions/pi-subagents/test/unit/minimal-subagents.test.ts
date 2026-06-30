@@ -1348,7 +1348,7 @@ test("cohort: widget keeps completed cohort members visible while siblings run",
 	}
 });
 
-test("cohort: turn_end starts a new cohort", async () => {
+test("cohort: turn_end does not close active cohort", async () => {
 	const mockPi = createMockPi();
 	mockPi.install();
 	mockPi.onCall({ output: "one", exitCode: 0, delay: 80 });
@@ -1361,19 +1361,17 @@ test("cohort: turn_end starts a new cohort", async () => {
 	try {
 		await spawnTool.execute("turn-a", { task: "a" }, new AbortController().signal, undefined, fake.ctx);
 		await spawnTool.execute("turn-b", { task: "b" }, new AbortController().signal, undefined, fake.ctx);
-		assert.ok(handlers.get("turn_end"), "turn_end handler registered");
-		await handlers.get("turn_end")(undefined, fake.ctx);
+		assert.equal(handlers.has("turn_end"), false, "turn_end handler not registered for cohort reset");
 		await spawnTool.execute("turn-c", { task: "c" }, new AbortController().signal, undefined, fake.ctx);
 		await Promise.all(["turn-a", "turn-b", "turn-c"].map((id) => waitForPersistedRecord(sessionId, id)));
 		const a = readPersistedRecord(sessionId, "turn-a");
 		const b = readPersistedRecord(sessionId, "turn-b");
 		const c = readPersistedRecord(sessionId, "turn-c");
 		assert.equal(a.cohortId, b.cohortId);
-		assert.notEqual(a.cohortId, c.cohortId);
-		assert.equal(messages.some((m) => m.includes("out of 2 subagents have completed")), false);
-		assert.ok(messages.some((m) => m.includes("All 2 subagents completed successfully.")));
-		assert.ok(messages.some((m) => m.includes(`Subagent ${c.id} completed.`) && m.includes("Result file:") && !m.includes("out of")));
-		assert.equal(messages.some((m) => m.includes("out of 3") || m.includes("All 3")), false);
+		assert.equal(a.cohortId, c.cohortId);
+		assert.equal(messages.some((m) => m.includes("out of 2") || m.includes("All 2")), false);
+		assert.equal(messages.some((m) => m.includes(`Subagent ${c.id} completed.`) && !m.includes("out of")), false);
+		assert.ok(messages.some((m) => m.includes("All 3 subagents completed successfully.")));
 	} finally {
 		mockPi.uninstall();
 		cleanupTestCtx(ctx, sessionId);
