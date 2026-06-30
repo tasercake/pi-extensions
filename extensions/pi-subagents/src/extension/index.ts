@@ -1338,10 +1338,6 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 			retryPendingNotices(pi, parentId);
 		});
 
-		pi.on("turn_end", (_event, ctx) => {
-			closeActiveCohort(parentSessionId(ctx));
-		});
-
 		pi.on("agent_end", (_event, ctx) => {
 			rememberUiContext(ctx);
 			const parentId = parentSessionId(ctx);
