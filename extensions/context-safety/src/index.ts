@@ -215,9 +215,34 @@ function maybeOversizedRegularFile(path: string): number | undefined {
   }
 }
 
+function messageContextBytes(message: AgentMessage): number {
+  const content = (message as { content?: unknown }).content;
+  if (typeof content === "string") return utf8Bytes(content);
+  if (!Array.isArray(content)) return utf8Bytes(safeJson(message));
+
+  let bytes = 0;
+  for (const block of content) {
+    if (!block || typeof block !== "object") {
+      bytes += utf8Bytes(safeString(block));
+      continue;
+    }
+    const typed = block as { type?: unknown; text?: unknown; thinking?: unknown };
+    if (typed.type === "image") continue;
+    if (typeof typed.text === "string") {
+      bytes += utf8Bytes(typed.text);
+      continue;
+    }
+    if (typeof typed.thinking === "string") {
+      bytes += utf8Bytes(typed.thinking);
+      continue;
+    }
+    bytes += utf8Bytes(safeJson(block));
+  }
+  return bytes;
+}
+
 function quarantineMessage(message: AgentMessage, ctx: ExtensionContext, id: unknown): AgentMessage | undefined {
-  const serialized = safeJson(message);
-  const originalBytes = utf8Bytes(serialized);
+  const originalBytes = messageContextBytes(message);
   if (originalBytes <= MESSAGE_LIMIT_BYTES) return undefined;
   const spillPath = writeSpill(ctx, "overflow_message", id, {
     input: { source: "message" },
