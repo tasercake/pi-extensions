@@ -1,0 +1,9 @@
+Agentmemory Pi Extension
+
+This extension adapts the official Agentmemory Pi integration and security behavior from rohitg00/agentmemory at commit 93ae9bc04f3ab5042f982aaadf11f1e3f5137531, specifically integrations/pi/index.ts and integrations/pi/security.ts.
+
+Copyright 2026 Rohit Ghumare and the Agentmemory contributors.
+
+This adaptation changes package imports, tool namespacing, daemon lifecycle, locking, security defaults, bounds, error handling, and tests. Agentmemory is licensed under Apache-2.0: https://github.com/rohitg00/agentmemory/blob/main/LICENSE
+
+This project is not endorsed by the upstream authors.
