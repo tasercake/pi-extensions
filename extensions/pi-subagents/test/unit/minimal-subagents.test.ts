@@ -9,7 +9,7 @@ import { Value } from "typebox/value";
 import registerSubagentExtension from "../../src/extension/index.ts";
 import { SpawnSubagentParams } from "../../src/extension/schemas.ts";
 import { createMockPi } from "../support/mock-pi.ts";
-import {
+import registerSubagentPromptRuntime, {
 	CHILD_SUBAGENT_SYSTEM_LINE,
 	rewriteSubagentPrompt,
 	SUBAGENT_RESULT_PATH_ENV,
@@ -250,6 +250,118 @@ test("prompt runtime prepends exactly one line and preserves content", () => {
 	assert.equal(rewritten, `${CHILD_SUBAGENT_SYSTEM_LINE}\n\n${prompt}`);
 	assert.equal(rewriteSubagentPrompt(rewritten), rewritten);
 	assert(!rewritten.includes("Do not propose or run subagents"));
+});
+
+function registerPromptRuntimeHandlers() {
+	const handlers = new Map<string, (event: any) => unknown>();
+	registerSubagentPromptRuntime({
+		on(event: string, handler: (event: any) => unknown) {
+			handlers.set(event, handler);
+		},
+	} as never);
+	return handlers;
+}
+
+async function withResultPath(
+	resultPath: string | undefined,
+	callback: () => Promise<void>,
+) {
+	const previousResultPath = process.env[SUBAGENT_RESULT_PATH_ENV];
+	if (resultPath === undefined) delete process.env[SUBAGENT_RESULT_PATH_ENV];
+	else process.env[SUBAGENT_RESULT_PATH_ENV] = resultPath;
+	try {
+		await callback();
+	} finally {
+		if (previousResultPath === undefined) {
+			delete process.env[SUBAGENT_RESULT_PATH_ENV];
+		} else {
+			process.env[SUBAGENT_RESULT_PATH_ENV] = previousResultPath;
+		}
+	}
+}
+
+test("prompt runtime rewrites a literal result-path alias for file tools", async () => {
+	const toolCall = registerPromptRuntimeHandlers().get("tool_call");
+	assert.ok(toolCall, "prompt runtime must register a tool_call guard");
+
+	await withResultPath("/tmp/subagents/abc/result.log", async () => {
+		const event = {
+			toolName: "write",
+			input: { path: "$PI_SUBAGENT_RESULT_PATH", content: "done" },
+		};
+		await toolCall(event);
+		assert.equal(event.input.path, "/tmp/subagents/abc/result.log");
+	});
+});
+
+test("prompt runtime rewrites both exact aliases for write edit and read", async () => {
+	const toolCall = registerPromptRuntimeHandlers().get("tool_call");
+	assert.ok(toolCall);
+
+	await withResultPath("/tmp/subagents/abc/result.log", async () => {
+		for (const [toolName, alias] of [
+			["write", "${PI_SUBAGENT_RESULT_PATH}"],
+			["edit", "$PI_SUBAGENT_RESULT_PATH"],
+			["read", "${PI_SUBAGENT_RESULT_PATH}"],
+		] as const) {
+			const event = { toolName, input: { path: alias } };
+			await toolCall(event);
+			assert.equal(event.input.path, "/tmp/subagents/abc/result.log");
+		}
+	});
+});
+
+test("prompt runtime leaves non-exact paths and unrelated variables unchanged", async () => {
+	const toolCall = registerPromptRuntimeHandlers().get("tool_call");
+	assert.ok(toolCall);
+
+	await withResultPath("/tmp/subagents/abc/result.log", async () => {
+		for (const candidate of [
+			"prefix/$PI_SUBAGENT_RESULT_PATH",
+			"${PI_SUBAGENT_RESULT_PATH}/suffix",
+			"$HOME/result.log",
+			"/tmp/ordinary.log",
+		]) {
+			const event = { toolName: "write", input: { path: candidate } };
+			await toolCall(event);
+			assert.equal(event.input.path, candidate);
+		}
+	});
+});
+
+test("prompt runtime leaves aliases unchanged when result env is missing", async () => {
+	const toolCall = registerPromptRuntimeHandlers().get("tool_call");
+	assert.ok(toolCall);
+
+	await withResultPath(undefined, async () => {
+		const event = {
+			toolName: "read",
+			input: { path: "$PI_SUBAGENT_RESULT_PATH" },
+		};
+		await toolCall(event);
+		assert.equal(event.input.path, "$PI_SUBAGENT_RESULT_PATH");
+	});
+});
+
+test("prompt runtime never rewrites bash commands", async () => {
+	const toolCall = registerPromptRuntimeHandlers().get("tool_call");
+	assert.ok(toolCall);
+
+	await withResultPath("/tmp/subagents/abc/result.log", async () => {
+		const event = {
+			toolName: "bash",
+			input: {
+				path: "$PI_SUBAGENT_RESULT_PATH",
+				command: 'printf done > "$PI_SUBAGENT_RESULT_PATH"',
+			},
+		};
+		await toolCall(event);
+		assert.equal(event.input.path, "$PI_SUBAGENT_RESULT_PATH");
+		assert.equal(
+			event.input.command,
+			'printf done > "$PI_SUBAGENT_RESULT_PATH"',
+		);
+	});
 });
 
 test("child pi args do not restrict tools skills extensions or MCP", () => {
@@ -547,39 +659,40 @@ test("subagent-written result file content is preserved, not overwritten", async
 });
 
 // Test 8: Prompt injection includes result path (Requirement 4)
-test("subagent system prompt includes result file path when env var set", () => {
-	const prompt = "Original system prompt.";
-	const resultPath = "/tmp/subagents/abc/result.log";
-	process.env[SUBAGENT_RESULT_PATH_ENV] = resultPath;
+test("prompt runtime explains literal file paths shell aliases and fallback", async () => {
+	const beforeAgentStart =
+		registerPromptRuntimeHandlers().get("before_agent_start");
+	assert.ok(beforeAgentStart);
 
-	// Simulate the handler's logic (mirrors registerSubagentPromptRuntime):
-	const RESULT_PATH_MARKER = "Your result file:";
-	let rewritten = rewriteSubagentPrompt(prompt);
-	if (resultPath && !rewritten.includes(RESULT_PATH_MARKER)) {
-		rewritten = `${rewritten}\n\nYour result file: ${resultPath}\nYou may write your final output to this file at any time using any tool (e.g., write, bash). If you leave the file empty, your final assistant message will be automatically saved there on exit. The environment variable "$PI_SUBAGENT_RESULT_PATH" is aliased to ${resultPath}; you can pipe your answer there. Particularly for very large outputs, or for programmatic outputs, use tools to write the result directly to "$PI_SUBAGENT_RESULT_PATH".`;
-	}
+	await withResultPath("/tmp/subagents/abc/result.log", async () => {
+		const first = (await beforeAgentStart({
+			systemPrompt: "Original system prompt.",
+		})) as { systemPrompt: string };
+		const rewritten = first.systemPrompt;
 
-	assert.ok(rewritten.includes(resultPath));
-	assert.ok(rewritten.includes("Your result file:"));
-	assert.ok(rewritten.includes("write"));
-	assert.ok(rewritten.includes("automatically saved"));
-	assert.ok(rewritten.includes('"$PI_SUBAGENT_RESULT_PATH"'));
-	assert.ok(rewritten.includes("you can pipe your answer there"));
-	assert.ok(rewritten.includes("very large outputs"));
-	assert.ok(rewritten.includes("programmatic outputs"));
+		assert.ok(
+			rewritten.includes(
+				"Your result file: /tmp/subagents/abc/result.log",
+			),
+		);
+		assert.match(rewritten, /resolved absolute (result )?path/i);
+		assert.match(rewritten, /file tools.*write.*edit.*read/i);
+		assert.match(rewritten, /literal absolute path/i);
+		assert.match(rewritten, /do not expand (shell )?environment variables/i);
+		assert.match(rewritten, /PI_SUBAGENT_RESULT_PATH.*same path/i);
+		assert.match(rewritten, /only inside (bash|shell)/i);
+		assert.match(rewritten, /automatically saved there on exit/i);
+		assert.doesNotMatch(rewritten, /using any tool/i);
+		assert.doesNotMatch(
+			rewritten,
+			/write directly to ["']?\$PI_SUBAGENT_RESULT_PATH/i,
+		);
 
-	// Idempotency: second injection must not append again
-	let rewrittenAgain = rewritten;
-	if (resultPath && !rewrittenAgain.includes(RESULT_PATH_MARKER)) {
-		rewrittenAgain = `${rewrittenAgain}\n\nYour result file: ${resultPath}\nYou may write...`;
-	}
-	assert.equal(
-		rewrittenAgain,
-		rewritten,
-		"prompt injection must be idempotent",
-	);
-
-	delete process.env[SUBAGENT_RESULT_PATH_ENV];
+		const second = (await beforeAgentStart({
+			systemPrompt: rewritten,
+		})) as { systemPrompt?: string } | undefined;
+		assert.equal(second, undefined, "prompt injection must be idempotent");
+	});
 });
 
 // Test 9: pi-args passes resultPath env var (Requirement 4)

@@ -31,11 +31,13 @@ Completed children are final. Running children continue their original task unti
 
 ## Child environment
 
-Child Pi sessions keep normal Pi capabilities: tools, skills, extensions, and project context are not hidden or restricted by this extension. The only automatic child-system-prompt addition is:
+Child Pi sessions keep normal Pi capabilities: tools, skills, extensions, and project context are not hidden or restricted by this extension. Every child system prompt receives this identity line:
 
 ```text
 You are a Pi subagent controlled by another Pi agent.
 ```
+
+Each child receives a resolved absolute `result.log` path. Pass that literal path to Pi file tools (`write`, `edit`, and `read`), which do not expand shell environment variables. Shell commands and programs may use `$PI_SUBAGENT_RESULT_PATH`; the child runtime also narrowly corrects either exact env-var token when it is accidentally passed as a file-tool path. If the child leaves `result.log` empty, its final assistant message is saved there automatically.
 
 Children may spawn further subagents recursively until the configured recursion-depth limit is reached.
 
