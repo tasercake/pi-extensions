@@ -7,6 +7,11 @@ export const CHILD_SUBAGENT_SYSTEM_LINE =
 	"You are a Pi subagent controlled by another Pi agent.";
 
 const RESULT_PATH_MARKER = "Your result file:";
+const RESULT_PATH_ALIASES = new Set([
+	"$PI_SUBAGENT_RESULT_PATH",
+	"${PI_SUBAGENT_RESULT_PATH}",
+]);
+const FILE_TOOL_NAMES = new Set(["write", "edit", "read"]);
 
 export function rewriteSubagentPrompt(prompt: string): string {
 	if (prompt.includes(CHILD_SUBAGENT_SYSTEM_LINE)) return prompt;
@@ -14,6 +19,19 @@ export function rewriteSubagentPrompt(prompt: string): string {
 }
 
 export default function registerSubagentPromptRuntime(pi: ExtensionAPI): void {
+	pi.on("tool_call", (event) => {
+		if (!FILE_TOOL_NAMES.has(event.toolName)) return;
+		const resultPath = process.env[SUBAGENT_RESULT_PATH_ENV]?.trim();
+		const input = event.input as { path?: unknown };
+		if (
+			resultPath &&
+			typeof input.path === "string" &&
+			RESULT_PATH_ALIASES.has(input.path)
+		) {
+			input.path = resultPath;
+		}
+	});
+
 	pi.on("before_agent_start", async (event) => {
 		const intercomSessionName =
 			process.env[SUBAGENT_INTERCOM_SESSION_NAME_ENV]?.trim();
@@ -25,7 +43,7 @@ export default function registerSubagentPromptRuntime(pi: ExtensionAPI): void {
 
 		const resultPath = process.env[SUBAGENT_RESULT_PATH_ENV]?.trim();
 		if (resultPath && !rewritten.includes(RESULT_PATH_MARKER)) {
-			rewritten = `${rewritten}\n\nYour result file: ${resultPath}\nYou may write your final output to this file at any time using any tool (e.g., write, bash). If you leave the file empty, your final assistant message will be automatically saved there on exit. The environment variable "$PI_SUBAGENT_RESULT_PATH" is aliased to ${resultPath}; you can pipe your answer there. Particularly for very large outputs, or for programmatic outputs, use tools to write the result directly to "$PI_SUBAGENT_RESULT_PATH".`;
+			rewritten = `${rewritten}\n\nYour result file: ${resultPath} (resolved absolute result path)\nPi file tools (\`write\`, \`edit\`, and \`read\`) must receive this literal absolute path as \`path\`; they do not expand shell environment variables. \`PI_SUBAGENT_RESULT_PATH\` contains the same path for shell commands and programs. Use \`$PI_SUBAGENT_RESULT_PATH\` only inside bash/shell commands. If you leave the result file empty, your final assistant message will be automatically saved there on exit.`;
 		}
 
 		if (rewritten === event.systemPrompt) return;
