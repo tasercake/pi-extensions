@@ -1128,8 +1128,8 @@ test("Phase 7.8: headless liveness — stdio pipes keep parent process alive nat
 		assert.ok(childSpawnOptions, "extension child spawn call is present");
 		assert.match(
 			childSpawnOptions,
-			/stdio:\s*\["ignore", "pipe", "pipe"\]/,
-			"extension child spawn uses default pipe stdio for stdout/stderr",
+			/stdio:\s*\["pipe", "pipe", "pipe"\]/,
+			"extension child spawn uses pipe stdio with lifeline on stdin",
 		);
 		assert.doesNotMatch(
 			childSpawnOptions,
@@ -1557,5 +1557,275 @@ test("cohort: reconcile preserves cohort metadata", async () => {
 		assert.equal(persisted.cohortCreatedAt, 12345);
 	} finally {
 		cleanupTestCtx(ctx, sessionId);
+	}
+});
+
+// ── Lifeline: process-death cascade via anonymous pipe ──
+
+import { PI_SUBAGENT_LIFELINE_FD } from "../../src/runs/shared/subagent-prompt-runtime.ts";
+
+function isProcessAlive(pid: number): boolean {
+	try {
+		process.kill(pid, 0);
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+async function waitForProcessDeath(pid: number, timeoutMs: number): Promise<void> {
+	const deadline = Date.now() + timeoutMs;
+	while (Date.now() < deadline) {
+		if (!isProcessAlive(pid)) return;
+		await new Promise((r) => setTimeout(r, 50));
+	}
+	throw new Error(`process ${pid} did not die within ${timeoutMs}ms`);
+}
+
+async function waitForFile(filePath: string, timeoutMs: number): Promise<string> {
+	const deadline = Date.now() + timeoutMs;
+	while (Date.now() < deadline) {
+		try {
+			return fs.readFileSync(filePath, "utf-8");
+		} catch {
+			await new Promise((r) => setTimeout(r, 50));
+		}
+	}
+	throw new Error(`file ${filePath} not created within ${timeoutMs}ms`);
+}
+
+test("lifeline: subagent-prompt-runtime exposes lifeline env constant", () => {
+	assert.equal(typeof PI_SUBAGENT_LIFELINE_FD, "string");
+	assert.ok(PI_SUBAGENT_LIFELINE_FD.length > 0);
+});
+
+test("lifeline: session_shutdown terminates children via lifeline", async () => {
+	const mockPi = createMockPi();
+	mockPi.install();
+	mockPi.onCall({
+		output: "lifeline-kill done",
+		exitCode: 0,
+		delay: 60,
+		keepAliveAfterFinalMessageMs: 300,
+	});
+
+	const { sessionId, ctx } = makeTestCtx("pi-subagents-lifeline-kill");
+	const fake = makeFakeCtx(sessionId, ctx.cwd, false);
+
+	const sessionShutdownHandlers: Array<(_event: unknown, ctx: unknown) => void> = [];
+	const registered = new Map<string, any>();
+	registerSubagentExtension({
+		registerTool(tool: any) { registered.set(tool.name, tool); },
+		sendMessage() {},
+		on(event: string, handler: any) {
+			if (event === "session_shutdown") sessionShutdownHandlers.push(handler);
+		},
+	} as never);
+	const spawnTool = registered.get("spawn_subagent");
+	assert.ok(spawnTool, "spawn_subagent tool registered");
+
+	try {
+		const result = await spawnTool.execute(
+			"lifeline-kill-child",
+			{ task: "lifeline kill test", timeout: 30 },
+			new AbortController().signal,
+			undefined,
+			fake.ctx,
+		);
+		const childId = result.details.id;
+		await waitForSubagentRecord(sessionId, childId, (r) => r.running === true);
+		const record = readPersistedRecord(sessionId, childId);
+		assert.equal(record.running, true);
+		assert.ok(typeof record.pid === "number");
+		assert.ok(isProcessAlive(record.pid), "child must be alive before lifeline close");
+
+		assert.ok(sessionShutdownHandlers.length >= 1, "session_shutdown handler registered");
+		sessionShutdownHandlers.forEach((h) => h(undefined, fake.ctx));
+
+		await waitForProcessDeath(record.pid, 2000);
+		assert.equal(isProcessAlive(record.pid), false, "child must die after session_shutdown");
+	} finally {
+		mockPi.uninstall();
+		cleanupTestCtx(ctx, sessionId);
+	}
+});
+
+test("lifeline: agent_end does NOT kill child process", async () => {
+	const mockPi = createMockPi();
+	mockPi.install();
+	mockPi.onCall({ output: "agent-end-survive done", exitCode: 0, delay: 200 });
+
+	const { sessionId, ctx } = makeTestCtx("pi-subagents-agent-end-survive");
+	const fake = makeFakeCtx(sessionId, ctx.cwd, false);
+
+	const agentEndHandlers: Array<(_event: unknown, ctx: unknown) => void> = [];
+	const registered = new Map<string, any>();
+	registerSubagentExtension({
+		registerTool(tool: any) { registered.set(tool.name, tool); },
+		sendMessage() {},
+		on(event: string, handler: any) {
+			if (event === "agent_end") agentEndHandlers.push(handler);
+		},
+	} as never);
+	const spawnTool = registered.get("spawn_subagent");
+
+	try {
+		const result = await spawnTool.execute(
+			"agent-end-survive-child",
+			{ task: "survive agent_end", timeout: 30 },
+			new AbortController().signal,
+			undefined,
+			fake.ctx,
+		);
+		const childId = result.details.id;
+		await waitForSubagentRecord(sessionId, childId, (r) => r.running === true);
+		const record = readPersistedRecord(sessionId, childId);
+		assert.ok(isProcessAlive(record.pid), "child must be alive before agent_end");
+
+		assert.ok(agentEndHandlers.length >= 1);
+		agentEndHandlers.forEach((h) => h(undefined, fake.ctx));
+
+		await new Promise((r) => setTimeout(r, 80));
+		assert.ok(isProcessAlive(record.pid), "child must survive agent_end");
+
+		await waitForSubagentRecord(sessionId, childId, (r) => r.running === false);
+	} finally {
+		mockPi.uninstall();
+		cleanupTestCtx(ctx, sessionId);
+	}
+});
+
+test("lifeline: abrupt parent SIGKILL cascades to child termination", async () => {
+	const extensionPath = path.join(projectRoot, "src", "index.ts");
+	const testDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-cascade-"));
+	const parentSessionId = testDir;
+	const sessionFile = path.join(testDir, "session.jsonl");
+
+	const parentScript = `
+		import fs from "node:fs";
+		import registerSubagentExtension from ${JSON.stringify(extensionPath)};
+
+		const registered = new Map();
+		registerSubagentExtension({
+			registerTool(tool) { registered.set(tool.name, tool); },
+			sendMessage() {},
+			on() {},
+		});
+
+		const ctx = {
+			cwd: ${JSON.stringify(testDir)},
+			hasUI: false,
+			sessionManager: {
+				getSessionFile: () => ${JSON.stringify(sessionFile)},
+				getSessionId: () => ${JSON.stringify(sessionFile)},
+			},
+		};
+
+		const result = await registered.get("spawn_subagent").execute(
+			"cascade-child",
+			{ task: "long-running cascade child", timeout: 60 },
+			new AbortController().signal,
+			undefined,
+			ctx,
+		);
+
+		fs.writeFileSync(${JSON.stringify(path.join(testDir, "ready"))}, JSON.stringify({
+			childId: result.details.id,
+		}), "utf-8");
+
+		setTimeout(() => {}, 60000);
+	`;
+
+	const parentProc = spawn(
+		process.execPath,
+		["--experimental-strip-types", "--input-type=module", "-e", parentScript],
+		{ cwd: projectRoot, env: { ...process.env, PI_NO_COLOR: "1" }, stdio: ["ignore", "pipe", "pipe"] },
+	);
+
+	try {
+		const readyContent = await waitForFile(path.join(testDir, "ready"), 10000);
+		const { childId } = JSON.parse(readyContent) as { childId: string };
+
+		const childRecord = readPersistedRecord(parentSessionId, childId);
+		assert.ok(childRecord, "child record must exist");
+		assert.equal(childRecord.running, true);
+		const childPid = childRecord.pid;
+		assert.ok(typeof childPid === "number" && childPid > 0);
+		assert.ok(isProcessAlive(childPid), "child must be alive before parent kill");
+
+		assert.ok(parentProc.pid);
+		process.kill(parentProc.pid, "SIGKILL");
+
+		await waitForProcessDeath(childPid, 5000);
+		assert.equal(isProcessAlive(childPid), false, "child must die after parent SIGKILL");
+	} finally {
+		try { process.kill(parentProc.pid as number, "SIGKILL"); } catch {}
+		try { fs.rmSync(testDir, { recursive: true, force: true }); } catch {}
+	}
+});
+
+test("lifeline: recursive cascade — grandparent death kills parent subagent", async () => {
+	const extensionPath = path.join(projectRoot, "src", "index.ts");
+	const testDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-recursive-"));
+	const sessionFile = path.join(testDir, "session.jsonl");
+
+	const grandparentScript = `
+		import fs from "node:fs";
+		import registerSubagentExtension from ${JSON.stringify(extensionPath)};
+
+		const registered = new Map();
+		registerSubagentExtension({
+			registerTool(tool) { registered.set(tool.name, tool); },
+			sendMessage() {},
+			on() {},
+		});
+
+		const ctx = {
+			cwd: ${JSON.stringify(testDir)},
+			hasUI: false,
+			sessionManager: {
+				getSessionFile: () => ${JSON.stringify(sessionFile)},
+				getSessionId: () => ${JSON.stringify(sessionFile)},
+			},
+		};
+
+		const result = await registered.get("spawn_subagent").execute(
+			"recursive-parent",
+			{ task: "parent that spawns child", timeout: 60 },
+			new AbortController().signal,
+			undefined,
+			ctx,
+		);
+
+		fs.writeFileSync(${JSON.stringify(path.join(testDir, "ready"))}, JSON.stringify({
+			parentId: result.details.id,
+		}), "utf-8");
+
+		setTimeout(() => {}, 60000);
+	`;
+
+	const grandparentProc = spawn(
+		process.execPath,
+		["--experimental-strip-types", "--input-type=module", "-e", grandparentScript],
+		{ cwd: projectRoot, env: { ...process.env, PI_NO_COLOR: "1" }, stdio: ["ignore", "pipe", "pipe"] },
+	);
+
+	try {
+		const readyContent = await waitForFile(path.join(testDir, "ready"), 15000);
+		const { parentId } = JSON.parse(readyContent) as { parentId: string };
+
+		const parentRecord = readPersistedRecord(testDir, parentId);
+		assert.ok(parentRecord, "parent record must exist");
+		const parentPid = parentRecord.pid;
+		assert.ok(typeof parentPid === "number" && parentPid > 0);
+		assert.ok(isProcessAlive(parentPid), "parent subagent must be alive");
+
+		process.kill(grandparentProc.pid as number, "SIGKILL");
+
+		await waitForProcessDeath(parentPid, 5000);
+		assert.equal(isProcessAlive(parentPid), false, "parent subagent must die after grandparent SIGKILL");
+	} finally {
+		try { process.kill(grandparentProc.pid as number, "SIGKILL"); } catch {}
+		try { fs.rmSync(testDir, { recursive: true, force: true }); } catch {}
 	}
 });
