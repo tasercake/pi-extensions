@@ -5,6 +5,7 @@ import { randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import type { Writable } from "node:stream";
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 import type {
 	ExtensionAPI,
@@ -93,10 +94,10 @@ interface StartChildHooks {
 const DEFAULT_TIMEOUT_SECONDS = 600;
 const runningChildren = new Map<string, ChildProcess>();
 
-// Lifeline pipes keyed by record.id.  Each entry holds the parent's write end
-// (child.stdin) of the anonymous lifeline pipe.  The parent never writes to it;
-// holding it open keeps the child's read end alive.  When the parent process
-// dies the kernel closes all FDs, the child sees EOF, and self-terminates.
+// Lifeline pipes keyed by record.id. Each entry holds the parent's end of the
+// child's dedicated fd 3 pipe. The parent never writes to it; holding it open
+// keeps the child's read end alive. When the parent process dies the kernel
+// closes all FDs, the child sees EOF, and self-terminates.
 function closeLifeline(recordId: string): void {
 	const stream = lifelines.get(recordId);
 	if (!stream) return;
@@ -109,7 +110,7 @@ function destroyAllLifelines(): void {
 	for (const id of [...lifelines.keys()]) closeLifeline(id);
 }
 
-const lifelines = new Map<string, NodeJS.WritableStream>();
+const lifelines = new Map<string, Writable>();
 const activeCohorts = new Map<
 	string,
 	{ id: string; createdAt: number; turnIndex?: number }
@@ -1142,13 +1143,13 @@ function startChild(
 			...built.env,
 			...getSubagentDepthEnv(resolveCurrentMaxSubagentDepth()),
 		};
-		// Use stdin (fd 0) as the anonymous lifeline pipe.
-		// The parent holds child.stdin open without writing; the child
-		// runtime watches fd 0 for EOF to detect parent death.
-		env[PI_SUBAGENT_LIFELINE_FD] = "0";
+		// Keep stdin independent from process ownership. The parent holds its
+		// side of the dedicated fd 3 pipe open without writing; the child
+		// runtime watches fd 3 for EOF to detect parent death.
+		env[PI_SUBAGENT_LIFELINE_FD] = "3";
 		child = spawn(spawnSpec.command, spawnSpec.args, {
 			cwd: record.cwd,
-			stdio: ["pipe", "pipe", "pipe"],
+			stdio: ["ignore", "pipe", "pipe", "pipe"],
 			env,
 		});
 	} catch (error) {
@@ -1177,8 +1178,11 @@ function startChild(
 	if (!child.stdout || !child.stderr) {
 		throw new Error("Subagent process stdio pipes were not created.");
 	}
-	// Store the lifeline write end (child.stdin) before piping stdout/stderr.
-	if (child.stdin) lifelines.set(record.id, child.stdin);
+	const lifeline = child.stdio[3] as Writable | null;
+	if (!lifeline || typeof lifeline.end !== "function") {
+		throw new Error("Subagent process lifeline pipe was not created.");
+	}
+	lifelines.set(record.id, lifeline);
 	child.stdout.pipe(stdoutStream);
 	child.stderr.pipe(stderrStream);
 
