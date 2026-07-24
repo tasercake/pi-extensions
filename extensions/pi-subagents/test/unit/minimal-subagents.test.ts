@@ -1128,8 +1128,13 @@ test("Phase 7.8: headless liveness — stdio pipes keep parent process alive nat
 		assert.ok(childSpawnOptions, "extension child spawn call is present");
 		assert.match(
 			childSpawnOptions,
-			/stdio:\s*\["pipe", "pipe", "pipe"\]/,
-			"extension child spawn uses pipe stdio with lifeline on stdin",
+			/stdio:\s*\["ignore", "pipe", "pipe", "pipe"\]/,
+			"extension child spawn uses a dedicated fd 3 lifeline without changing stdin",
+		);
+		assert.match(
+			extensionSource,
+			/env\[PI_SUBAGENT_LIFELINE_FD\]\s*=\s*"3"/,
+			"child runtime receives the dedicated lifeline fd number",
 		);
 		assert.doesNotMatch(
 			childSpawnOptions,
