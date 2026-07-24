@@ -19,6 +19,7 @@ import {
 } from "../shared/types.ts";
 import { getPiSpawnCommand } from "../runs/shared/pi-spawn.ts";
 import { buildPiArgs, cleanupTempDir } from "../runs/shared/pi-args.ts";
+import { PI_SUBAGENT_LIFELINE_FD } from "../runs/shared/subagent-prompt-runtime.ts";
 import {
 	SpawnSubagentParams,
 	type SpawnSubagentParamsLike,
@@ -91,6 +92,24 @@ interface StartChildHooks {
 
 const DEFAULT_TIMEOUT_SECONDS = 600;
 const runningChildren = new Map<string, ChildProcess>();
+
+// Lifeline pipes keyed by record.id.  Each entry holds the parent's write end
+// (child.stdin) of the anonymous lifeline pipe.  The parent never writes to it;
+// holding it open keeps the child's read end alive.  When the parent process
+// dies the kernel closes all FDs, the child sees EOF, and self-terminates.
+function closeLifeline(recordId: string): void {
+	const stream = lifelines.get(recordId);
+	if (!stream) return;
+	lifelines.delete(recordId);
+	try { stream.end(); } catch { /* best-effort */ }
+	try { stream.destroy(); } catch { /* best-effort */ }
+}
+
+function destroyAllLifelines(): void {
+	for (const id of [...lifelines.keys()]) closeLifeline(id);
+}
+
+const lifelines = new Map<string, NodeJS.WritableStream>();
 const activeCohorts = new Map<
 	string,
 	{ id: string; createdAt: number; turnIndex?: number }
@@ -1123,9 +1142,13 @@ function startChild(
 			...built.env,
 			...getSubagentDepthEnv(resolveCurrentMaxSubagentDepth()),
 		};
+		// Use stdin (fd 0) as the anonymous lifeline pipe.
+		// The parent holds child.stdin open without writing; the child
+		// runtime watches fd 0 for EOF to detect parent death.
+		env[PI_SUBAGENT_LIFELINE_FD] = "0";
 		child = spawn(spawnSpec.command, spawnSpec.args, {
 			cwd: record.cwd,
-			stdio: ["ignore", "pipe", "pipe"],
+			stdio: ["pipe", "pipe", "pipe"],
 			env,
 		});
 	} catch (error) {
@@ -1154,6 +1177,8 @@ function startChild(
 	if (!child.stdout || !child.stderr) {
 		throw new Error("Subagent process stdio pipes were not created.");
 	}
+	// Store the lifeline write end (child.stdin) before piping stdout/stderr.
+	if (child.stdin) lifelines.set(record.id, child.stdin);
 	child.stdout.pipe(stdoutStream);
 	child.stderr.pipe(stderrStream);
 
@@ -1173,6 +1198,8 @@ function startChild(
 			]);
 
 			runningChildren.delete(record.id);
+			// Release the lifeline on normal child completion.
+			closeLifeline(record.id);
 			cleanupTempDir(built.tempDir);
 
 			const stdout = fs.existsSync(record.stdoutFile)
@@ -1356,6 +1383,9 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 		});
 
 		pi.on("session_shutdown", (_event, _ctx) => {
+			// Close all lifelines: the owning session is being torn down.
+			// This terminates all running children for this parent session.
+			destroyAllLifelines();
 			// Clear all widget refresh timers to prevent stale UI state across extension instances.
 			stopAllWidgetRefreshForInstance();
 			activeCohorts.clear();
