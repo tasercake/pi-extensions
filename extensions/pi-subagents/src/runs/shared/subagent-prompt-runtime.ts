@@ -39,7 +39,9 @@ function setupLifelineWatcher(): void {
 	// and the stream emits 'end' → self-terminate via SIGTERM.
 	// We use a dedicated ReadStream (not process.stdin) so we never
 	// conflict with whatever Pi may do with its own stdin handling.
-	const lifeline = fs.createReadStream(null as unknown as string, { fd, autoClose: false });
+	// We use fd option to read directly from the lifeline fd; the path
+	// argument is not used when fd is supplied but required by the type.
+	const lifeline = fs.createReadStream("", { fd, autoClose: false });
 	lifeline.on("end", () => {
 		process.kill(process.pid, "SIGTERM");
 	});
