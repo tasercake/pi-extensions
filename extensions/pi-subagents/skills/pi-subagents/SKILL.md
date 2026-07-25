@@ -16,6 +16,7 @@ Use this tool to launch unrestricted child Pi sessions. The caller must include 
   - Timeout is only a notification threshold: the parent is informed that the child is still running; the child is not killed.
   - The returned subagent id is also the child Pi session id.
   - Child output is written to `result.log` under the child subagent directory.
+  - When `model` is omitted, the child inherits the parent session's active model (e.g., `openai-codex/gpt-5.6-sol`). Pass an explicit `model` to override (e.g., `"anthropic/claude-sonnet-4-5"`).
 
 ## Usage
 
