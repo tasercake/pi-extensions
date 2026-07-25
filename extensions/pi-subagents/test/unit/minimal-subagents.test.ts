@@ -2085,3 +2085,300 @@ test("lifeline: recursive cascade — grandparent death kills parent subagent", 
 		try { fs.rmSync(testDir, { recursive: true, force: true }); } catch {}
 	}
 });
+// ── Bug: model inheritance ──
+
+test("model inheritance: omitted model inherits parent active model", async () => {
+	const mockPi = createMockPi();
+	mockPi.install();
+	mockPi.onCall({ output: "inherited model done", exitCode: 0 });
+
+	const { sessionId, ctx } = makeTestCtx("pi-subagents-model-inherit");
+	// Simulate a parent context with an active model
+	const parentModel = { provider: "openai-codex", id: "gpt-5.6-sol" };
+	const ctxWithModel = {
+		...ctx,
+		model: parentModel,
+	};
+	const { spawnTool } = registerTestTools(() => {});
+
+	try {
+		const result = await spawnTool.execute(
+			"inherit-model-child",
+			{ task: "echo model" },
+			new AbortController().signal,
+			undefined,
+			ctxWithModel,
+		);
+		await waitForPersistedRecord(sessionId, result.details.id);
+
+		// Verify --model was passed to child with the parent's active model
+		const captured = readLatestMockPiArgs(mockPi).args;
+		const modelIdx = captured.indexOf("--model");
+		assert.ok(modelIdx !== -1, "--model must be passed to child");
+		const modelValue = captured[modelIdx + 1];
+		assert.equal(modelValue, "openai-codex/gpt-5.6-sol");
+
+		// Verify record persisted the model
+		const record = readPersistedRecord(sessionId, result.details.id);
+		assert.equal(record.model, "openai-codex/gpt-5.6-sol");
+	} finally {
+		mockPi.uninstall();
+		cleanupTestCtx(ctx, sessionId);
+	}
+});
+
+test("model inheritance: explicit model overrides inherited model", async () => {
+	const mockPi = createMockPi();
+	mockPi.install();
+	mockPi.onCall({ output: "explicit model done", exitCode: 0 });
+
+	const { sessionId, ctx } = makeTestCtx("pi-subagents-model-override");
+	const parentModel = { provider: "openai-codex", id: "gpt-5.6-sol" };
+	const ctxWithModel = {
+		...ctx,
+		model: parentModel,
+	};
+	const { spawnTool } = registerTestTools(() => {});
+
+	try {
+		const result = await spawnTool.execute(
+			"explicit-model-child",
+			{ task: "echo model", model: "anthropic/claude-sonnet-4-5" },
+			new AbortController().signal,
+			undefined,
+			ctxWithModel,
+		);
+		await waitForPersistedRecord(sessionId, result.details.id);
+
+		const captured = readLatestMockPiArgs(mockPi).args;
+		const modelIdx = captured.indexOf("--model");
+		assert.ok(modelIdx !== -1);
+		const modelValue = captured[modelIdx + 1];
+		assert.equal(modelValue, "anthropic/claude-sonnet-4-5");
+
+		const record = readPersistedRecord(sessionId, result.details.id);
+		assert.equal(record.model, "anthropic/claude-sonnet-4-5");
+	} finally {
+		mockPi.uninstall();
+		cleanupTestCtx(ctx, sessionId);
+	}
+});
+
+// ── Bug: fatal-error lifecycle ──
+
+test("error lifecycle: provider error marks child failed promptly", async () => {
+	const mockPi = createMockPi();
+	mockPi.install();
+	// Simulate an HTTP 402 payment-required error where child stays alive
+	mockPi.onCall({
+		output: "payment required",
+		stopReason: "error",
+		errorMessage: "HTTP 402 Payment Required",
+		exitCode: 0,
+		keepAliveAfterFinalMessageMs: 20_000, // would hang for 20s
+	});
+
+	const { sessionId, ctx } = makeTestCtx("pi-subagents-error-lifecycle");
+	const { spawnTool } = registerTestTools(() => {});
+
+	try {
+		const result = await spawnTool.execute(
+			"error-child",
+			{ task: "do work" },
+			new AbortController().signal,
+			undefined,
+			ctx,
+		);
+
+		// Wait up to 10s: 1s error-detection grace + SIGTERM + process exit.
+		let record: Record<string, any> | undefined;
+		for (let i = 0; i < 200; i++) {
+			record = readPersistedRecord(sessionId, result.details.id);
+			if (record && !record.running) break;
+			await new Promise((resolve) => setTimeout(resolve, 50));
+		}
+		assert.ok(record, "record must exist");
+
+		// Child must be marked as not running
+		assert.equal(record.running, false, "record must show running=false");
+		// completedAt must be set
+		assert.ok(record.completedAt, "completedAt must be set");
+		// Error text must be captured
+		assert.ok(record.error, "error must be set");
+		assert.match(record.error, /HTTP 402 Payment Required/);
+		// result must be set
+		assert.ok(record.result, "result must be set (file path)");
+
+		// Verify result.log has (error) fallback
+		const resultContent = fs.readFileSync(record.result, "utf-8");
+		assert.equal(resultContent.trim(), "(error)");
+	} finally {
+		mockPi.uninstall();
+		cleanupTestCtx(ctx, sessionId);
+	}
+});
+
+test("error lifecycle: no duplicate completion notification on provider error", async () => {
+	const mockPi = createMockPi();
+	mockPi.install();
+	mockPi.onCall({
+		output: "payment required",
+		stopReason: "error",
+		errorMessage: "HTTP 402 Payment Required",
+		exitCode: 0,
+	});
+
+	const { sessionId, ctx } = makeTestCtx("pi-subagents-error-dedup");
+	let notifyCount = 0;
+	const { spawnTool } = registerTestTools(() => {
+		notifyCount += 1;
+	});
+
+	try {
+		const result = await spawnTool.execute(
+			"error-dedup-child",
+			{ task: "do work" },
+			new AbortController().signal,
+			undefined,
+			ctx,
+		);
+
+		await waitForPersistedRecord(sessionId, result.details.id);
+		assert.equal(
+			notifyCount,
+			1,
+			"completion notification must fire exactly once",
+		);
+	} finally {
+		mockPi.uninstall();
+		cleanupTestCtx(ctx, sessionId);
+	}
+});
+
+test("error lifecycle: normal successful completion unchanged", async () => {
+	const mockPi = createMockPi();
+	mockPi.install();
+	mockPi.onCall({ output: "success output", exitCode: 0 });
+
+	const { sessionId, ctx } = makeTestCtx("pi-subagents-error-normal");
+	const { spawnTool } = registerTestTools(() => {});
+
+	try {
+		const result = await spawnTool.execute(
+			"normal-child",
+			{ task: "do work" },
+			new AbortController().signal,
+			undefined,
+			ctx,
+		);
+
+		const record = await waitForPersistedRecord(sessionId, result.details.id);
+		assert.equal(record.running, false);
+		assert.equal(record.error, undefined);
+		assert.ok(record.completedAt);
+		const resultContent = fs.readFileSync(record.result, "utf-8");
+		assert.match(resultContent, /success output/);
+	} finally {
+		mockPi.uninstall();
+		cleanupTestCtx(ctx, sessionId);
+	}
+});
+
+test("error lifecycle: timeout notification-only unchanged", async () => {
+	const mockPi = createMockPi();
+	mockPi.install();
+	// Keep child alive for a long time; timeout must fire but not kill
+	mockPi.onCall({
+		output: "running",
+		exitCode: 0,
+		keepAliveAfterFinalMessageMs: 2000,
+	});
+
+	const { sessionId, ctx } = makeTestCtx("pi-subagents-error-timeout");
+	const timeoutMessages: string[] = [];
+	const { spawnTool } = registerTestTools((message: any) => {
+		const content = String(message.content ?? "");
+		if (content.includes("timed out")) timeoutMessages.push(content);
+	});
+
+	try {
+		const result = await spawnTool.execute(
+			"timeout-child",
+			{ task: "do work", timeout: 0.1 },
+			new AbortController().signal,
+			undefined,
+			ctx,
+		);
+
+		// Wait for timeout notice
+		for (let i = 0; i < 100; i++) {
+			if (timeoutMessages.length > 0) break;
+			await new Promise((resolve) => setTimeout(resolve, 20));
+		}
+		assert.ok(timeoutMessages.length >= 1, "timeout notice must fire");
+		assert.match(timeoutMessages[0], /still running; not killed/);
+
+		// Verify record has timeoutAt but child is still running (not killed)
+		const runningRecord = readPersistedRecord(sessionId, result.details.id);
+		assert.equal(runningRecord.running, true, "child must still be running after timeout");
+		assert.ok(runningRecord.timeoutAt, "timeoutAt must be set");
+
+		// Wait for child to actually finish before cleanup
+		await waitForPersistedRecord(sessionId, result.details.id);
+	} finally {
+		mockPi.uninstall();
+		cleanupTestCtx(ctx, sessionId);
+	}
+});
+
+test("error lifecycle: lifeline cleanup unchanged after provider error", async () => {
+	const mockPi = createMockPi();
+	mockPi.install();
+	mockPi.onCall({
+		output: "payment required",
+		stopReason: "error",
+		errorMessage: "HTTP 402 Payment Required",
+		exitCode: 0,
+		keepAliveAfterFinalMessageMs: 30_000,
+	});
+
+	const { sessionId, ctx } = makeTestCtx("pi-subagents-error-lifeline");
+	const messages: string[] = [];
+	const { spawnTool } = registerTestTools((message: any) => {
+		messages.push(String(message.content ?? ""));
+	});
+
+	try {
+		const result = await spawnTool.execute(
+			"lifeline-error-child",
+			{ task: "do work" },
+			new AbortController().signal,
+			undefined,
+			ctx,
+		);
+
+		// Wait up to 10s for error detection + kill.
+		let record: Record<string, any> | undefined;
+		for (let i = 0; i < 200; i++) {
+			record = readPersistedRecord(sessionId, result.details.id);
+			if (record && !record.running) break;
+			await new Promise((resolve) => setTimeout(resolve, 50));
+		}
+		assert.ok(record, "record must exist");
+
+		// Completion notification must fire
+		const completionMsg = messages.find((m) =>
+			m.includes(record!.id) && m.includes("completed"),
+		);
+		assert.ok(completionMsg, "completion notification must fire");
+
+		// running must be false
+		assert.equal(record.running, false);
+		// pendingCompletionNotice must be false (notification was sent)
+		assert.equal(record.pendingCompletionNotice, false);
+		assert.equal(record.notifiedCompletion, true);
+	} finally {
+		mockPi.uninstall();
+		cleanupTestCtx(ctx, sessionId);
+	}
+});

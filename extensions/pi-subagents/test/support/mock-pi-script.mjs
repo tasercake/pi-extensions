@@ -39,7 +39,7 @@ function claimNextResponse(dir) {
 	return JSON.parse(fs.readFileSync(defaultPath, "utf-8"));
 }
 
-function defaultAssistantMessage(output) {
+function defaultAssistantMessage(output, overrides = {}) {
 	return {
 		type: "message_end",
 		message: {
@@ -54,6 +54,7 @@ function defaultAssistantMessage(output) {
 				cacheWrite: 0,
 				cost: { total: 0.001 },
 			},
+			...overrides,
 		},
 	};
 }
@@ -191,6 +192,14 @@ async function main() {
 		await new Promise((resolve) => setTimeout(resolve, response.delay));
 	}
 
+	const assistantOverrides = {};
+	if (typeof response.stopReason === "string") {
+		assistantOverrides.stopReason = response.stopReason;
+	}
+	if (typeof response.errorMessage === "string") {
+		assistantOverrides.errorMessage = response.errorMessage;
+	}
+
 	if (Array.isArray(response.steps) && response.steps.length > 0) {
 		for (const step of response.steps) {
 			if (typeof step?.delay === "number" && step.delay > 0) {
@@ -210,10 +219,10 @@ async function main() {
 			response.echoEnv.map((key) => [key, process.env[key] ?? null]),
 		);
 		if (jsonMode)
-			writeJsonlLine(defaultAssistantMessage(JSON.stringify(envSnapshot)));
+			writeJsonlLine(defaultAssistantMessage(JSON.stringify(envSnapshot), assistantOverrides));
 		else process.stdout.write(`${JSON.stringify(envSnapshot)}\n`);
 	} else if (typeof response.output === "string") {
-		if (jsonMode) writeJsonlLine(defaultAssistantMessage(response.output));
+		if (jsonMode) writeJsonlLine(defaultAssistantMessage(response.output, assistantOverrides));
 		else process.stdout.write(`${response.output}\n`);
 	}
 

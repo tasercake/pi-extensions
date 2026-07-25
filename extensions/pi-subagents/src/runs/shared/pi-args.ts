@@ -65,6 +65,10 @@ export function buildPiArgs(input: BuildPiArgsInput): BuildPiArgsResult {
 
 	if (input.model) args.push("--model", input.model);
 
+	// Use JSON mode so child output is machine-parseable for error
+	// detection and result extraction.
+	args.push("--mode", "json");
+
 	// Add only the minimal runtime extension. Do not disable normal extensions,
 	// skills, tools, MCP direct tools, or project context.
 	args.push("--extension", PROMPT_RUNTIME_EXTENSION_PATH);

@@ -1188,7 +1188,38 @@ function startChild(
 		throw new Error("Subagent process lifeline pipe was not created.");
 	}
 	lifelines.set(record.id, lifeline);
-	child.stdout.pipe(stdoutStream);
+
+	// Monitor stdout for terminal provider errors (e.g. HTTP 402).
+	// When stopReason==="error" is emitted, the child Pi process may
+	// stay alive indefinitely. Kill it so the close handler finalizes
+	// the record promptly.
+	let terminalErrorText: string | undefined;
+	let errorTimer: NodeJS.Timeout | undefined;
+	child.stdout.on("data", (chunk: Buffer) => {
+		// Write to file (replaces pipe).
+		stdoutStream.write(chunk);
+		if (terminalErrorText) return;
+		const text = chunk.toString("utf-8");
+		if (/"stopReason"\s*:\s*"error"/.test(text)) {
+			const errMatch = text.match(/"errorMessage"\s*:\s*"([^"]+)"/);
+			terminalErrorText = errMatch?.[1] ?? "Provider error";
+			if (!record.error) {
+				record.error = terminalErrorText;
+			}
+			errorTimer = setTimeout(() => {
+				errorTimer = undefined;
+				if (child.exitCode === null && child.signalCode === null) {
+					child.kill("SIGTERM");
+					setTimeout(() => {
+						if (child.exitCode === null && child.signalCode === null) {
+							child.kill("SIGKILL");
+						}
+					}, 1000).unref();
+				}
+			}, 1000);
+			errorTimer.unref();
+		}
+	});
 	child.stderr.pipe(stderrStream);
 
 	const done = new Promise<PersistedSubagentRecord>((resolve) => {
@@ -1200,6 +1231,12 @@ function startChild(
 		) {
 			if (finalized) return;
 			finalized = true;
+
+			// Clear error-detection timer if still pending.
+			if (errorTimer) {
+				clearTimeout(errorTimer);
+				errorTimer = undefined;
+			}
 
 			await Promise.all([
 				new Promise<void>((r) => stdoutStream.end(r)),
@@ -1227,7 +1264,10 @@ function startChild(
 			record.completedAt = Date.now();
 			record.updatedAt = Date.now();
 
-			if (code !== 0 && !record.error)
+			// Only assign a code-based error for actual non-zero exit
+			// codes (not null signals) and when we don't already have
+			// a provider error from stdout monitoring.
+			if (code !== null && code !== 0 && !record.error)
 				record.error =
 					stderr.trim() ||
 					`Subagent exited with code ${code}${signal ? ` (${signal})` : ""}`;
@@ -1241,7 +1281,11 @@ function startChild(
 			if (!hasExistingResult) {
 				// Subagent did not write to result file — auto-save final output
 				const finalOutput = extractFinalOutput(stdout);
-				if (finalOutput && record.outputFile) {
+				// When we have a provider error captured from stdout
+			// monitoring, use the (error) fallback.
+			if (record.error && record.outputFile) {
+				fs.writeFileSync(record.outputFile, "(error)\n", { mode: 0o600 });
+			} else if (finalOutput && record.outputFile) {
 					fs.writeFileSync(record.outputFile, `${finalOutput}\n`, {
 						mode: 0o600,
 					});
