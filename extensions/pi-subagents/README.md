@@ -1,6 +1,6 @@
 # pi-subagents
 
-Minimal recursive child-Pi spawner for Pi.
+Minimal recursive child-Pi spawner for Pi 0.80.4 or newer.
 
 This extension intentionally does **not** define roles, agent types, chains, or parallel task lists. The parent agent supplies the full prompt and instructions for each child.
 
@@ -22,6 +22,7 @@ spawn_subagent({
 - No wait-for-completion mode exists; calls always return immediately with an ID and resultPath.
 - You will be notified when the subagent completes.
 - The returned ID is also the child Pi session ID and can be used with Pi session lookup/resume behavior.
+- `model` is an explicit override; omitting it inherits the active parent provider/model.
 - `timeout` is optional (default 600s = 10 minutes) and measured in seconds. When reached, the parent is informed that the child is still running; the child is **not killed**.
 - Give `timeout` a healthy margin above expected runtime because child execution time can be wildly unpredictable.
 - Subagents always start with fresh session history. Put any desired context explicitly in `task`.

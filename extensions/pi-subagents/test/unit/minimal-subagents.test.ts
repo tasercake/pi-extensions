@@ -175,6 +175,30 @@ test("spawn schema accepts task only and rejects removed properties", () => {
 	);
 });
 
+test("model override contract is synchronized across schema, tool, README, and skill", () => {
+	const schemaDescription =
+		(SpawnSubagentParams.properties.model as { description?: string }).description ?? "";
+	const extensionSource = fs.readFileSync(
+		path.join(projectRoot, "src", "extension", "index.ts"),
+		"utf-8",
+	);
+	const readme = fs.readFileSync(path.join(projectRoot, "README.md"), "utf-8");
+	const skill = fs.readFileSync(
+		path.join(projectRoot, "skills", "pi-subagents", "SKILL.md"),
+		"utf-8",
+	);
+
+	for (const [surface, text] of [
+		["schema", schemaDescription],
+		["tool", extensionSource],
+		["README", readme],
+		["skill", skill],
+	] as const) {
+		assert.match(text, /(?:explicit model override|model[^\n]*explicit override)/i, `${surface} must call model an explicit override`);
+		assert.match(text, /omit(?:ted|ting)[^\n]*inherit[^\n]*parent[^\n]*provider\/model/i, `${surface} must document canonical parent model inheritance`);
+	}
+});
+
 test("user-facing packaged docs do not expose removed API concepts", () => {
 	const packageJsonPath = path.join(projectRoot, "package.json");
 	const packageJsonText = fs.readFileSync(packageJsonPath, "utf-8");
@@ -242,6 +266,83 @@ function makeFakeCtx(sessionId: string, cwd: string, hasUI: boolean) {
 		widgetCalls,
 	};
 }
+
+function runPromptRuntimeTerminalMessage(
+	stopReason: "stop" | "error" | "aborted",
+	errorMessage?: string,
+) {
+	const runtimePath = path.join(
+		projectRoot,
+		"src",
+		"runs",
+		"shared",
+		"subagent-prompt-runtime.ts",
+	);
+	const script = `
+		import registerRuntime from ${JSON.stringify(runtimePath)};
+		let messageEnd;
+		let agentSettled;
+		registerRuntime({
+			on(event, handler) {
+				if (event === "message_end") messageEnd = handler;
+				if (event === "agent_settled") agentSettled = handler;
+			},
+		});
+		if (!messageEnd) throw new Error("message_end handler was not registered");
+		if (!agentSettled) throw new Error("agent_settled handler was not registered");
+		await messageEnd({
+			type: "message_end",
+			message: {
+				role: "assistant",
+				content: [],
+				provider: "test-provider",
+				model: "test-model",
+				stopReason: ${JSON.stringify(stopReason)},
+				errorMessage: ${JSON.stringify(errorMessage)},
+			},
+		});
+		await agentSettled({ type: "agent_settled" });
+		if (${JSON.stringify(stopReason)} === "error") {
+			setInterval(() => {}, 60_000);
+		} else {
+			setTimeout(() => process.exit(0), 30);
+		}
+	`;
+	return spawnSync(
+		process.execPath,
+		["--experimental-strip-types", "--input-type=module", "-e", script],
+		{
+			cwd: projectRoot,
+			encoding: "utf-8",
+			timeout: 1500,
+			env: { ...process.env, PI_NO_COLOR: "1" },
+		},
+	);
+}
+
+test("prompt runtime exits nonzero promptly on canonical assistant provider failure", () => {
+	const startedAt = Date.now();
+	const result = runPromptRuntimeTerminalMessage(
+		"error",
+		"HTTP 402: provider credits exhausted",
+	);
+
+	assert.equal(result.status, 1, result.stderr || result.stdout);
+	assert.ok(Date.now() - startedAt < 1000, "provider failure must not wait on the child lifeline");
+	assert.match(result.stderr, /HTTP 402: provider credits exhausted/);
+});
+
+test("prompt runtime does not misclassify abort as provider failure", () => {
+	const result = runPromptRuntimeTerminalMessage("aborted", "Request was aborted");
+	assert.equal(result.status, 0, result.stderr || result.stdout);
+	assert.doesNotMatch(result.stderr, /Request was aborted/);
+});
+
+test("prompt runtime leaves successful terminal messages successful", () => {
+	const result = runPromptRuntimeTerminalMessage("stop");
+	assert.equal(result.status, 0, result.stderr || result.stdout);
+	assert.equal(result.stderr, "");
+});
 
 test("prompt runtime prepends exactly one line and preserves content", () => {
 	const prompt =
@@ -436,6 +537,156 @@ test("async completion persists success and pending metadata when stale notifica
 		);
 		assert.equal(record.notifiedCompletion, undefined);
 		assert.equal(notifyAttempts, 1);
+	} finally {
+		mockPi.uninstall();
+		cleanupTestCtx(ctx, sessionId);
+	}
+});
+
+test("omitted model inherits and reports the active parent canonical provider/model", async () => {
+	const mockPi = createMockPi();
+	mockPi.install();
+	mockPi.onCall({ output: "inherited model done", exitCode: 0 });
+
+	const { sessionId, ctx } = makeTestCtx("pi-subagents-model-inherit");
+	const parentModel = { provider: "openai-codex", id: "gpt-5.3-codex" };
+	const { spawnTool } = registerTestTools(() => {});
+
+	try {
+		const result = await spawnTool.execute(
+			"model-inherit-child",
+			{ task: "inherit parent model" },
+			new AbortController().signal,
+			undefined,
+			{ ...ctx, model: parentModel },
+		);
+		const record = await waitForPersistedRecord(sessionId, result.details.id);
+		const args = readLatestMockPiArgs(mockPi).args;
+		const modelFlag = args.indexOf("--model");
+
+		assert.notEqual(modelFlag, -1, "child args must always select the effective model");
+		assert.equal(args[modelFlag + 1], "openai-codex/gpt-5.3-codex");
+		assert.equal(record.model, "openai-codex/gpt-5.3-codex");
+		assert.equal(result.details.model, "openai-codex/gpt-5.3-codex");
+		assert.match(result.content[0].text, /openai-codex\/gpt-5\.3-codex/);
+	} finally {
+		mockPi.uninstall();
+		cleanupTestCtx(ctx, sessionId);
+	}
+});
+
+test("explicit model override wins over the active parent model", async () => {
+	const mockPi = createMockPi();
+	mockPi.install();
+	mockPi.onCall({ output: "override model done", exitCode: 0 });
+
+	const { sessionId, ctx } = makeTestCtx("pi-subagents-model-override");
+	const { spawnTool } = registerTestTools(() => {});
+	const override = "anthropic/claude-opus-4-6";
+
+	try {
+		const result = await spawnTool.execute(
+			"model-override-child",
+			{ task: "override parent model", model: override },
+			new AbortController().signal,
+			undefined,
+			{ ...ctx, model: { provider: "openai", id: "gpt-5.4" } },
+		);
+		const record = await waitForPersistedRecord(sessionId, result.details.id);
+		const args = readLatestMockPiArgs(mockPi).args;
+		const modelFlag = args.indexOf("--model");
+
+		assert.equal(args[modelFlag + 1], override);
+		assert.equal(record.model, override);
+		assert.equal(result.details.model, override);
+	} finally {
+		mockPi.uninstall();
+		cleanupTestCtx(ctx, sessionId);
+	}
+});
+
+test("provider failure finalizes once with error text and result fallback", async () => {
+	const mockPi = createMockPi();
+	mockPi.install();
+	mockPi.onCall({
+		jsonl: [{
+			type: "message_end",
+			message: {
+				role: "assistant",
+				content: [],
+				provider: "test-provider",
+				model: "test-model",
+				stopReason: "error",
+				errorMessage: "HTTP 402: provider credits exhausted",
+			},
+		}],
+		stderr: "HTTP 402: provider credits exhausted\n",
+		exitCode: 1,
+	});
+
+	const { sessionId, ctx } = makeTestCtx("pi-subagents-provider-failure");
+	const notifications: string[] = [];
+	const { spawnTool } = registerTestTools((message) => {
+		const content = (message as { content?: unknown }).content;
+		if (typeof content === "string") notifications.push(content);
+	});
+
+	try {
+		const result = await spawnTool.execute(
+			"provider-failure-child",
+			{ task: "trigger provider failure" },
+			new AbortController().signal,
+			undefined,
+			ctx,
+		);
+		const record = await waitForPersistedRecord(sessionId, result.details.id);
+
+		assert.equal(record.running, false);
+		assert.equal(typeof record.completedAt, "number");
+		assert.match(record.error, /HTTP 402: provider credits exhausted/);
+		assert.equal(fs.readFileSync(record.outputFile, "utf-8"), "(error)\n");
+		assert.equal(notifications.length, 1, "failure must emit one completion notification");
+		assert.equal(record.notifiedCompletion, true);
+	} finally {
+		mockPi.uninstall();
+		cleanupTestCtx(ctx, sessionId);
+	}
+});
+
+test("timeout remains notification-only and child later completes", async () => {
+	const mockPi = createMockPi();
+	mockPi.install();
+	mockPi.onCall({ output: "late success", exitCode: 0, delay: 180 });
+
+	const { sessionId, ctx } = makeTestCtx("pi-subagents-timeout-notify-only");
+	const notifications: string[] = [];
+	const { spawnTool } = registerTestTools((message) => {
+		const content = (message as { content?: unknown }).content;
+		if (typeof content === "string") notifications.push(content);
+	});
+
+	try {
+		const result = await spawnTool.execute(
+			"timeout-notify-child",
+			{ task: "finish after threshold", timeout: 0.04 },
+			new AbortController().signal,
+			undefined,
+			ctx,
+		);
+		const timedOut = await waitForPersistedRecord(
+			sessionId,
+			result.details.id,
+			(record) => record.running === true && typeof record.timeoutAt === "number",
+		);
+		assert.equal(timedOut.running, true, "timeout must not kill the child");
+		assert.equal(timedOut.timeoutNotified, true);
+		assert.equal(notifications.filter((text) => text.includes("still running; not killed")).length, 1);
+
+		const completed = await waitForPersistedRecord(sessionId, result.details.id);
+		assert.equal(completed.running, false);
+		assert.equal(completed.error, undefined);
+		assert.equal(fs.readFileSync(completed.outputFile, "utf-8").trim(), "late success");
+		assert.equal(notifications.filter((text) => text.includes("completed")).length, 1);
 	} finally {
 		mockPi.uninstall();
 		cleanupTestCtx(ctx, sessionId);
