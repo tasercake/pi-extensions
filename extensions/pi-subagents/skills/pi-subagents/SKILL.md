@@ -11,6 +11,7 @@ Use this tool to launch unrestricted child Pi sessions. The caller must include 
 
 - `spawn_subagent({ task, timeout?, cwd?, model? })`
   - Calls return immediately; the parent will be notified when the subagent completes.
+  - `model` is an explicit override; omitting it inherits the active parent provider/model.
   - `timeout` is optional; default is `600` seconds (10 minutes).
   - Timeout is only a notification threshold: the parent is informed that the child is still running; the child is not killed.
   - The returned subagent id is also the child Pi session id.
@@ -37,6 +38,7 @@ Calls return immediately; the parent will be notified when each subagent complet
 - No wait-for-completion mode exists.
 - No subagent types exist.
 - No chain or parallel-list mode exists.
+- `model` is an explicit override; omitting it inherits the active parent provider/model.
 - `timeout` is optional and measured in seconds; omitted timeout defaults to 10 minutes.
 - When `timeout` expires, the parent is informed that the subagent is still running; the child is not killed.
 - Do not kill subagents autonomously to enforce `timeout`.

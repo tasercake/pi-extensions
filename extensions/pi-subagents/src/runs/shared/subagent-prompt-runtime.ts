@@ -57,6 +57,31 @@ function setupLifelineWatcher(): void {
 setupLifelineWatcher();
 
 export default function registerSubagentPromptRuntime(pi: ExtensionAPI): void {
+	let settledProviderError: string | undefined;
+	let exitingForProviderError = false;
+
+	pi.on("message_end", (event) => {
+		if (event.message.role !== "assistant") return;
+		if (event.message.stopReason !== "error") {
+			settledProviderError = undefined;
+			return;
+		}
+		settledProviderError =
+			event.message.errorMessage?.trim() ||
+			`Provider/model request failed for ${event.message.provider}/${event.message.model}.`;
+	});
+
+	pi.on("agent_settled", () => {
+		if (!settledProviderError || exitingForProviderError) return;
+		exitingForProviderError = true;
+		process.exitCode = 1;
+		process.stderr.write(`${settledProviderError}\n`);
+		// message_end has been persisted and agent_settled guarantees no retry,
+		// compaction, or queued continuation remains. Force exit because the
+		// dedicated parent lifeline intentionally keeps the event loop alive.
+		setImmediate(() => process.exit(1));
+	});
+
 	pi.on("tool_call", (event) => {
 		if (!FILE_TOOL_NAMES.has(event.toolName)) return;
 		const resultPath = process.env[SUBAGENT_RESULT_PATH_ENV]?.trim();

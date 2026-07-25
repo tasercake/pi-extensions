@@ -37,6 +37,7 @@ interface ToolDetails {
 	timedOut?: boolean;
 	timeoutAt?: number;
 	timeoutMessage?: string;
+	model?: string;
 	subagents?: Array<{ id: string; running: boolean }>;
 }
 
@@ -792,6 +793,10 @@ function makeRecord(
 	const id = randomUUID();
 	const parentId = parentSessionId(ctx);
 	const dir = childDir(parentId, id);
+	const inheritedModel = ctx.model
+		? `${ctx.model.provider}/${ctx.model.id}`
+		: undefined;
+	const model = params.model || inheritedModel;
 	fs.mkdirSync(dir, { recursive: true });
 	return {
 		id,
@@ -799,7 +804,7 @@ function makeRecord(
 		cwd: params.cwd ? path.resolve(ctx.cwd, params.cwd) : ctx.cwd,
 		taskPreview: params.task.slice(0, 500),
 		timeout: params.timeout ?? DEFAULT_TIMEOUT_SECONDS,
-		...(params.model ? { model: params.model } : {}),
+		...(model ? { model } : {}),
 		running: false,
 		sessionDir: dir,
 		outputFile: path.join(dir, "result.log"),
@@ -1281,7 +1286,7 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 		name: "spawn_subagent",
 		label: "Spawn subagent",
 		description:
-			"Spawn a child Pi subagent for one task. timeout is optional and measured in seconds (default 600 = 10 minutes). This returns immediately, allowing the parent to spawn multiple concurrent subagents by calling spawn_subagent multiple times. Do not kill subagents autonomously to enforce timeout; the parent will be informed when timeout expires. Give a healthy timeout margin above expected runtime because subagent execution may be wildly unpredictable.",
+			"Spawn a child Pi subagent for one task. model is an explicit override; omitting it inherits the active parent provider/model. timeout is optional and measured in seconds (default 600 = 10 minutes). This returns immediately, allowing the parent to spawn multiple concurrent subagents by calling spawn_subagent multiple times. Do not kill subagents autonomously to enforce timeout; the parent will be informed when timeout expires. Give a healthy timeout margin above expected runtime because subagent execution may be wildly unpredictable.",
 		parameters: SpawnSubagentParams,
 		async execute(
 			id,
@@ -1336,13 +1341,14 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 				content: [
 					{
 						type: "text",
-						text: `Spawned subagent ${started.record.id}. Result will be at: ${started.record.outputFile}. You will be notified when this subagent completes. Do not poll for result. Do not sleep for result. Continue with whatever other work you may have.`,
+						text: `Spawned subagent ${started.record.id} using ${started.record.model ?? "Pi's selected model"}. Result will be at: ${started.record.outputFile}. You will be notified when this subagent completes. Do not poll for result. Do not sleep for result. Continue with whatever other work you may have.`,
 					},
 				],
 				details: {
 					id: started.record.id,
 					running: started.record.running,
 					resultPath: started.record.outputFile,
+					...(started.record.model ? { model: started.record.model } : {}),
 				},
 			};
 		},

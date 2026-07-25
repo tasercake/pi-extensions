@@ -19,7 +19,10 @@ export const SpawnSubagentParams = Type.Object(
 			}),
 		),
 		model: Type.Optional(
-			Type.String({ description: "Optional model override for the child Pi." }),
+			Type.String({
+				description:
+					"Explicit model override for the child Pi. Omitting it inherits the active parent provider/model.",
+			}),
 		),
 	},
 	{ additionalProperties: false },
