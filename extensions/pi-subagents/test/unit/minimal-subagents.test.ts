@@ -2,8 +2,9 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as os from "node:os";
-import { spawn, spawnSync } from "node:child_process";
+import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import * as path from "node:path";
+import type { Writable } from "node:stream";
 import { fileURLToPath } from "node:url";
 import { Value } from "typebox/value";
 import registerSubagentExtension from "../../src/extension/index.ts";
@@ -1809,9 +1810,108 @@ async function waitForFile(filePath: string, timeoutMs: number): Promise<string>
 	throw new Error(`file ${filePath} not created within ${timeoutMs}ms`);
 }
 
+async function waitForChildExit(
+	child: ChildProcess,
+	timeoutMs: number,
+): Promise<{ code: number | null; signal: NodeJS.Signals | null }> {
+	if (child.exitCode !== null || child.signalCode !== null) {
+		return { code: child.exitCode, signal: child.signalCode };
+	}
+	return new Promise((resolve, reject) => {
+		const timer = setTimeout(() => {
+			child.off("exit", onExit);
+			reject(new Error(`process ${child.pid} did not exit within ${timeoutMs}ms`));
+		}, timeoutMs);
+		const onExit = (code: number | null, signal: NodeJS.Signals | null) => {
+			clearTimeout(timer);
+			resolve({ code, signal });
+		};
+		child.once("exit", onExit);
+	});
+}
+
+function spawnLifelineRuntimeFixture(readyFile: string, keepAlive: boolean): {
+	child: ChildProcess;
+	lifeline: Writable;
+	stderr: () => string;
+} {
+	const runtimePath = path.join(
+		projectRoot,
+		"src",
+		"runs",
+		"shared",
+		"subagent-prompt-runtime.ts",
+	);
+	const script = `
+		import ${JSON.stringify(runtimePath)};
+		import fs from "node:fs";
+		fs.writeFileSync(${JSON.stringify(readyFile)}, "ready", "utf-8");
+		${keepAlive ? "setInterval(() => {}, 60_000);" : ""}
+	`;
+	const child = spawn(
+		process.execPath,
+		["--experimental-strip-types", "--input-type=module", "-e", script],
+		{
+			cwd: projectRoot,
+			env: {
+				...process.env,
+				[PI_SUBAGENT_LIFELINE_FD]: "3",
+			},
+			stdio: ["ignore", "pipe", "pipe", "pipe"],
+		},
+	);
+	const lifeline = child.stdio[3] as Writable | null;
+	assert.ok(lifeline, "fixture lifeline pipe must exist");
+	let stderr = "";
+	child.stderr?.setEncoding("utf-8");
+	child.stderr?.on("data", (chunk) => {
+		stderr += chunk;
+	});
+	return { child, lifeline, stderr: () => stderr };
+}
+
+function cleanupLifelineRuntimeFixture(
+	child: ChildProcess,
+	lifeline: Writable,
+): void {
+	if (child.exitCode === null && child.signalCode === null) {
+		child.kill("SIGKILL");
+	}
+	lifeline.destroy();
+}
+
 test("lifeline: subagent-prompt-runtime exposes lifeline env constant", () => {
 	assert.equal(typeof PI_SUBAGENT_LIFELINE_FD, "string");
 	assert.ok(PI_SUBAGENT_LIFELINE_FD.length > 0);
+});
+
+test("lifeline: watcher does not retain an otherwise idle child", async () => {
+	const testDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-lifeline-idle-"));
+	const fixture = spawnLifelineRuntimeFixture(path.join(testDir, "ready"), false);
+
+	try {
+		await waitForFile(path.join(testDir, "ready"), 2000);
+		const result = await waitForChildExit(fixture.child, 2000);
+		assert.equal(result.code, 0, fixture.stderr());
+		assert.equal(result.signal, null, fixture.stderr());
+	} finally {
+		cleanupLifelineRuntimeFixture(fixture.child, fixture.lifeline);
+		fs.rmSync(testDir, { recursive: true, force: true });
+	}
+});
+
+test("lifeline: parent EOF still terminates an active child", async () => {
+	const testDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-lifeline-eof-"));
+	const fixture = spawnLifelineRuntimeFixture(path.join(testDir, "ready"), true);
+
+	try {
+		await waitForFile(path.join(testDir, "ready"), 2000);
+		fixture.lifeline.end();
+		await waitForChildExit(fixture.child, 2000);
+	} finally {
+		cleanupLifelineRuntimeFixture(fixture.child, fixture.lifeline);
+		fs.rmSync(testDir, { recursive: true, force: true });
+	}
 });
 
 test("lifeline: session_shutdown terminates children via lifeline", async () => {
