@@ -28,17 +28,9 @@ import {
 
 interface ToolDetails {
 	id?: string;
-	sessionId?: string;
-	sessionFile?: string;
 	running?: boolean;
-	result?: string;
 	resultPath?: string;
-	error?: string;
-	timedOut?: boolean;
-	timeoutAt?: number;
-	timeoutMessage?: string;
 	model?: string;
-	subagents?: Array<{ id: string; running: boolean }>;
 }
 
 interface PersistedSubagentRecord {
@@ -47,7 +39,6 @@ interface PersistedSubagentRecord {
 	cwd: string;
 	taskPreview: string;
 	keepContext?: boolean;
-	timeout: number;
 	model?: string;
 	running: boolean;
 	pid?: number;
@@ -61,11 +52,6 @@ interface PersistedSubagentRecord {
 	createdAt: number;
 	updatedAt: number;
 	completedAt?: number;
-	timeoutAt?: number;
-	timeoutNotified?: boolean;
-	pendingTimeoutNotice?: boolean;
-	timeoutNotifyError?: string;
-	timeoutNotifiedAt?: number;
 	completionNotificationPending?: boolean;
 	notifiedCompletion?: boolean;
 	pendingCompletionNotice?: boolean;
@@ -87,12 +73,9 @@ interface ReconcileResult {
 
 interface StartChildHooks {
 	onRunning?(record: PersistedSubagentRecord): void;
-	onTimeout?(record: PersistedSubagentRecord): void;
 	onTerminal?(record: PersistedSubagentRecord): void;
 	onSetupFailure?(record: PersistedSubagentRecord, error: unknown): void;
 }
-
-const DEFAULT_TIMEOUT_SECONDS = 600;
 const runningChildren = new Map<string, ChildProcess>();
 
 // Lifeline pipes keyed by record.id. Each entry holds the parent's end of the
@@ -194,15 +177,6 @@ function upsertRecord(record: PersistedSubagentRecord): void {
 	writeStore(record.parentSessionId, store);
 }
 
-function findRecord(
-	parentId: string,
-	id: string,
-): PersistedSubagentRecord | undefined {
-	return readStore(parentId).records.find(
-		(r) => r.id === id || r.id.startsWith(id),
-	);
-}
-
 function updateRecordFields(
 	parentId: string,
 	id: string,
@@ -243,45 +217,6 @@ function markCompletionNoticeSent(
 			latest.completionNotificationPending = false;
 			delete latest.notifyError;
 			latest.notifiedAt = Date.now();
-		}) ?? record
-	);
-}
-
-function markTimeoutNoticePending(
-	record: PersistedSubagentRecord,
-	error?: unknown,
-): PersistedSubagentRecord {
-	return (
-		updateRecordFields(record.parentSessionId, record.id, (latest) => {
-			latest.pendingTimeoutNotice = true;
-			latest.timeoutNotified = false;
-			if (error !== undefined)
-				latest.timeoutNotifyError =
-					error instanceof Error ? error.message : String(error);
-		}) ?? record
-	);
-}
-
-function markTimeoutNoticeSent(
-	record: PersistedSubagentRecord,
-): PersistedSubagentRecord {
-	return (
-		updateRecordFields(record.parentSessionId, record.id, (latest) => {
-			latest.timeoutNotified = true;
-			latest.pendingTimeoutNotice = false;
-			delete latest.timeoutNotifyError;
-			latest.timeoutNotifiedAt = Date.now();
-		}) ?? record
-	);
-}
-
-function markTimeoutNoticeSkipped(
-	record: PersistedSubagentRecord,
-): PersistedSubagentRecord {
-	return (
-		updateRecordFields(record.parentSessionId, record.id, (latest) => {
-			latest.pendingTimeoutNotice = false;
-			delete latest.timeoutNotifyError;
 		}) ?? record
 	);
 }
@@ -432,7 +367,6 @@ function mergeRecord(
 					pid: refreshed.pid ?? latest.pid,
 					cwd: refreshed.cwd,
 					taskPreview: refreshed.taskPreview,
-					timeout: refreshed.timeout,
 					model: refreshed.model ?? latest.model,
 					running: refreshed.running,
 					sessionDir: refreshed.sessionDir ?? latest.sessionDir,
@@ -445,7 +379,6 @@ function mergeRecord(
 					createdAt: refreshed.createdAt,
 					updatedAt: refreshed.updatedAt,
 					completedAt: refreshed.completedAt ?? latest.completedAt,
-					timeoutAt: refreshed.timeoutAt ?? latest.timeoutAt,
 					cohortId: refreshed.cohortId ?? latest.cohortId,
 					cohortCreatedAt:
 						refreshed.cohortCreatedAt ?? latest.cohortCreatedAt,
@@ -471,16 +404,11 @@ function applyNotificationFields(
 		"notifiedCompletion",
 		latest.notifiedCompletion || refreshed.notifiedCompletion,
 	);
-	set("timeoutNotified", latest.timeoutNotified || refreshed.timeoutNotified);
 	set(
 		"cohortFinalNotified",
 		latest.cohortFinalNotified || refreshed.cohortFinalNotified,
 	);
 	set("notifiedAt", refreshed.notifiedAt ?? latest.notifiedAt);
-	set(
-		"timeoutNotifiedAt",
-		refreshed.timeoutNotifiedAt ?? latest.timeoutNotifiedAt,
-	);
 	const notifiedCompletion =
 		latest.notifiedCompletion || refreshed.notifiedCompletion;
 	set(
@@ -494,17 +422,7 @@ function applyNotificationFields(
 			refreshed.completionNotificationPending) &&
 			!notifiedCompletion,
 	);
-	const timeoutNotified = latest.timeoutNotified || refreshed.timeoutNotified;
-	set(
-		"pendingTimeoutNotice",
-		(latest.pendingTimeoutNotice || refreshed.pendingTimeoutNotice) &&
-			!timeoutNotified,
-	);
 	set("notifyError", refreshed.notifyError || latest.notifyError);
-	set(
-		"timeoutNotifyError",
-		refreshed.timeoutNotifyError || latest.timeoutNotifyError,
-	);
 	return r as unknown as PersistedSubagentRecord;
 }
 
@@ -655,11 +573,8 @@ function sanitizePreview(text: string): string {
 
 function formatRunningLine(record: PersistedSubagentRecord): string {
 	const elapsed = Math.floor((Date.now() - record.createdAt) / 1000);
-	const timedOut = Boolean(record.timeoutAt);
 	const statusText = record.running
-		? timedOut
-			? "timed out, still running"
-			: `running ${elapsed}s`
+		? `running ${elapsed}s`
 		: record.error
 			? "failed"
 			: "complete";
@@ -670,95 +585,6 @@ function formatRunningLine(record: PersistedSubagentRecord): string {
 	const available = Math.max(0, terminalWidth() - visibleLength(prefix) - separator.length);
 	const line = `${prefix}${separator}${fitToWidth(preview, available)}`;
 	return `\x1b[2m${line}\x1b[22m`;
-}
-
-function resultForRecord(record: PersistedSubagentRecord): string | undefined {
-	return (
-		record.outputFile ??
-		path.join(childDir(record.parentSessionId, record.id), "result.log")
-	);
-}
-
-function subagentSessionId(
-	record: PersistedSubagentRecord,
-): string | undefined {
-	if (!record.sessionFile || !fs.existsSync(record.sessionFile))
-		return undefined;
-	for (const line of fs.readFileSync(record.sessionFile, "utf-8").split("\n")) {
-		if (!line.trim()) continue;
-		try {
-			const event = JSON.parse(line) as { type?: string; id?: unknown };
-			if (event.type === "session" && typeof event.id === "string")
-				return event.id;
-		} catch {
-			// Ignore malformed session log lines.
-		}
-	}
-	return undefined;
-}
-
-function timeoutMessage(record: PersistedSubagentRecord): string {
-	const details = [
-		`Subagent ${record.id} timed out after ${record.timeout}s; still running; not killed`,
-	];
-	const sessionId = subagentSessionId(record) ?? record.id;
-	details.push(`sessionId=${sessionId}`);
-	if (record.pid) details.push(`pid=${record.pid}`);
-	return `${details.join("; ")}.`;
-}
-
-function formatStatus(
-	record: PersistedSubagentRecord,
-): AgentToolResult<ToolDetails> {
-	const refreshed = refreshRecordFromDisk(record);
-	const result = resultForRecord(refreshed);
-	const timedOut = Boolean(refreshed.timeoutAt);
-	const timedOutMessage = timedOut ? timeoutMessage(refreshed) : undefined;
-	const doNotPollNotice = refreshed.running
-		? "Do not poll for the result. Do not sleep for the result. You will be notified when the subagent completes."
-		: undefined;
-	return {
-		content: [
-			{
-				type: "text",
-				text: JSON.stringify(
-					{
-						id: refreshed.id,
-						sessionId: refreshed.id,
-						running: refreshed.running,
-						...(result ? { resultPath: result } : {}),
-						...(timedOut
-							? {
-									timedOut: true,
-									timeoutAt: refreshed.timeoutAt,
-									timeoutMessage: timedOutMessage,
-								}
-							: {}),
-						...(refreshed.error ? { error: refreshed.error } : {}),
-					},
-					null,
-					2,
-				),
-			},
-			...(doNotPollNotice
-				? [{ type: "text" as const, text: doNotPollNotice }]
-				: []),
-		],
-		details: {
-			id: refreshed.id,
-			sessionId: refreshed.id,
-			running: refreshed.running,
-			...(result ? { resultPath: result } : {}),
-			...(timedOut
-				? {
-						timedOut: true,
-						timeoutAt: refreshed.timeoutAt,
-						timeoutMessage: timedOutMessage,
-					}
-				: {}),
-			...(refreshed.error ? { error: refreshed.error } : {}),
-		},
-	};
 }
 
 function childDir(parentId: string, id: string): string {
@@ -803,7 +629,6 @@ function makeRecord(
 		parentSessionId: parentId,
 		cwd: params.cwd ? path.resolve(ctx.cwd, params.cwd) : ctx.cwd,
 		taskPreview: params.task.slice(0, 500),
-		timeout: params.timeout ?? DEFAULT_TIMEOUT_SECONDS,
 		...(model ? { model } : {}),
 		running: false,
 		sessionDir: dir,
@@ -1004,113 +829,6 @@ function retryPendingCompletionNotices(
 	}
 }
 
-function retryPendingTimeoutNotices(pi: ExtensionAPI, parentId: string): void {
-	const records = readStore(parentId).records;
-	for (const record of records) {
-		const refreshed = refreshRecordFromDisk(record);
-		if (!refreshed.timeoutAt) continue;
-		if (!refreshed.running) {
-			if (refreshed.pendingTimeoutNotice) markTimeoutNoticeSkipped(refreshed);
-			continue;
-		}
-		if (refreshed.pendingTimeoutNotice && !refreshed.timeoutNotified) {
-			notifyTimeout(pi, refreshed);
-		}
-	}
-}
-
-function retryPendingNotices(pi: ExtensionAPI, parentId: string): void {
-	retryPendingTimeoutNotices(pi, parentId);
-	retryPendingCompletionNotices(pi, parentId);
-}
-
-function markTimedOut(
-	record: PersistedSubagentRecord,
-	queueNotice = true,
-): PersistedSubagentRecord {
-	// Use updateRecordFields for atomic read-modify-write to avoid
-	// clobbering a newer terminal state written by the child close handler.
-	// WARNING: Do NOT call refreshRecordFromDisk or upsertRecord inside the
-	// callback.  The outer updateRecordFields writes the store after the
-	// callback returns, so any inner upsert would be immediately clobbered.
-	// Instead only check liveness via isPidRunning and conditionally clear
-	// pending flags on the record that updateRecordFields will persist.
-	const updated = updateRecordFields(
-		record.parentSessionId,
-		record.id,
-		(latest) => {
-			// Already terminal (child close handler won): just clear pending
-			// timeout flags without re-marking running.
-			if (!latest.running) {
-				if (latest.pendingTimeoutNotice) {
-					latest.pendingTimeoutNotice = false;
-					delete latest.timeoutNotifyError;
-				}
-				return;
-			}
-			// Verify PID is still alive.  If the PID died but store still
-			// says running, mark terminal inline (no separate upsert).
-			if (!isPidRunning(latest.pid)) {
-				latest.running = false;
-				latest.completedAt ??= Date.now();
-				if (latest.pendingTimeoutNotice) {
-					latest.pendingTimeoutNotice = false;
-					delete latest.timeoutNotifyError;
-				}
-				return;
-			}
-			if (!latest.timeoutAt) latest.timeoutAt = Date.now();
-			if (queueNotice && !latest.timeoutNotified) {
-				latest.pendingTimeoutNotice = true;
-			}
-		},
-	);
-	if (!updated) return record;
-	return updated;
-}
-
-function notifyTimeout(
-	pi: ExtensionAPI,
-	record: PersistedSubagentRecord,
-): boolean {
-	// Re-read latest from store before sending; skip if already notified.
-	// Return true: consistent with notifyCompletion ("did we handle it?").
-	const freshLatest = findRecord(record.parentSessionId, record.id);
-	if (freshLatest?.timeoutNotified) return true;
-
-	const timedOut = markTimedOut(record);
-	if (!timedOut.running || !timedOut.timeoutAt || timedOut.timeoutNotified)
-		return false;
-	try {
-		pi.sendMessage(
-			{
-				customType: "subagent-notify",
-				content: timeoutMessage(timedOut),
-				display: true,
-			},
-			{ triggerTurn: true },
-		);
-	} catch (error) {
-		markTimeoutNoticePending(timedOut, error);
-		return false;
-	}
-	markTimeoutNoticeSent(timedOut);
-	return true;
-}
-
-function startTimeoutTimer(
-	pi: ExtensionAPI,
-	record: PersistedSubagentRecord,
-	notify: boolean,
-): NodeJS.Timeout {
-	const timer = setTimeout(function onSubagentTimeout() {
-		if (notify) notifyTimeout(pi, record);
-		else markTimedOut(record, false);
-	}, record.timeout * 1000);
-	timer.unref();
-	return timer;
-}
-
 function startChild(
 	pi: ExtensionAPI,
 	ctx: ExtensionContext,
@@ -1255,11 +973,6 @@ function startChild(
 				? fs.readFileSync(record.stderrFile, "utf-8")
 				: "";
 
-			const latest = findRecord(record.parentSessionId, record.id);
-			if (latest?.timeoutAt) record.timeoutAt = latest.timeoutAt;
-			if (latest?.timeoutNotified)
-				record.timeoutNotified = latest.timeoutNotified;
-
 			record.running = false;
 			record.completedAt = Date.now();
 			record.updatedAt = Date.now();
@@ -1330,7 +1043,7 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 		name: "spawn_subagent",
 		label: "Spawn subagent",
 		description:
-			"Spawn a child Pi subagent for one task. model is an explicit override; omitting it inherits the active parent provider/model. timeout is optional and measured in seconds (default 600 = 10 minutes). This returns immediately, allowing the parent to spawn multiple concurrent subagents by calling spawn_subagent multiple times. Do not kill subagents autonomously to enforce timeout; the parent will be informed when timeout expires. Give a healthy timeout margin above expected runtime because subagent execution may be wildly unpredictable.",
+			"Spawn a child Pi subagent for one task. model is an explicit override; omitting it inherits the active parent provider/model. This returns immediately, allowing the parent to spawn multiple concurrent subagents by calling spawn_subagent multiple times.",
 		parameters: SpawnSubagentParams,
 		async execute(
 			id,
@@ -1341,7 +1054,7 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 		) {
 			void id;
 			const parentId = parentSessionId(ctx);
-			retryPendingNotices(pi, parentId);
+			retryPendingCompletionNotices(pi, parentId);
 			rememberUiContext(ctx);
 			const record = makeRecord(ctx, params);
 			const cohort = getOrCreateActiveCohort(parentId);
@@ -1353,9 +1066,6 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 					renderRunningWidget(ctx, parentId);
 					scheduleWidgetRefresh(parentId);
 				},
-				onTimeout(_r) {
-					renderRunningWidget(ctx, parentId);
-				},
 				onTerminal(_r) {
 					renderRunningWidget(ctx, parentId);
 					stopWidgetRefreshIfIdle(parentId);
@@ -1366,7 +1076,6 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 				},
 			};
 			const started = startChild(pi, ctx, record, params.task, true, hooks);
-			const timeoutTimer = startTimeoutTimer(pi, started.record, true);
 			void started.done
 				.catch((error) => {
 					record.running = false;
@@ -1379,8 +1088,7 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 						markPendingBeforeSend: false,
 					});
 				})
-				.catch(() => {})
-				.finally(() => clearTimeout(timeoutTimer));
+				.catch(() => {});
 			return {
 				content: [
 					{
@@ -1416,7 +1124,7 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 				renderRunningWidget(ctx, parentId);
 				scheduleWidgetRefresh(parentId);
 			}
-			retryPendingNotices(pi, parentId);
+			retryPendingCompletionNotices(pi, parentId);
 		});
 
 		pi.on("agent_end", (_event, ctx) => {

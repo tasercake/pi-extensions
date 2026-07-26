@@ -5,13 +5,6 @@ import { Type } from "typebox";
 export const SpawnSubagentParams = Type.Object(
 	{
 		task: Type.String({ description: "Task for the child Pi to perform." }),
-		timeout: Type.Optional(
-			Type.Number({
-				minimum: 0.001,
-				description:
-					"Optional timeout in seconds (default 600 = 10 minutes). When the timeout is reached, the parent is informed that the subagent is still running; the subagent is not killed. Do not kill subagents autonomously to enforce this timeout. Give a healthy timeout margin on top of expected execution time because subagent runtime may be wildly unpredictable.",
-			}),
-		),
 		cwd: Type.Optional(
 			Type.String({
 				description:
@@ -42,7 +35,6 @@ export const ListSubagentsParams = Type.Object(
 
 export interface SpawnSubagentParamsLike {
 	task: string;
-	timeout?: number;
 	cwd?: string;
 	model?: string;
 }
