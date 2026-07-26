@@ -13,7 +13,6 @@ Spawn one child Pi process. This is the only exposed model-callable tool.
 ```ts
 spawn_subagent({
   task: string,
-  timeout?: number,
   cwd?: string,
   model?: string
 })
@@ -23,8 +22,6 @@ spawn_subagent({
 - You will be notified when the subagent completes.
 - The returned ID is also the child Pi session ID and can be used with Pi session lookup/resume behavior.
 - `model` is an explicit override; omitting it inherits the active parent provider/model.
-- `timeout` is optional (default 600s = 10 minutes) and measured in seconds. When reached, the parent is informed that the child is still running; the child is **not killed**.
-- Give `timeout` a healthy margin above expected runtime because child execution time can be wildly unpredictable.
 - Subagents always start with fresh session history. Put any desired context explicitly in `task`.
 - Child subagent directories contain separate `result.log`, `stdout.log`, and `stderr.log` files.
 

@@ -512,7 +512,7 @@ test("async completion persists success and pending metadata when stale notifica
 	try {
 		await spawnTool.execute(
 			"stale-notify-child",
-			{ task: "finish", timeout: 30 },
+			{ task: "finish" },
 			new AbortController().signal,
 			undefined,
 			ctx,
@@ -647,46 +647,6 @@ test("provider failure finalizes once with error text and result fallback", asyn
 		assert.equal(fs.readFileSync(record.outputFile, "utf-8"), "(error)\n");
 		assert.equal(notifications.length, 1, "failure must emit one completion notification");
 		assert.equal(record.notifiedCompletion, true);
-	} finally {
-		mockPi.uninstall();
-		cleanupTestCtx(ctx, sessionId);
-	}
-});
-
-test("timeout remains notification-only and child later completes", async () => {
-	const mockPi = createMockPi();
-	mockPi.install();
-	mockPi.onCall({ output: "late success", exitCode: 0, delay: 180 });
-
-	const { sessionId, ctx } = makeTestCtx("pi-subagents-timeout-notify-only");
-	const notifications: string[] = [];
-	const { spawnTool } = registerTestTools((message) => {
-		const content = (message as { content?: unknown }).content;
-		if (typeof content === "string") notifications.push(content);
-	});
-
-	try {
-		const result = await spawnTool.execute(
-			"timeout-notify-child",
-			{ task: "finish after threshold", timeout: 0.04 },
-			new AbortController().signal,
-			undefined,
-			ctx,
-		);
-		const timedOut = await waitForPersistedRecord(
-			sessionId,
-			result.details.id,
-			(record) => record.running === true && typeof record.timeoutAt === "number",
-		);
-		assert.equal(timedOut.running, true, "timeout must not kill the child");
-		assert.equal(timedOut.timeoutNotified, true);
-		assert.equal(notifications.filter((text) => text.includes("still running; not killed")).length, 1);
-
-		const completed = await waitForPersistedRecord(sessionId, result.details.id);
-		assert.equal(completed.running, false);
-		assert.equal(completed.error, undefined);
-		assert.equal(fs.readFileSync(completed.outputFile, "utf-8").trim(), "late success");
-		assert.equal(notifications.filter((text) => text.includes("completed")).length, 1);
 	} finally {
 		mockPi.uninstall();
 		cleanupTestCtx(ctx, sessionId);
@@ -1522,7 +1482,6 @@ test("Phase 7.14: session_start renders widget before user status", async () => 
 		parentSessionId: sessionId,
 		cwd: ctx.cwd,
 		taskPreview: "session start test",
-		timeout: 3600,
 		running: true,
 		pid: process.pid,
 		sessionFile: path.join(childDataDir, "session.jsonl"),
@@ -1758,7 +1717,7 @@ test("cohort: legacy records without cohortId notify solo", async () => {
 		fs.mkdirSync(child, { recursive: true });
 		const outputFile = path.join(child, "result.log");
 		fs.writeFileSync(outputFile, `${id}\n`);
-		return { id, parentSessionId: sessionId, cwd: ctx.cwd, taskPreview: id, timeout: 3600, running: false, outputFile, stdoutFile: path.join(child, "stdout.log"), stderrFile: path.join(child, "stderr.log"), createdAt: now + index, updatedAt: now + index, completedAt: now + index, pendingCompletionNotice: id === "legacy-a" };
+		return { id, parentSessionId: sessionId, cwd: ctx.cwd, taskPreview: id, running: false, outputFile, stdoutFile: path.join(child, "stdout.log"), stderrFile: path.join(child, "stderr.log"), createdAt: now + index, updatedAt: now + index, completedAt: now + index, pendingCompletionNotice: id === "legacy-a" };
 	});
 	fs.writeFileSync(storeFile(sessionId), JSON.stringify({ records }, null, 2));
 	const messages: string[] = [];
@@ -1801,7 +1760,7 @@ test("cohort: reconcile preserves cohort metadata", async () => {
 	const fake = makeFakeCtx(sessionId, ctx.cwd, false);
 	const dir = path.join(sessionId, "subagents", "reconcile-a");
 	fs.mkdirSync(dir, { recursive: true });
-	const record = { id: "reconcile-a", parentSessionId: sessionId, cwd: ctx.cwd, taskPreview: "x", timeout: 3600, running: true, outputFile: path.join(dir, "result.log"), stdoutFile: path.join(dir, "stdout.log"), stderrFile: path.join(dir, "stderr.log"), createdAt: Date.now(), updatedAt: Date.now(), cohortId: "cohort-keep", cohortCreatedAt: 12345 };
+	const record = { id: "reconcile-a", parentSessionId: sessionId, cwd: ctx.cwd, taskPreview: "x", running: true, outputFile: path.join(dir, "result.log"), stdoutFile: path.join(dir, "stdout.log"), stderrFile: path.join(dir, "stderr.log"), createdAt: Date.now(), updatedAt: Date.now(), cohortId: "cohort-keep", cohortCreatedAt: 12345 };
 	fs.writeFileSync(record.stdoutFile, "");
 	fs.writeFileSync(record.stderrFile, "");
 	fs.writeFileSync(storeFile(sessionId), JSON.stringify({ records: [record] }, null, 2));
@@ -1883,7 +1842,7 @@ test("lifeline: session_shutdown terminates children via lifeline", async () => 
 	try {
 		const result = await spawnTool.execute(
 			"lifeline-kill-child",
-			{ task: "lifeline kill test", timeout: 30 },
+			{ task: "lifeline kill test" },
 			new AbortController().signal,
 			undefined,
 			fake.ctx,
@@ -1928,7 +1887,7 @@ test("lifeline: agent_end does NOT kill child process", async () => {
 	try {
 		const result = await spawnTool.execute(
 			"agent-end-survive-child",
-			{ task: "survive agent_end", timeout: 30 },
+			{ task: "survive agent_end" },
 			new AbortController().signal,
 			undefined,
 			fake.ctx,
@@ -1979,7 +1938,7 @@ test("lifeline: abrupt parent SIGKILL cascades to child termination", async () =
 
 		const result = await registered.get("spawn_subagent").execute(
 			"cascade-child",
-			{ task: "long-running cascade child", timeout: 60 },
+			{ task: "long-running cascade child" },
 			new AbortController().signal,
 			undefined,
 			ctx,
@@ -2047,7 +2006,7 @@ test("lifeline: recursive cascade — grandparent death kills parent subagent", 
 
 		const result = await registered.get("spawn_subagent").execute(
 			"recursive-parent",
-			{ task: "parent that spawns child", timeout: 60 },
+			{ task: "parent that spawns child" },
 			new AbortController().signal,
 			undefined,
 			ctx,
@@ -2278,53 +2237,6 @@ test("error lifecycle: normal successful completion unchanged", async () => {
 		assert.ok(record.completedAt);
 		const resultContent = fs.readFileSync(record.result, "utf-8");
 		assert.match(resultContent, /success output/);
-	} finally {
-		mockPi.uninstall();
-		cleanupTestCtx(ctx, sessionId);
-	}
-});
-
-test("error lifecycle: timeout notification-only unchanged", async () => {
-	const mockPi = createMockPi();
-	mockPi.install();
-	// Keep child alive for a long time; timeout must fire but not kill
-	mockPi.onCall({
-		output: "running",
-		exitCode: 0,
-		keepAliveAfterFinalMessageMs: 2000,
-	});
-
-	const { sessionId, ctx } = makeTestCtx("pi-subagents-error-timeout");
-	const timeoutMessages: string[] = [];
-	const { spawnTool } = registerTestTools((message: any) => {
-		const content = String(message.content ?? "");
-		if (content.includes("timed out")) timeoutMessages.push(content);
-	});
-
-	try {
-		const result = await spawnTool.execute(
-			"timeout-child",
-			{ task: "do work", timeout: 0.1 },
-			new AbortController().signal,
-			undefined,
-			ctx,
-		);
-
-		// Wait for timeout notice
-		for (let i = 0; i < 100; i++) {
-			if (timeoutMessages.length > 0) break;
-			await new Promise((resolve) => setTimeout(resolve, 20));
-		}
-		assert.ok(timeoutMessages.length >= 1, "timeout notice must fire");
-		assert.match(timeoutMessages[0], /still running; not killed/);
-
-		// Verify record has timeoutAt but child is still running (not killed)
-		const runningRecord = readPersistedRecord(sessionId, result.details.id);
-		assert.equal(runningRecord.running, true, "child must still be running after timeout");
-		assert.ok(runningRecord.timeoutAt, "timeoutAt must be set");
-
-		// Wait for child to actually finish before cleanup
-		await waitForPersistedRecord(sessionId, result.details.id);
 	} finally {
 		mockPi.uninstall();
 		cleanupTestCtx(ctx, sessionId);
