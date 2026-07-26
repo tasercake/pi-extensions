@@ -14,6 +14,7 @@
 ### Added
 
 ### Fixed
+- Prevent the parent-death lifeline watcher from keeping successfully settled subagents alive indefinitely.
 
 ## [0.24.2] - 2026-05-10
 

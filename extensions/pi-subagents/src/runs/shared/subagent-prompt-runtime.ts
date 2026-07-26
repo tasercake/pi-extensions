@@ -1,5 +1,5 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import * as fs from "node:fs";
+import { Socket } from "node:net";
 
 export const SUBAGENT_INTERCOM_SESSION_NAME_ENV =
 	"PI_SUBAGENT_INTERCOM_SESSION_NAME";
@@ -34,23 +34,20 @@ function setupLifelineWatcher(): void {
 	const fd = parseInt(lifelineFdRaw, 10);
 	if (!Number.isFinite(fd) || fd < 0) return;
 
-	// Create a read stream on the lifeline fd.  When the parent process
-	// dies the kernel closes the write end of the pipe; the child sees EOF
-	// and the stream emits 'end' → self-terminate via SIGTERM.
-	// We use a dedicated ReadStream (not process.stdin) so we never
-	// conflict with whatever Pi may do with its own stdin handling.
-	// We use fd option to read directly from the lifeline fd; the path
-	// argument is not used when fd is supplied but required by the type.
-	const lifeline = fs.createReadStream("", { fd, autoClose: false });
-	lifeline.on("end", () => {
+	// Wrap the dedicated pipe as a socket so its libuv handle can be unref'd.
+	// EOF still detects parent death while the child is active, but the watcher
+	// alone must not keep a successfully settled child process alive.
+	const lifeline = new Socket({ fd, readable: true, writable: false });
+	let terminating = false;
+	const terminate = () => {
+		if (terminating) return;
+		terminating = true;
 		process.kill(process.pid, "SIGTERM");
-	});
-	lifeline.on("error", () => {
-		// If the fd is already closed or invalid, treat as parent death.
-		process.kill(process.pid, "SIGTERM");
-	});
-	// Start flowing so libuv polls the fd for readability/EOF.
+	};
+	lifeline.once("end", terminate);
+	lifeline.once("error", terminate);
 	lifeline.resume();
+	lifeline.unref();
 }
 
 // Run at module load time so the watcher is active before any Pi handlers fire.
@@ -77,8 +74,8 @@ export default function registerSubagentPromptRuntime(pi: ExtensionAPI): void {
 		process.exitCode = 1;
 		process.stderr.write(`${settledProviderError}\n`);
 		// message_end has been persisted and agent_settled guarantees no retry,
-		// compaction, or queued continuation remains. Force exit because the
-		// dedicated parent lifeline intentionally keeps the event loop alive.
+		// compaction, or queued continuation remains. Preserve the provider
+		// failure as a prompt nonzero process exit.
 		setImmediate(() => process.exit(1));
 	});
 
