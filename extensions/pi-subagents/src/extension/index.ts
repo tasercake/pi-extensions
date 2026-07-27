@@ -258,12 +258,103 @@ function extractFinalOutput(stdout: string): string {
 			if (event.message?.role === "assistant") {
 				const text = extractTextFromMessageContent(event.message.content);
 				if (text.trim()) lastAssistant = text.trim();
+			} else if (!event.type) {
+				// Print-mode answers may themselves be valid JSON.
+				rawLines.push(line);
 			}
 		} catch {
 			rawLines.push(line);
 		}
 	}
 	return lastAssistant || rawLines.join("\n").trim();
+}
+
+const MAX_RECOVERY_FILE_BYTES = 16 * 1024 * 1024;
+
+function hasNonEmptyFile(filePath: string | undefined): boolean {
+	if (!filePath) return false;
+	try {
+		return fs.statSync(filePath).size > 0;
+	} catch {
+		return false;
+	}
+}
+
+function readRecoveryFile(
+	filePath: string | undefined,
+	label: string,
+): { text: string; issue?: string } {
+	if (!filePath) return { text: "" };
+	try {
+		const size = fs.statSync(filePath).size;
+		if (size > MAX_RECOVERY_FILE_BYTES) {
+			return {
+				text: "",
+				issue: `${label} exceeds the ${MAX_RECOVERY_FILE_BYTES}-byte recovery limit: ${filePath}`,
+			};
+		}
+		return { text: fs.readFileSync(filePath, "utf-8") };
+	} catch (error) {
+		const code =
+			error && typeof error === "object" && "code" in error
+				? String(error.code)
+				: undefined;
+		if (code === "ENOENT") return { text: "" };
+		return {
+			text: "",
+			issue: `Could not read ${label} ${filePath}: ${error instanceof Error ? error.message : String(error)}`,
+		};
+	}
+}
+
+function recoverFinalOutput(record: PersistedSubagentRecord): {
+	output: string;
+	issue?: string;
+} {
+	try {
+		recordDiscoveredSessionFile(record);
+	} catch {
+		// Discovery is best-effort; stdout remains the compatibility fallback.
+	}
+	let issue: string | undefined;
+	for (const [filePath, label] of [
+		[record.sessionFile, "child session"],
+		[record.stdoutFile, "child stdout"],
+	] as const) {
+		const recovered = readRecoveryFile(filePath, label);
+		issue ??= recovered.issue;
+		const output = extractFinalOutput(recovered.text);
+		if (output) return { output };
+	}
+	return { output: "", issue };
+}
+
+function ensureResultFile(
+	record: PersistedSubagentRecord,
+	stderr: { text: string; issue?: string },
+): void {
+	if (!record.outputFile || hasNonEmptyFile(record.outputFile)) return;
+	try {
+		const recovered = recoverFinalOutput(record);
+		if (record.error) {
+			fs.writeFileSync(record.outputFile, "(error)\n", { mode: 0o600 });
+		} else if (recovered.output) {
+			fs.writeFileSync(record.outputFile, `${recovered.output}\n`, {
+				mode: 0o600,
+			});
+		} else if (stderr.text.trim()) {
+			record.error = stderr.text.trim();
+			fs.writeFileSync(record.outputFile, "(error)\n", { mode: 0o600 });
+		} else if (recovered.issue || stderr.issue) {
+			record.error = recovered.issue ?? stderr.issue;
+			fs.writeFileSync(record.outputFile, "(error)\n", { mode: 0o600 });
+		} else {
+			fs.writeFileSync(record.outputFile, "(no output)\n", { mode: 0o600 });
+		}
+	} catch (error) {
+		record.error ??=
+			`Could not create subagent result: ${error instanceof Error ? error.message : String(error)}`;
+	}
 }
 
 function refreshRecord(record: PersistedSubagentRecord): {
@@ -274,40 +365,12 @@ function refreshRecord(record: PersistedSubagentRecord): {
 		return { record, changed: false };
 	}
 	const refreshed: PersistedSubagentRecord = { ...record };
-	const stdout = fs.existsSync(refreshed.stdoutFile)
-		? fs.readFileSync(refreshed.stdoutFile, "utf-8")
-		: "";
-	const stderr = fs.existsSync(refreshed.stderrFile)
-		? fs.readFileSync(refreshed.stderrFile, "utf-8")
-		: "";
 	refreshed.running = false;
 	refreshed.updatedAt = Date.now();
 	refreshed.completedAt ??= Date.now();
 
-	// Check if subagent already wrote to the result file.
-	const hasExistingResult =
-		refreshed.outputFile &&
-		fs.existsSync(refreshed.outputFile) &&
-		fs.readFileSync(refreshed.outputFile, "utf-8").trim().length > 0;
-
-	if (!hasExistingResult) {
-		const finalOutput = extractFinalOutput(stdout);
-		if (finalOutput && refreshed.outputFile) {
-			fs.writeFileSync(refreshed.outputFile, `${finalOutput}\n`, {
-				mode: 0o600,
-			});
-		} else if (stderr.trim()) {
-			// Subagent produced only stderr, no stdout output.
-			if (!refreshed.error) refreshed.error = stderr.trim();
-			if (refreshed.outputFile) {
-				fs.writeFileSync(refreshed.outputFile, "(error)\n", { mode: 0o600 });
-			}
-		} else if (refreshed.outputFile) {
-			// Edge case: neither stdout nor stderr produced content.
-			// Write a placeholder so the parent gets a valid result file.
-			fs.writeFileSync(refreshed.outputFile, "(no output)\n", { mode: 0o600 });
-		}
-	}
+	const stderr = readRecoveryFile(refreshed.stderrFile, "child stderr");
+	ensureResultFile(refreshed, stderr);
 	refreshed.result = refreshed.outputFile;
 	return { record: refreshed, changed: true };
 }
@@ -907,37 +970,7 @@ function startChild(
 	}
 	lifelines.set(record.id, lifeline);
 
-	// Monitor stdout for terminal provider errors (e.g. HTTP 402).
-	// When stopReason==="error" is emitted, the child Pi process may
-	// stay alive indefinitely. Kill it so the close handler finalizes
-	// the record promptly.
-	let terminalErrorText: string | undefined;
-	let errorTimer: NodeJS.Timeout | undefined;
-	child.stdout.on("data", (chunk: Buffer) => {
-		// Write to file (replaces pipe).
-		stdoutStream.write(chunk);
-		if (terminalErrorText) return;
-		const text = chunk.toString("utf-8");
-		if (/"stopReason"\s*:\s*"error"/.test(text)) {
-			const errMatch = text.match(/"errorMessage"\s*:\s*"([^"]+)"/);
-			terminalErrorText = errMatch?.[1] ?? "Provider error";
-			if (!record.error) {
-				record.error = terminalErrorText;
-			}
-			errorTimer = setTimeout(() => {
-				errorTimer = undefined;
-				if (child.exitCode === null && child.signalCode === null) {
-					child.kill("SIGTERM");
-					setTimeout(() => {
-						if (child.exitCode === null && child.signalCode === null) {
-							child.kill("SIGKILL");
-						}
-					}, 1000).unref();
-				}
-			}, 1000);
-			errorTimer.unref();
-		}
-	});
+	child.stdout.pipe(stdoutStream);
 	child.stderr.pipe(stderrStream);
 
 	const done = new Promise<PersistedSubagentRecord>((resolve) => {
@@ -950,12 +983,6 @@ function startChild(
 			if (finalized) return;
 			finalized = true;
 
-			// Clear error-detection timer if still pending.
-			if (errorTimer) {
-				clearTimeout(errorTimer);
-				errorTimer = undefined;
-			}
-
 			await Promise.all([
 				new Promise<void>((r) => stdoutStream.end(r)),
 				new Promise<void>((r) => stderrStream.end(r)),
@@ -966,55 +993,25 @@ function startChild(
 			closeLifeline(record.id);
 			cleanupTempDir(built.tempDir);
 
-			const stdout = fs.existsSync(record.stdoutFile)
-				? fs.readFileSync(record.stdoutFile, "utf-8")
-				: "";
-			const stderr = fs.existsSync(record.stderrFile)
-				? fs.readFileSync(record.stderrFile, "utf-8")
-				: "";
-
 			record.running = false;
 			record.completedAt = Date.now();
 			record.updatedAt = Date.now();
 
-			// Only assign a code-based error for actual non-zero exit
-			// codes (not null signals) and when we don't already have
-			// a provider error from stdout monitoring.
-			if (code !== null && code !== 0 && !record.error)
+			const stderr = readRecoveryFile(record.stderrFile, "child stderr");
+			if (code !== null && code !== 0 && !record.error) {
 				record.error =
-					stderr.trim() ||
+					stderr.text.trim() ||
+					stderr.issue ||
 					`Subagent exited with code ${code}${signal ? ` (${signal})` : ""}`;
-
-			// Check if subagent already wrote to result file
-			const hasExistingResult =
-				record.outputFile &&
-				fs.existsSync(record.outputFile) &&
-				fs.readFileSync(record.outputFile, "utf-8").trim().length > 0;
-
-			if (!hasExistingResult) {
-				// Subagent did not write to result file — auto-save final output
-				const finalOutput = extractFinalOutput(stdout);
-				// When we have a provider error captured from stdout
-			// monitoring, use the (error) fallback.
-			if (record.error && record.outputFile) {
-				fs.writeFileSync(record.outputFile, "(error)\n", { mode: 0o600 });
-			} else if (finalOutput && record.outputFile) {
-					fs.writeFileSync(record.outputFile, `${finalOutput}\n`, {
-						mode: 0o600,
-					});
-				} else if (stderr.trim()) {
-					// Subagent produced only stderr, no stdout output.
-					if (!record.error) record.error = stderr.trim();
-					if (record.outputFile) {
-						fs.writeFileSync(record.outputFile, "(error)\n", { mode: 0o600 });
-					}
-				} else if (record.outputFile) {
-					// Edge case: neither stdout nor stderr produced content.
-					fs.writeFileSync(record.outputFile, "(no output)\n", { mode: 0o600 });
-				}
 			}
+
+			ensureResultFile(record, stderr);
 			record.result = record.outputFile;
-			recordDiscoveredSessionFile(record);
+			try {
+				recordDiscoveredSessionFile(record);
+			} catch {
+				// Session-file discovery is best-effort after terminal persistence.
+			}
 
 			upsertRecord(record);
 

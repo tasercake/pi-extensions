@@ -65,9 +65,9 @@ export function buildPiArgs(input: BuildPiArgsInput): BuildPiArgsResult {
 
 	if (input.model) args.push("--model", input.model);
 
-	// Use JSON mode so child output is machine-parseable for error
-	// detection and result extraction.
-	args.push("--mode", "json");
+	// Child stdout is only a fallback for the final answer. Full JSON event
+	// streams repeat cumulative message state and can grow to hundreds of MB.
+	args.push("--print");
 
 	// Add only the minimal runtime extension. Do not disable normal extensions,
 	// skills, tools, MCP direct tools, or project context.
