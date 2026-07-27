@@ -16,10 +16,7 @@ export class CappedLogWriter extends Writable {
 	private remaining: number;
 	private truncated = false;
 
-	constructor(
-		filePath: string,
-		private readonly maxBytes: number,
-	) {
+	constructor(filePath: string, maxBytes: number) {
 		super();
 		if (!Number.isSafeInteger(maxBytes) || maxBytes < 0) {
 			throw new Error(`maxBytes must be a non-negative safe integer: ${maxBytes}`);
