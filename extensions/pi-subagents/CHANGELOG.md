@@ -14,6 +14,7 @@
 ### Added
 
 ### Fixed
+- Run minimal child subagents in print mode instead of persisting cumulative JSON streaming events, and bound legacy output recovery so oversized logs cannot exceed V8's string limit.
 - Prevent the parent-death lifeline watcher from keeping successfully settled subagents alive indefinitely.
 
 ## [0.24.2] - 2026-05-10

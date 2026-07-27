@@ -478,6 +478,8 @@ test("child pi args do not restrict tools skills extensions or MCP", () => {
 	assert(!built.args.includes("--tools"));
 	assert.equal(built.env.MCP_DIRECT_TOOLS, undefined);
 	assert(built.args.includes("--extension"));
+	assert(built.args.includes("--print"));
+	assert.equal(built.args.includes("--mode"), false);
 });
 
 test("buildPiArgs supports sessionId with sessionDir", () => {
@@ -834,6 +836,31 @@ test("auto-saves final assistant message to result file when subagent does not w
 		await waitForPersistedRecord(sessionId, result.details.id);
 		const content = fs.readFileSync(result.details.resultPath, "utf-8");
 		assert.match(content, /auto-saved output/);
+	} finally {
+		mockPi.uninstall();
+		cleanupTestCtx(ctx, sessionId);
+	}
+});
+
+test("auto-saves a print-mode answer that is valid JSON", async () => {
+	const mockPi = createMockPi();
+	mockPi.install();
+	mockPi.onCall({ output: '{"ok":true}', exitCode: 0 });
+	const { sessionId, ctx } = makeTestCtx("pi-subagents-autosave-json-text");
+	const { spawnTool } = registerTestTools(() => {});
+	try {
+		const result = await spawnTool.execute(
+			"autosave-json-child",
+			{ task: "return JSON" },
+			new AbortController().signal,
+			undefined,
+			ctx,
+		);
+		await waitForPersistedRecord(sessionId, result.details.id);
+		assert.equal(
+			fs.readFileSync(result.details.resultPath, "utf-8"),
+			'{"ok":true}\n',
+		);
 	} finally {
 		mockPi.uninstall();
 		cleanupTestCtx(ctx, sessionId);
@@ -1776,6 +1803,28 @@ test("cohort: reconcile preserves cohort metadata", async () => {
 	}
 });
 
+test("reconcile never reads an oversized legacy stdout log into a string", async () => {
+	const { sessionId, ctx } = makeTestCtx("pi-subagents-oversized-stdout");
+	const fake = makeFakeCtx(sessionId, ctx.cwd, false);
+	const dir = path.join(sessionId, "subagents", "oversized-a");
+	fs.mkdirSync(dir, { recursive: true });
+	const record = { id: "oversized-a", parentSessionId: sessionId, cwd: ctx.cwd, taskPreview: "x", running: true, outputFile: path.join(dir, "result.log"), stdoutFile: path.join(dir, "stdout.log"), stderrFile: path.join(dir, "stderr.log"), createdAt: Date.now(), updatedAt: Date.now() };
+	fs.writeFileSync(record.stdoutFile, "");
+	fs.truncateSync(record.stdoutFile, 16 * 1024 * 1024 + 1);
+	fs.writeFileSync(record.stderrFile, "");
+	fs.writeFileSync(storeFile(sessionId), JSON.stringify({ records: [record] }, null, 2));
+	const { handlers } = registerTestTools(() => {});
+	try {
+		await handlers.get("session_start")(undefined, fake.ctx);
+		const persisted = readPersistedRecord(sessionId, "oversized-a");
+		assert.equal(persisted.running, false);
+		assert.match(persisted.error, /exceeds the 16777216-byte recovery limit/);
+		assert.equal(fs.readFileSync(record.outputFile, "utf-8"), "(error)\n");
+	} finally {
+		cleanupTestCtx(ctx, sessionId);
+	}
+});
+
 // ── Lifeline: process-death cascade via anonymous pipe ──
 
 import { PI_SUBAGENT_LIFELINE_FD } from "../../src/runs/shared/subagent-prompt-runtime.ts";
@@ -2225,16 +2274,14 @@ test("model inheritance: explicit model overrides inherited model", async () => 
 
 // ── Bug: fatal-error lifecycle ──
 
-test("error lifecycle: provider error marks child failed promptly", async () => {
+test("error lifecycle: provider runtime failure marks child failed promptly", async () => {
 	const mockPi = createMockPi();
 	mockPi.install();
-	// Simulate an HTTP 402 payment-required error where child stays alive
+	// The child prompt runtime turns terminal provider failures into stderr and
+	// a non-zero exit; its prompt lifecycle behavior is tested separately above.
 	mockPi.onCall({
-		output: "payment required",
-		stopReason: "error",
-		errorMessage: "HTTP 402 Payment Required",
-		exitCode: 0,
-		keepAliveAfterFinalMessageMs: 20_000, // would hang for 20s
+		stderr: "HTTP 402 Payment Required\n",
+		exitCode: 1,
 	});
 
 	const { sessionId, ctx } = makeTestCtx("pi-subagents-error-lifecycle");
@@ -2249,7 +2296,6 @@ test("error lifecycle: provider error marks child failed promptly", async () => 
 			ctx,
 		);
 
-		// Wait up to 10s: 1s error-detection grace + SIGTERM + process exit.
 		let record: Record<string, any> | undefined;
 		for (let i = 0; i < 200; i++) {
 			record = readPersistedRecord(sessionId, result.details.id);
@@ -2281,10 +2327,8 @@ test("error lifecycle: no duplicate completion notification on provider error", 
 	const mockPi = createMockPi();
 	mockPi.install();
 	mockPi.onCall({
-		output: "payment required",
-		stopReason: "error",
-		errorMessage: "HTTP 402 Payment Required",
-		exitCode: 0,
+		stderr: "HTTP 402 Payment Required\n",
+		exitCode: 1,
 	});
 
 	const { sessionId, ctx } = makeTestCtx("pi-subagents-error-dedup");
@@ -2347,11 +2391,8 @@ test("error lifecycle: lifeline cleanup unchanged after provider error", async (
 	const mockPi = createMockPi();
 	mockPi.install();
 	mockPi.onCall({
-		output: "payment required",
-		stopReason: "error",
-		errorMessage: "HTTP 402 Payment Required",
-		exitCode: 0,
-		keepAliveAfterFinalMessageMs: 30_000,
+		stderr: "HTTP 402 Payment Required\n",
+		exitCode: 1,
 	});
 
 	const { sessionId, ctx } = makeTestCtx("pi-subagents-error-lifeline");
@@ -2369,7 +2410,6 @@ test("error lifecycle: lifeline cleanup unchanged after provider error", async (
 			ctx,
 		);
 
-		// Wait up to 10s for error detection + kill.
 		let record: Record<string, any> | undefined;
 		for (let i = 0; i < 200; i++) {
 			record = readPersistedRecord(sessionId, result.details.id);
