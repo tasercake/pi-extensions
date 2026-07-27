@@ -15,6 +15,7 @@ import registerSubagentPromptRuntime, {
 	rewriteSubagentPrompt,
 	SUBAGENT_RESULT_PATH_ENV,
 } from "../../src/runs/shared/subagent-prompt-runtime.ts";
+import { CappedLogWriter } from "../../src/runs/shared/capped-log.ts";
 import { buildPiArgs } from "../../src/runs/shared/pi-args.ts";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -271,6 +272,7 @@ function makeFakeCtx(sessionId: string, cwd: string, hasUI: boolean) {
 function runPromptRuntimeTerminalMessage(
 	stopReason: "stop" | "error" | "aborted",
 	errorMessage?: string,
+	options: { content?: unknown[]; resultPath?: string } = {},
 ) {
 	const runtimePath = path.join(
 		projectRoot,
@@ -283,19 +285,22 @@ function runPromptRuntimeTerminalMessage(
 		import registerRuntime from ${JSON.stringify(runtimePath)};
 		let messageEnd;
 		let agentSettled;
+		let sessionShutdown;
 		registerRuntime({
 			on(event, handler) {
 				if (event === "message_end") messageEnd = handler;
 				if (event === "agent_settled") agentSettled = handler;
+				if (event === "session_shutdown") sessionShutdown = handler;
 			},
 		});
 		if (!messageEnd) throw new Error("message_end handler was not registered");
 		if (!agentSettled) throw new Error("agent_settled handler was not registered");
+		if (!sessionShutdown) throw new Error("session_shutdown handler was not registered");
 		await messageEnd({
 			type: "message_end",
 			message: {
 				role: "assistant",
-				content: [],
+				content: ${JSON.stringify(options.content ?? [])},
 				provider: "test-provider",
 				model: "test-model",
 				stopReason: ${JSON.stringify(stopReason)},
@@ -306,6 +311,7 @@ function runPromptRuntimeTerminalMessage(
 		if (${JSON.stringify(stopReason)} === "error") {
 			setInterval(() => {}, 60_000);
 		} else {
+			await sessionShutdown({ type: "session_shutdown", reason: "quit" });
 			setTimeout(() => process.exit(0), 30);
 		}
 	`;
@@ -316,7 +322,13 @@ function runPromptRuntimeTerminalMessage(
 			cwd: projectRoot,
 			encoding: "utf-8",
 			timeout: 1500,
-			env: { ...process.env, PI_NO_COLOR: "1" },
+			env: {
+				...process.env,
+				PI_NO_COLOR: "1",
+				...(options.resultPath
+					? { PI_SUBAGENT_RESULT_PATH: options.resultPath }
+					: {}),
+			},
 		},
 	);
 }
@@ -343,6 +355,53 @@ test("prompt runtime leaves successful terminal messages successful", () => {
 	const result = runPromptRuntimeTerminalMessage("stop");
 	assert.equal(result.status, 0, result.stderr || result.stdout);
 	assert.equal(result.stderr, "");
+});
+
+test("prompt runtime atomically saves the final assistant text on shutdown", () => {
+	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagent-runtime-result-"));
+	const resultPath = path.join(dir, "result.log");
+	try {
+		const result = runPromptRuntimeTerminalMessage("stop", undefined, {
+			content: [{ type: "text", text: "durable child result" }],
+			resultPath,
+		});
+		assert.equal(result.status, 0, result.stderr || result.stdout);
+		assert.equal(fs.readFileSync(resultPath, "utf-8"), "durable child result\n");
+	} finally {
+		fs.rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("prompt runtime preserves an explicitly written result", () => {
+	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagent-runtime-preserve-"));
+	const resultPath = path.join(dir, "result.log");
+	fs.writeFileSync(resultPath, "explicit result\n", { mode: 0o600 });
+	try {
+		const result = runPromptRuntimeTerminalMessage("stop", undefined, {
+			content: [{ type: "text", text: "fallback result" }],
+			resultPath,
+		});
+		assert.equal(result.status, 0, result.stderr || result.stdout);
+		assert.equal(fs.readFileSync(resultPath, "utf-8"), "explicit result\n");
+	} finally {
+		fs.rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("prompt runtime persists an error result before provider-failure exit", () => {
+	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagent-runtime-error-"));
+	const resultPath = path.join(dir, "result.log");
+	try {
+		const result = runPromptRuntimeTerminalMessage(
+			"error",
+			"HTTP 402: provider credits exhausted",
+			{ resultPath },
+		);
+		assert.equal(result.status, 1, result.stderr || result.stdout);
+		assert.equal(fs.readFileSync(resultPath, "utf-8"), "(error)\n");
+	} finally {
+		fs.rmSync(dir, { recursive: true, force: true });
+	}
 });
 
 test("prompt runtime prepends exactly one line and preserves content", () => {
@@ -480,6 +539,30 @@ test("child pi args do not restrict tools skills extensions or MCP", () => {
 	assert(built.args.includes("--extension"));
 	assert(built.args.includes("--print"));
 	assert.equal(built.args.includes("--mode"), false);
+});
+
+test("capped log writer consumes excess output without exceeding its byte cap", async () => {
+	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagent-capped-log-"));
+	const logPath = path.join(dir, "stdout.log");
+	try {
+		const writer = new CappedLogWriter(logPath, 64);
+		await new Promise<void>((resolve, reject) => {
+			writer.once("error", reject);
+			writer.end(Buffer.alloc(256, 0x61), resolve);
+		});
+		const content = fs.readFileSync(logPath);
+		assert.equal(content.length, 64);
+		assert.match(content.toString("utf8"), /pi-subagents log truncated/);
+
+		const appended = new CappedLogWriter(logPath, 64);
+		await new Promise<void>((resolve, reject) => {
+			appended.once("error", reject);
+			appended.end("more data", resolve);
+		});
+		assert.equal(fs.statSync(logPath).size, 64);
+	} finally {
+		fs.rmSync(dir, { recursive: true, force: true });
+	}
 });
 
 test("buildPiArgs supports sessionId with sessionDir", () => {
@@ -1818,8 +1901,60 @@ test("reconcile never reads an oversized legacy stdout log into a string", async
 		await handlers.get("session_start")(undefined, fake.ctx);
 		const persisted = readPersistedRecord(sessionId, "oversized-a");
 		assert.equal(persisted.running, false);
-		assert.match(persisted.error, /exceeds the 16777216-byte recovery limit/);
-		assert.equal(fs.readFileSync(record.outputFile, "utf-8"), "(error)\n");
+		assert.equal(persisted.error, undefined);
+		assert.equal(fs.readFileSync(record.outputFile, "utf-8"), "(no output)\n");
+		assert.equal(fs.statSync(record.stdoutFile).size, 16 * 1024 * 1024 + 1);
+	} finally {
+		cleanupTestCtx(ctx, sessionId);
+	}
+});
+
+test("reconcile compacts oversized legacy stdout after preserving an existing result", async () => {
+	const { sessionId, ctx } = makeTestCtx("pi-subagents-compact-stdout");
+	const fake = makeFakeCtx(sessionId, ctx.cwd, false);
+	const dir = path.join(sessionId, "subagents", "compact-a");
+	fs.mkdirSync(dir, { recursive: true });
+	const record = { id: "compact-a", parentSessionId: sessionId, cwd: ctx.cwd, taskPreview: "x", running: true, outputFile: path.join(dir, "result.log"), stdoutFile: path.join(dir, "stdout.log"), stderrFile: path.join(dir, "stderr.log"), createdAt: Date.now(), updatedAt: Date.now() };
+	fs.writeFileSync(record.outputFile, "preserved result\n");
+	fs.writeFileSync(record.stdoutFile, "");
+	fs.truncateSync(record.stdoutFile, 16 * 1024 * 1024 + 1);
+	fs.writeFileSync(record.stderrFile, "");
+	fs.writeFileSync(storeFile(sessionId), JSON.stringify({ records: [record] }, null, 2));
+	const { handlers } = registerTestTools(() => {});
+	try {
+		await handlers.get("session_start")(undefined, fake.ctx);
+		assert.equal(fs.readFileSync(record.outputFile, "utf-8"), "preserved result\n");
+		assert.match(
+			fs.readFileSync(record.stdoutFile, "utf-8"),
+			/legacy stdout compacted.*16777217/,
+		);
+	} finally {
+		cleanupTestCtx(ctx, sessionId);
+	}
+});
+
+test("reconcile streams a large child session and recovers its final assistant message", async () => {
+	const { sessionId, ctx } = makeTestCtx("pi-subagents-stream-session");
+	const fake = makeFakeCtx(sessionId, ctx.cwd, false);
+	const dir = path.join(sessionId, "subagents", "stream-a");
+	fs.mkdirSync(dir, { recursive: true });
+	const sessionFile = path.join(dir, "2026-01-01T00-00-00-000Z_stream-a.jsonl");
+	fs.writeFileSync(sessionFile, Buffer.alloc(16 * 1024 * 1024 + 1, 0x78));
+	fs.appendFileSync(
+		sessionFile,
+		`\n${JSON.stringify({ type: "message", message: { role: "assistant", content: [{ type: "text", text: "recovered final answer" }] } })}\n`,
+	);
+	const record = { id: "stream-a", parentSessionId: sessionId, cwd: ctx.cwd, taskPreview: "x", running: true, sessionDir: dir, outputFile: path.join(dir, "result.log"), stdoutFile: path.join(dir, "stdout.log"), stderrFile: path.join(dir, "stderr.log"), createdAt: Date.now(), updatedAt: Date.now() };
+	fs.writeFileSync(record.stdoutFile, "unused stdout");
+	fs.writeFileSync(record.stderrFile, "");
+	fs.writeFileSync(storeFile(sessionId), JSON.stringify({ records: [record] }, null, 2));
+	const { handlers } = registerTestTools(() => {});
+	try {
+		await handlers.get("session_start")(undefined, fake.ctx);
+		const persisted = readPersistedRecord(sessionId, "stream-a");
+		assert.equal(persisted.running, false);
+		assert.equal(persisted.error, undefined);
+		assert.equal(fs.readFileSync(record.outputFile, "utf-8"), "recovered final answer\n");
 	} finally {
 		cleanupTestCtx(ctx, sessionId);
 	}

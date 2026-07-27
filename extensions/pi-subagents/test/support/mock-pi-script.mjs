@@ -170,6 +170,46 @@ function writeResponseEntries(entries, jsonMode) {
 	}
 }
 
+function responseEntries(response) {
+	if (Array.isArray(response.steps)) {
+		return response.steps.flatMap((step) =>
+			Array.isArray(step?.jsonl) ? step.jsonl : [],
+		);
+	}
+	return Array.isArray(response.jsonl) ? response.jsonl : [];
+}
+
+function persistPromptRuntimeResult(response) {
+	const resultPath = process.env.PI_SUBAGENT_RESULT_PATH?.trim();
+	if (!resultPath) return;
+	try {
+		if (fs.statSync(resultPath).size > 0) return;
+	} catch {}
+
+	const entries = responseEntries(response);
+	const providerFailed =
+		response.stopReason === "error" ||
+		entries.some(
+			(entry) =>
+				entry?.type === "message_end" &&
+				entry.message?.role === "assistant" &&
+				entry.message?.stopReason === "error",
+		);
+	let output = "";
+	if (!providerFailed) {
+		if (typeof response.output === "string") output = response.output;
+		for (const entry of entries) {
+			const text = extractPlainText(entry);
+			if (text) output = text;
+		}
+	}
+	if (!providerFailed && !output) return;
+	fs.mkdirSync(path.dirname(resultPath), { recursive: true });
+	fs.writeFileSync(resultPath, providerFailed ? "(error)\n" : `${output}\n`, {
+		mode: 0o600,
+	});
+}
+
 async function main() {
 	if (!queueDir) fail("MOCK_PI_QUEUE_DIR is required.");
 	if (!fs.existsSync(queueDir))
@@ -229,6 +269,8 @@ async function main() {
 	if (typeof response.stderr === "string" && response.stderr.length > 0) {
 		process.stderr.write(response.stderr);
 	}
+
+	persistPromptRuntimeResult(response);
 
 	if (
 		typeof response.keepAliveAfterFinalMessageMs === "number" &&
