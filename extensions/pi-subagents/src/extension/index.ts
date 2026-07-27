@@ -6,6 +6,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { Writable } from "node:stream";
+import { finished } from "node:stream/promises";
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 import type {
 	ExtensionAPI,
@@ -18,9 +19,17 @@ import {
 	getSubagentDepthEnv,
 	resolveCurrentMaxSubagentDepth,
 } from "../shared/types.ts";
+import {
+	CappedLogWriter,
+	STDERR_LOG_MAX_BYTES,
+	STDOUT_LOG_MAX_BYTES,
+} from "../runs/shared/capped-log.ts";
 import { getPiSpawnCommand } from "../runs/shared/pi-spawn.ts";
 import { buildPiArgs, cleanupTempDir } from "../runs/shared/pi-args.ts";
-import { PI_SUBAGENT_LIFELINE_FD } from "../runs/shared/subagent-prompt-runtime.ts";
+
+// Keep this child-runtime environment key local. Importing the prompt runtime
+// here would execute its child-only fd watcher in the parent extension process.
+const PI_SUBAGENT_LIFELINE_FD = "PI_SUBAGENT_LIFELINE_FD";
 import {
 	SpawnSubagentParams,
 	type SpawnSubagentParamsLike,
@@ -245,31 +254,8 @@ function extractTextFromMessageContent(content: unknown): string {
 		.join("\n");
 }
 
-function extractFinalOutput(stdout: string): string {
-	const rawLines: string[] = [];
-	let lastAssistant = "";
-	for (const line of stdout.split("\n")) {
-		if (!line.trim()) continue;
-		try {
-			const event = JSON.parse(line) as {
-				type?: string;
-				message?: { role?: string; content?: unknown; errorMessage?: string };
-			};
-			if (event.message?.role === "assistant") {
-				const text = extractTextFromMessageContent(event.message.content);
-				if (text.trim()) lastAssistant = text.trim();
-			} else if (!event.type) {
-				// Print-mode answers may themselves be valid JSON.
-				rawLines.push(line);
-			}
-		} catch {
-			rawLines.push(line);
-		}
-	}
-	return lastAssistant || rawLines.join("\n").trim();
-}
-
-const MAX_RECOVERY_FILE_BYTES = 16 * 1024 * 1024;
+const SESSION_READ_CHUNK_BYTES = 64 * 1024;
+const MAX_SESSION_LINE_BYTES = 16 * 1024 * 1024;
 
 function hasNonEmptyFile(filePath: string | undefined): boolean {
 	if (!filePath) return false;
@@ -280,17 +266,17 @@ function hasNonEmptyFile(filePath: string | undefined): boolean {
 	}
 }
 
-function readRecoveryFile(
+function readDiagnosticFile(
 	filePath: string | undefined,
 	label: string,
 ): { text: string; issue?: string } {
 	if (!filePath) return { text: "" };
 	try {
 		const size = fs.statSync(filePath).size;
-		if (size > MAX_RECOVERY_FILE_BYTES) {
+		if (size > STDERR_LOG_MAX_BYTES) {
 			return {
 				text: "",
-				issue: `${label} exceeds the ${MAX_RECOVERY_FILE_BYTES}-byte recovery limit: ${filePath}`,
+				issue: `${label} exceeds the ${STDERR_LOG_MAX_BYTES}-byte diagnostic limit: ${filePath}`,
 			};
 		}
 		return { text: fs.readFileSync(filePath, "utf-8") };
@@ -307,26 +293,105 @@ function readRecoveryFile(
 	}
 }
 
+function assistantOutputFromSessionLine(line: Buffer): string {
+	if (line.length === 0) return "";
+	try {
+		const event = JSON.parse(line.toString("utf8")) as {
+			message?: { role?: string; content?: unknown };
+		};
+		if (event.message?.role !== "assistant") return "";
+		return extractTextFromMessageContent(event.message.content).trim();
+	} catch {
+		return "";
+	}
+}
+
 function recoverFinalOutput(record: PersistedSubagentRecord): {
 	output: string;
 	issue?: string;
 } {
 	try {
 		recordDiscoveredSessionFile(record);
-	} catch {
-		// Discovery is best-effort; stdout remains the compatibility fallback.
+	} catch (error) {
+		return {
+			output: "",
+			issue: `Could not discover child session: ${error instanceof Error ? error.message : String(error)}`,
+		};
 	}
+	if (!record.sessionFile) return { output: "" };
+
+	let fd: number | undefined;
+	let lastAssistant = "";
 	let issue: string | undefined;
-	for (const [filePath, label] of [
-		[record.sessionFile, "child session"],
-		[record.stdoutFile, "child stdout"],
-	] as const) {
-		const recovered = readRecoveryFile(filePath, label);
-		issue ??= recovered.issue;
-		const output = extractFinalOutput(recovered.text);
-		if (output) return { output };
+	let pieces: Buffer[] = [];
+	let pendingBytes = 0;
+	let droppingOversizedLine = false;
+	const chunk = Buffer.allocUnsafe(SESSION_READ_CHUNK_BYTES);
+
+	const append = (part: Buffer) => {
+		if (part.length === 0 || droppingOversizedLine) return;
+		if (pendingBytes + part.length > MAX_SESSION_LINE_BYTES) {
+			droppingOversizedLine = true;
+			pieces = [];
+			pendingBytes = 0;
+			issue ??= `Child session contains a line larger than ${MAX_SESSION_LINE_BYTES} bytes: ${record.sessionFile}`;
+			return;
+		}
+		pieces.push(Buffer.from(part));
+		pendingBytes += part.length;
+	};
+	const finishLine = () => {
+		if (!droppingOversizedLine) {
+			const output = assistantOutputFromSessionLine(Buffer.concat(pieces, pendingBytes));
+			if (output) lastAssistant = output;
+		}
+		pieces = [];
+		pendingBytes = 0;
+		droppingOversizedLine = false;
+	};
+
+	try {
+		fd = fs.openSync(record.sessionFile, "r");
+		for (;;) {
+			const bytesRead = fs.readSync(fd, chunk, 0, chunk.length, null);
+			if (bytesRead === 0) break;
+			let start = 0;
+			for (let index = 0; index < bytesRead; index += 1) {
+				if (chunk[index] !== 0x0a) continue;
+				append(chunk.subarray(start, index));
+				finishLine();
+				start = index + 1;
+			}
+			append(chunk.subarray(start, bytesRead));
+		}
+		if (pendingBytes > 0 || droppingOversizedLine) finishLine();
+	} catch (error) {
+		issue = `Could not stream child session ${record.sessionFile}: ${error instanceof Error ? error.message : String(error)}`;
+	} finally {
+		if (fd !== undefined) {
+			try {
+				fs.closeSync(fd);
+			} catch {
+				// Recovery file cleanup is best-effort.
+			}
+		}
 	}
-	return { output: "", issue };
+	return { output: lastAssistant, issue };
+}
+
+function compactLegacyStdout(record: PersistedSubagentRecord): void {
+	if (!record.stdoutFile || !hasNonEmptyFile(record.outputFile)) return;
+	try {
+		const size = fs.statSync(record.stdoutFile).size;
+		if (size <= STDOUT_LOG_MAX_BYTES) return;
+		fs.writeFileSync(
+			record.stdoutFile,
+			`[legacy stdout compacted after result recovery; original bytes: ${size}]\n`,
+			{ mode: 0o600 },
+		);
+	} catch {
+		// Legacy diagnostic cleanup must not change the recovered result state.
+	}
 }
 
 function ensureResultFile(
@@ -335,10 +400,12 @@ function ensureResultFile(
 ): void {
 	if (!record.outputFile || hasNonEmptyFile(record.outputFile)) return;
 	try {
-		const recovered = recoverFinalOutput(record);
 		if (record.error) {
 			fs.writeFileSync(record.outputFile, "(error)\n", { mode: 0o600 });
-		} else if (recovered.output) {
+			return;
+		}
+		const recovered = recoverFinalOutput(record);
+		if (recovered.output) {
 			fs.writeFileSync(record.outputFile, `${recovered.output}\n`, {
 				mode: 0o600,
 			});
@@ -369,8 +436,10 @@ function refreshRecord(record: PersistedSubagentRecord): {
 	refreshed.updatedAt = Date.now();
 	refreshed.completedAt ??= Date.now();
 
-	const stderr = readRecoveryFile(refreshed.stderrFile, "child stderr");
+	const hadExistingResult = hasNonEmptyFile(refreshed.outputFile);
+	const stderr = readDiagnosticFile(refreshed.stderrFile, "child stderr");
 	ensureResultFile(refreshed, stderr);
+	if (hadExistingResult || refreshed.sessionFile) compactLegacyStdout(refreshed);
 	refreshed.result = refreshed.outputFile;
 	return { record: refreshed, changed: true };
 }
@@ -915,15 +984,25 @@ function startChild(
 	}
 
 	let child: ChildProcess;
-	let stdoutStream: fs.WriteStream;
-	let stderrStream: fs.WriteStream;
+	let stdoutStream: CappedLogWriter | undefined;
+	let stderrStream: CappedLogWriter | undefined;
 	const built = buildArgsForRecord(ctx, record, task);
 
 	try {
 		upsertRecord(record);
 		const spawnSpec = getPiSpawnCommand(built.args);
-		stdoutStream = fs.createWriteStream(record.stdoutFile, { flags: "a" });
-		stderrStream = fs.createWriteStream(record.stderrFile, { flags: "a" });
+		stdoutStream = new CappedLogWriter(
+			record.stdoutFile,
+			STDOUT_LOG_MAX_BYTES,
+		);
+		stderrStream = new CappedLogWriter(
+			record.stderrFile,
+			STDERR_LOG_MAX_BYTES,
+		);
+		// Log failures are collected during finalization instead of becoming
+		// uncaught stream errors that bypass terminal record persistence.
+		stdoutStream.on("error", () => {});
+		stderrStream.on("error", () => {});
 		const env = {
 			...process.env,
 			...built.env,
@@ -939,6 +1018,8 @@ function startChild(
 			env,
 		});
 	} catch (error) {
+		stdoutStream?.destroy();
+		stderrStream?.destroy();
 		record.running = false;
 		record.error = error instanceof Error ? error.message : String(error);
 		record.completedAt = Date.now();
@@ -952,6 +1033,12 @@ function startChild(
 			),
 		};
 	}
+
+	if (!stdoutStream || !stderrStream) {
+		throw new Error("Subagent log streams were not created.");
+	}
+	const stdoutLog = stdoutStream;
+	const stderrLog = stderrStream;
 
 	record.pid = child.pid;
 	record.running = true;
@@ -970,8 +1057,10 @@ function startChild(
 	}
 	lifelines.set(record.id, lifeline);
 
-	child.stdout.pipe(stdoutStream);
-	child.stderr.pipe(stderrStream);
+	stdoutLog.on("error", () => child.stdout?.resume());
+	stderrLog.on("error", () => child.stderr?.resume());
+	child.stdout.pipe(stdoutLog);
+	child.stderr.pipe(stderrLog);
 
 	const done = new Promise<PersistedSubagentRecord>((resolve) => {
 		let finalized = false;
@@ -983,10 +1072,21 @@ function startChild(
 			if (finalized) return;
 			finalized = true;
 
-			await Promise.all([
-				new Promise<void>((r) => stdoutStream.end(r)),
-				new Promise<void>((r) => stderrStream.end(r)),
-			]);
+			if (!stdoutLog.writableEnded) stdoutLog.end();
+			if (!stderrLog.writableEnded) stderrLog.end();
+			const logIssues = await Promise.all(
+				([
+					[stdoutLog, "stdout"],
+					[stderrLog, "stderr"],
+				] as const).map(async ([stream, label]) => {
+					try {
+						await finished(stream);
+						return undefined;
+					} catch (error) {
+						return `Could not persist child ${label} log: ${error instanceof Error ? error.message : String(error)}`;
+					}
+				}),
+			);
 
 			runningChildren.delete(record.id);
 			// Release the lifeline on normal child completion.
@@ -996,8 +1096,9 @@ function startChild(
 			record.running = false;
 			record.completedAt = Date.now();
 			record.updatedAt = Date.now();
+			record.error ??= logIssues.find((issue) => issue !== undefined);
 
-			const stderr = readRecoveryFile(record.stderrFile, "child stderr");
+			const stderr = readDiagnosticFile(record.stderrFile, "child stderr");
 			if (code !== null && code !== 0 && !record.error) {
 				record.error =
 					stderr.text.trim() ||
@@ -1132,8 +1233,8 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 				renderRunningWidget(ctx, parentId);
 				scheduleWidgetRefresh(parentId);
 			}
-			// Headless/JSON mode: parent process stays alive naturally because
-			// child stdout/stderr pipes to fs.WriteStream keep Node's event loop alive.
+			// Headless/print mode: parent process stays alive naturally because
+			// child stdout/stderr pipes to capped log writers keep Node's event loop alive.
 			// When all children complete, event loop drains and process exits naturally.
 			// IMPORTANT: assumes Pi does NOT call process.exit() after agent_end in
 			// headless mode. If that changes, extension needs explicit ref-counting.

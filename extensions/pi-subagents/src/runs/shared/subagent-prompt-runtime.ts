@@ -1,5 +1,7 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import * as fs from "node:fs";
 import { Socket } from "node:net";
+import * as path from "node:path";
 
 export const SUBAGENT_INTERCOM_SESSION_NAME_ENV =
 	"PI_SUBAGENT_INTERCOM_SESSION_NAME";
@@ -19,6 +21,48 @@ const RESULT_PATH_ALIASES = new Set([
 	"${PI_SUBAGENT_RESULT_PATH}",
 ]);
 const FILE_TOOL_NAMES = new Set(["write", "edit", "read"]);
+
+function extractAssistantText(content: unknown): string {
+	if (typeof content === "string") return content.trim();
+	if (!Array.isArray(content)) return "";
+	return content
+		.map((part) => {
+			if (!part || typeof part !== "object") return "";
+			const value = part as { type?: unknown; text?: unknown; content?: unknown };
+			if (value.type === "text" && typeof value.text === "string") {
+				return value.text;
+			}
+			if (typeof value.content === "string") return value.content;
+			return "";
+		})
+		.filter(Boolean)
+		.join("\n")
+		.trim();
+}
+
+function hasNonEmptyResult(resultPath: string): boolean {
+	try {
+		return fs.statSync(resultPath).size > 0;
+	} catch {
+		return false;
+	}
+}
+
+function writeResultIfEmpty(resultPath: string, content: string): void {
+	if (!content || hasNonEmptyResult(resultPath)) return;
+	fs.mkdirSync(path.dirname(resultPath), { recursive: true });
+	const temporaryPath = `${resultPath}.${process.pid}.${Date.now()}.tmp`;
+	try {
+		fs.writeFileSync(temporaryPath, content, { mode: 0o600 });
+		if (!hasNonEmptyResult(resultPath)) fs.renameSync(temporaryPath, resultPath);
+	} finally {
+		try {
+			fs.rmSync(temporaryPath, { force: true });
+		} catch {
+			// Atomic result cleanup is best-effort.
+		}
+	}
+}
 
 export function rewriteSubagentPrompt(prompt: string): string {
 	if (prompt.includes(CHILD_SUBAGENT_SYSTEM_LINE)) return prompt;
@@ -56,11 +100,14 @@ setupLifelineWatcher();
 export default function registerSubagentPromptRuntime(pi: ExtensionAPI): void {
 	let settledProviderError: string | undefined;
 	let exitingForProviderError = false;
+	let finalAssistantText = "";
 
 	pi.on("message_end", (event) => {
 		if (event.message.role !== "assistant") return;
 		if (event.message.stopReason !== "error") {
 			settledProviderError = undefined;
+			const text = extractAssistantText(event.message.content);
+			if (text) finalAssistantText = text;
 			return;
 		}
 		settledProviderError =
@@ -71,12 +118,34 @@ export default function registerSubagentPromptRuntime(pi: ExtensionAPI): void {
 	pi.on("agent_settled", () => {
 		if (!settledProviderError || exitingForProviderError) return;
 		exitingForProviderError = true;
+		const resultPath = process.env[SUBAGENT_RESULT_PATH_ENV]?.trim();
+		if (resultPath) {
+			try {
+				writeResultIfEmpty(resultPath, "(error)\n");
+			} catch (error) {
+				process.stderr.write(
+					`Could not persist provider failure result: ${error instanceof Error ? error.message : String(error)}\n`,
+				);
+			}
+		}
 		process.exitCode = 1;
 		process.stderr.write(`${settledProviderError}\n`);
 		// message_end has been persisted and agent_settled guarantees no retry,
 		// compaction, or queued continuation remains. Preserve the provider
 		// failure as a prompt nonzero process exit.
 		setImmediate(() => process.exit(1));
+	});
+
+	pi.on("session_shutdown", () => {
+		const resultPath = process.env[SUBAGENT_RESULT_PATH_ENV]?.trim();
+		if (!resultPath || !finalAssistantText) return;
+		try {
+			writeResultIfEmpty(resultPath, `${finalAssistantText}\n`);
+		} catch (error) {
+			process.stderr.write(
+				`Could not persist final subagent result: ${error instanceof Error ? error.message : String(error)}\n`,
+			);
+		}
 	});
 
 	pi.on("tool_call", (event) => {

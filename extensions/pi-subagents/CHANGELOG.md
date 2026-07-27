@@ -14,8 +14,10 @@
 ### Added
 
 ### Fixed
+- Make `result.log` child-owned and authoritative, stream crash recovery from child session JSONL, cap diagnostic stdout/stderr logs, and remove all result recovery reads from `stdout.log`.
 - Run minimal child subagents in print mode instead of persisting cumulative JSON streaming events, and bound legacy output recovery so oversized logs cannot exceed V8's string limit.
 - Prevent the parent-death lifeline watcher from keeping successfully settled subagents alive indefinitely.
+- Avoid importing the child-only prompt runtime from the parent extension, preventing duplicate lifeline watchers.
 
 ## [0.24.2] - 2026-05-10
 

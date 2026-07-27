@@ -23,7 +23,7 @@ spawn_subagent({
 - The returned ID is also the child Pi session ID and can be used with Pi session lookup/resume behavior.
 - `model` is an explicit override; omitting it inherits the active parent provider/model.
 - Subagents always start with fresh session history. Put any desired context explicitly in `task`.
-- Child subagent directories contain separate `result.log`, `stdout.log`, and `stderr.log` files.
+- Child subagent directories contain separate `result.log`, `stdout.log`, and `stderr.log` files. `result.log` is the authoritative final result; the child session JSONL is the authoritative execution history. Diagnostic stdout and stderr logs are capped at 16 MiB and 4 MiB respectively and are never used as result databases.
 
 Completed children are final. Running children continue their original task until completion or failure. The extension exposes only the spawn tool.
 
@@ -35,7 +35,7 @@ Child Pi sessions keep normal Pi capabilities: tools, skills, extensions, and pr
 You are a Pi subagent controlled by another Pi agent.
 ```
 
-Each child receives a resolved absolute `result.log` path. Pass that literal path to Pi file tools (`write`, `edit`, and `read`), which do not expand shell environment variables. Shell commands and programs may use `$PI_SUBAGENT_RESULT_PATH`; the child runtime also narrowly corrects either exact env-var token when it is accidentally passed as a file-tool path. If the child leaves `result.log` empty, its final assistant message is saved there automatically.
+Each child receives a resolved absolute `result.log` path. Pass that literal path to Pi file tools (`write`, `edit`, and `read`), which do not expand shell environment variables. Shell commands and programs may use `$PI_SUBAGENT_RESULT_PATH`; the child runtime also narrowly corrects either exact env-var token when it is accidentally passed as a file-tool path. If the child leaves `result.log` empty, the child runtime atomically saves its final assistant message during session shutdown. Parent-side crash recovery streams the compact child session JSONL and never reads the complete stdout log into memory.
 
 Children may spawn further subagents recursively until the configured recursion-depth limit is reached.
 
