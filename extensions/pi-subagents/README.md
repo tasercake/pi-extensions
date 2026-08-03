@@ -27,6 +27,10 @@ spawn_subagent({
 
 Completed children are final. Running children continue their original task until completion or failure. The extension exposes only the spawn tool.
 
+## Subagent list
+
+Use `/subagents` or `Ctrl+Shift+S` in TUI mode to open the current session's subagent list. Use Up/Down to navigate, Enter to view read-only details, and Escape to close.
+
 ## Child environment
 
 Child Pi sessions keep normal Pi capabilities: tools, skills, extensions, and project context are not hidden or restricted by this extension. Every child system prompt receives this identity line:
