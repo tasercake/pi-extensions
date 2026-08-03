@@ -13,7 +13,14 @@ import type {
 	ExtensionContext,
 	ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
-import { Text } from "@earendil-works/pi-tui";
+import {
+	Container,
+	Key,
+	matchesKey,
+	type SelectItem,
+	SelectList,
+	Text,
+} from "@earendil-works/pi-tui";
 import {
 	checkSubagentDepth,
 	getSubagentDepthEnv,
@@ -802,7 +809,148 @@ function fitToWidth(text: string, width: number): string {
 }
 
 function sanitizePreview(text: string): string {
-	return text.replace(/[\r\n]+/g, " ").replace(/\s+/g, " ").trim();
+	return text
+		.replace(/\x1b\][^\x07]*(?:\x07|\x1b\\)/g, "")
+		.replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "")
+		.replace(/[\u0000-\u001f\u007f-\u009f]+/g, " ")
+		.replace(/\s+/g, " ")
+		.trim();
+}
+
+type SubagentDisplayStatus = "running" | "completed" | "error" | "timed-out";
+
+function displayStatus(record: PersistedSubagentRecord): SubagentDisplayStatus {
+	if (record.running) return "running";
+	if (record.error && /\b(?:timed?\s*out|timeout)\b/i.test(record.error))
+		return "timed-out";
+	if (record.error) return "error";
+	return "completed";
+}
+
+function elapsedMs(record: PersistedSubagentRecord): number {
+	const end = record.running
+		? Date.now()
+		: (record.completedAt ?? record.updatedAt);
+	return Math.max(0, end - record.createdAt);
+}
+
+function formatElapsed(milliseconds: number): string {
+	const seconds = Math.floor(milliseconds / 1000);
+	if (seconds < 60) return `${seconds}s`;
+	const minutes = Math.floor(seconds / 60);
+	if (minutes < 60) return `${minutes}m ${seconds % 60}s`;
+	const hours = Math.floor(minutes / 60);
+	return `${hours}h ${minutes % 60}m`;
+}
+
+function subagentSelectItems(records: PersistedSubagentRecord[]): SelectItem[] {
+	return records.map((record) => ({
+		value: record.id,
+		label: `${displayStatus(record)}  ${formatElapsed(elapsedMs(record))}  ${record.id.slice(0, 8)}`,
+		description: sanitizePreview(record.taskPreview),
+	}));
+}
+
+async function showSubagentDetails(
+	ctx: ExtensionContext,
+	record: PersistedSubagentRecord,
+): Promise<void> {
+	const status = displayStatus(record);
+	const lines = [
+		"Subagent details",
+		"",
+		`ID: ${record.id}`,
+		`Status: ${status}`,
+		`Elapsed: ${formatElapsed(elapsedMs(record))}`,
+		`Task: ${sanitizePreview(record.taskPreview) || "(empty)"}`,
+		`Working directory: ${record.cwd}`,
+		`Model: ${record.model ?? "(inherited)"}`,
+		`Started: ${new Date(record.createdAt).toISOString()}`,
+		...(record.completedAt
+			? [`Completed: ${new Date(record.completedAt).toISOString()}`]
+			: []),
+		`Result: ${record.outputFile ?? "(unavailable)"}`,
+		`Stderr: ${record.stderrFile}`,
+		...(record.error ? [`Error: ${sanitizePreview(record.error)}`] : []),
+		"",
+		"enter/esc close",
+	];
+
+	await ctx.ui.custom<void>((_tui, theme, _keybindings, done) => {
+		const text = new Text(
+			lines
+				.map((line, index) =>
+					index === 0 ? theme.fg("accent", theme.bold(line)) : line,
+				)
+				.join("\n"),
+			1,
+			0,
+		);
+		return {
+			render: (width: number) => text.render(width),
+			invalidate: () => text.invalidate(),
+			handleInput(data: string) {
+				if (matchesKey(data, Key.enter) || matchesKey(data, Key.escape))
+					done(undefined);
+			},
+		};
+	});
+}
+
+async function showSubagents(ctx: ExtensionContext): Promise<void> {
+	const mode = (ctx as ExtensionContext & { mode?: string }).mode;
+	if (mode ? mode !== "tui" : !ctx.hasUI) {
+		ctx.ui.notify("/subagents requires TUI mode", "error");
+		return;
+	}
+
+	const records = reconcileStore(parentSessionId(ctx)).records;
+	if (records.length === 0) {
+		ctx.ui.notify("No subagents for this session", "info");
+		return;
+	}
+
+	const selectedId = await ctx.ui.custom<string | null>(
+		(tui, theme, _keybindings, done) => {
+			const container = new Container();
+			container.addChild(
+				new Text(theme.fg("accent", theme.bold("Subagents")), 1, 0),
+			);
+			const selectList = new SelectList(
+				subagentSelectItems(records),
+				Math.min(records.length, 10),
+				{
+					selectedPrefix: (text) => theme.fg("accent", text),
+					selectedText: (text) => theme.fg("accent", text),
+					description: (text) => theme.fg("muted", text),
+					scrollInfo: (text) => theme.fg("dim", text),
+					noMatch: (text) => theme.fg("warning", text),
+				},
+			);
+			selectList.onSelect = (item) => done(item.value);
+			selectList.onCancel = () => done(null);
+			container.addChild(selectList);
+			container.addChild(
+				new Text(
+					theme.fg("dim", "↑↓ navigate • enter details • esc cancel"),
+					1,
+					0,
+				),
+			);
+			return {
+				render: (width: number) => container.render(width),
+				invalidate: () => container.invalidate(),
+				handleInput(data: string) {
+					selectList.handleInput(data);
+					tui.requestRender();
+				},
+			};
+		},
+	);
+
+	if (!selectedId) return;
+	const selected = records.find((record) => record.id === selectedId);
+	if (selected) await showSubagentDetails(ctx, selected);
 }
 
 function formatRunningLine(record: PersistedSubagentRecord): string {
@@ -1415,6 +1563,19 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 	pi.registerTool(listTool);
 	pi.registerTool(statusTool);
 	pi.registerTool(tailTool);
+
+	if (typeof pi.registerCommand === "function") {
+		pi.registerCommand("subagents", {
+			description: "List subagents",
+			handler: async (_args, ctx) => showSubagents(ctx),
+		});
+	}
+	if (typeof pi.registerShortcut === "function") {
+		pi.registerShortcut(Key.ctrlShift("s"), {
+			description: "List subagents",
+			handler: showSubagents,
+		});
+	}
 
 	if (typeof pi.on === "function") {
 		pi.on("session_start", (_event, ctx) => {
