@@ -15,6 +15,13 @@ Use this tool to launch unrestricted child Pi sessions. The caller must include 
   - The returned subagent id is also the child Pi session id.
   - Child output is written to `result.log` under the child subagent directory.
   - When `model` is omitted, the child inherits the parent session's active model (e.g., `openai-codex/gpt-5.6-sol`). Pass an explicit `model` to override (e.g., `"anthropic/claude-sonnet-4-5"`).
+- `list_subagents({})`
+  - Returns persisted subagent ids and latest running state for the current parent session.
+- `get_subagent_status({ id })`
+  - Returns one status snapshot and result path for a spawned subagent.
+- `tail_subagent({ id, lines? })`
+  - Returns recent complete NDJSON lines from child stdout (`lines` defaults to 20; maximum 200).
+  - Omits a trailing partial line that the child may still be writing.
 
 ## Usage
 
@@ -31,7 +38,7 @@ Calls return immediately; the parent will be notified when each subagent complet
 
 ## Rules
 
-- Available subagent tool is exactly `spawn_subagent`.
+- Inspection tools are read-only snapshots. Do not build polling or sleep loops around them; completion still sends a notification.
 - No wait-for-completion mode exists.
 - No subagent types exist.
 - No chain or parallel-list mode exists.
@@ -47,8 +54,8 @@ Calls return immediately; the parent will be notified when each subagent complet
 
 When changing the pi-subagents extension contract, update every surface together:
 
-1. Spawn tool schema in `extensions/pi-subagents/src/extension/schemas.ts`.
-2. Spawn runtime validation and user-facing messages in `extensions/pi-subagents/src/extension/index.ts`.
+1. Tool schemas in `extensions/pi-subagents/src/extension/schemas.ts`.
+2. Tool runtime validation and user-facing messages in `extensions/pi-subagents/src/extension/index.ts`.
 3. Skill docs in `extensions/pi-subagents/skills/pi-subagents/SKILL.md`.
 4. GitHub issues/PR text exactly as requested by the user; do not fabricate details.
 

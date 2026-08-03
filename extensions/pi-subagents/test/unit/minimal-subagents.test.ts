@@ -146,6 +146,7 @@ function registerTestTools(sendMessage: (...args: unknown[]) => void = () => {})
 	const rawSpawnTool = registered.get("spawn_subagent");
 	return {
 		handlers,
+		tools: registered,
 		spawnTool: {
 			...rawSpawnTool,
 			async execute(callId: string, ...args: any[]) {
@@ -175,6 +176,158 @@ test("spawn schema accepts task only and rejects removed properties", () => {
 		}),
 		false,
 	);
+});
+
+test("extension registers read-only subagent inspection tools with bounded tail schema", () => {
+	const { tools } = registerTestTools();
+
+	assert.deepEqual([...tools.keys()], [
+		"spawn_subagent",
+		"list_subagents",
+		"get_subagent_status",
+		"tail_subagent",
+	]);
+	assert.equal(Value.Check(tools.get("list_subagents").parameters, {}), true);
+	assert.equal(
+		Value.Check(tools.get("get_subagent_status").parameters, { id: "child-1" }),
+		true,
+	);
+
+	const tailSchema = tools.get("tail_subagent").parameters;
+	assert.equal(Value.Check(tailSchema, { id: "child-1" }), true);
+	assert.equal(Value.Check(tailSchema, { id: "child-1", lines: 1 }), true);
+	assert.equal(Value.Check(tailSchema, { id: "child-1", lines: 200 }), true);
+	assert.equal(Value.Check(tailSchema, { id: "child-1", lines: 0 }), false);
+	assert.equal(Value.Check(tailSchema, { id: "child-1", lines: 201 }), false);
+	assert.equal(Value.Check(tailSchema, { id: "child-1", lines: 1.5 }), false);
+	assert.equal(Value.Check(tailSchema, { id: "child-1", extra: true }), false);
+	assert.equal(tailSchema.properties.lines.default, 20);
+});
+
+test("list and status tools inspect records persisted for current parent", async () => {
+	const { sessionId, ctx } = makeTestCtx("pi-subagents-inspection");
+	const childDir = path.join(sessionId, "subagents", "child-1");
+	const outputFile = path.join(childDir, "result.log");
+	const stdoutFile = path.join(childDir, "stdout.log");
+	const stderrFile = path.join(childDir, "stderr.log");
+	fs.mkdirSync(childDir, { recursive: true });
+	fs.writeFileSync(outputFile, "done\n");
+	fs.writeFileSync(stdoutFile, "{\"type\":\"done\"}\n");
+	fs.writeFileSync(stderrFile, "");
+	fs.writeFileSync(
+		storeFile(sessionId),
+		JSON.stringify({
+			records: [{
+				id: "child-1",
+				parentSessionId: sessionId,
+				cwd: ctx.cwd,
+				taskPreview: "inspect me",
+				model: "mock/model",
+				running: false,
+				outputFile,
+				stdoutFile,
+				stderrFile,
+				createdAt: 10,
+				updatedAt: 20,
+				completedAt: 20,
+			}],
+		}, null, 2),
+	);
+
+	try {
+		const { tools } = registerTestTools();
+		const signal = new AbortController().signal;
+		const listed = await tools.get("list_subagents").execute(
+			"list-call", {}, signal, undefined, ctx,
+		);
+		assert.deepEqual(listed.details.subagents, [{
+			id: "child-1",
+			running: false,
+		}]);
+
+		const status = await tools.get("get_subagent_status").execute(
+			"status-call", { id: "child-1" }, signal, undefined, ctx,
+		);
+		assert.deepEqual(status.details, {
+			id: "child-1",
+			sessionId: "child-1",
+			running: false,
+			resultPath: outputFile,
+		});
+		assert.deepEqual(JSON.parse(status.content[0].text), status.details);
+	} finally {
+		cleanupTestCtx(ctx, sessionId);
+	}
+});
+
+test("tail_subagent returns recent complete NDJSON lines and drops a trailing partial line", async () => {
+	const { sessionId, ctx } = makeTestCtx("pi-subagents-tail");
+	const childDir = path.join(sessionId, "subagents", "child-tail");
+	const stdoutFile = path.join(childDir, "stdout.log");
+	fs.mkdirSync(childDir, { recursive: true });
+	const completeLines = Array.from(
+		{ length: 25 },
+		(_, index) => JSON.stringify({ type: "event", index }),
+	);
+	fs.writeFileSync(stdoutFile, `${completeLines.join("\n")}\n{\"partial\":`);
+	fs.writeFileSync(
+		storeFile(sessionId),
+		JSON.stringify({
+			records: [{
+				id: "child-tail",
+				parentSessionId: sessionId,
+				cwd: ctx.cwd,
+				taskPreview: "tail me",
+				running: true,
+				pid: process.pid,
+				outputFile: path.join(childDir, "result.log"),
+				stdoutFile,
+				stderrFile: path.join(childDir, "stderr.log"),
+				createdAt: 10,
+				updatedAt: 20,
+			}],
+		}, null, 2),
+	);
+
+	try {
+		const { tools } = registerTestTools();
+		const result = await tools.get("tail_subagent").execute(
+			"tail-call",
+			{ id: "child-tail" },
+			new AbortController().signal,
+			undefined,
+			ctx,
+		);
+		assert.equal(result.details.id, "child-tail");
+		assert.equal(result.details.running, true);
+		assert.deepEqual(result.details.lines, completeLines.slice(-20));
+		assert.equal(result.content[0].text, completeLines.slice(-20).join("\n"));
+		assert.doesNotMatch(result.content[0].text, /partial/);
+	} finally {
+		cleanupTestCtx(ctx, sessionId);
+	}
+});
+
+test("inspection tools reject ids outside current parent store", async () => {
+	const { sessionId, ctx } = makeTestCtx("pi-subagents-unknown-inspection");
+	try {
+		const { tools } = registerTestTools();
+		const signal = new AbortController().signal;
+		await assert.rejects(
+			() => tools.get("get_subagent_status").execute(
+				"status-call", { id: "missing" }, signal, undefined, ctx,
+			),
+			/Unknown subagent id: missing/,
+		);
+		await assert.rejects(
+			() => tools.get("tail_subagent").execute(
+				"tail-call", { id: "missing" }, signal, undefined, ctx,
+			),
+			/Unknown subagent id: missing/,
+		);
+	} finally {
+		cleanupTestCtx(ctx, sessionId);
+	}
 });
 
 test("model override contract is synchronized across schema, tool, README, and skill", () => {

@@ -33,6 +33,21 @@ export const ListSubagentsParams = Type.Object(
 	{ additionalProperties: false },
 );
 
+export const TailSubagentParams = Type.Object(
+	{
+		id: Type.String({ description: "Subagent id returned by spawn_subagent." }),
+		lines: Type.Optional(
+			Type.Integer({
+				minimum: 1,
+				maximum: 200,
+				default: 20,
+				description: "Number of recent complete NDJSON lines to return.",
+			}),
+		),
+	},
+	{ additionalProperties: false },
+);
+
 export interface SpawnSubagentParamsLike {
 	task: string;
 	cwd?: string;
@@ -41,4 +56,9 @@ export interface SpawnSubagentParamsLike {
 
 export interface GetSubagentStatusParamsLike {
 	id: string;
+}
+
+export interface TailSubagentParamsLike {
+	id: string;
+	lines?: number;
 }
