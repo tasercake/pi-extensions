@@ -31,15 +31,24 @@ import { buildPiArgs, cleanupTempDir } from "../runs/shared/pi-args.ts";
 // here would execute its child-only fd watcher in the parent extension process.
 const PI_SUBAGENT_LIFELINE_FD = "PI_SUBAGENT_LIFELINE_FD";
 import {
+	GetSubagentStatusParams,
+	type GetSubagentStatusParamsLike,
+	ListSubagentsParams,
 	SpawnSubagentParams,
 	type SpawnSubagentParamsLike,
+	TailSubagentParams,
+	type TailSubagentParamsLike,
 } from "./schemas.ts";
 
 interface ToolDetails {
 	id?: string;
+	sessionId?: string;
 	running?: boolean;
 	resultPath?: string;
 	model?: string;
+	error?: string;
+	subagents?: Array<{ id: string; running: boolean }>;
+	lines?: string[];
 }
 
 interface PersistedSubagentRecord {
@@ -184,6 +193,13 @@ function upsertRecord(record: PersistedSubagentRecord): void {
 	if (idx === -1) store.records.push(record);
 	else store.records[idx] = record;
 	writeStore(record.parentSessionId, store);
+}
+
+function findRecord(
+	parentId: string,
+	id: string,
+): PersistedSubagentRecord | undefined {
+	return readStore(parentId).records.find((record) => record.id === id);
 }
 
 function updateRecordFields(
@@ -453,6 +469,92 @@ function refreshRecordFromDisk(
 	if (changed || refreshed.sessionFile !== beforeSessionFile)
 		upsertRecord(refreshed);
 	return refreshed;
+}
+
+function resultPathForRecord(record: PersistedSubagentRecord): string {
+	return (
+		record.outputFile ??
+		path.join(record.parentSessionId, "subagents", record.id, "result.log")
+	);
+}
+
+function formatStatus(
+	record: PersistedSubagentRecord,
+): AgentToolResult<ToolDetails> {
+	const refreshed = refreshRecordFromDisk(record);
+	const details: ToolDetails = {
+		id: refreshed.id,
+		sessionId: refreshed.id,
+		running: refreshed.running,
+		resultPath: resultPathForRecord(refreshed),
+		...(refreshed.error ? { error: refreshed.error } : {}),
+	};
+	return {
+		content: [
+			{ type: "text", text: JSON.stringify(details, null, 2) },
+			...(refreshed.running
+				? [{
+						type: "text" as const,
+						text: "This is a snapshot. Do not poll or sleep for the result; you will be notified when the subagent completes.",
+					}]
+				: []),
+		],
+		details,
+	};
+}
+
+const TAIL_SUBAGENT_DEFAULT_LINES = 20;
+const TAIL_SUBAGENT_MAX_READ_BYTES = 1024 * 1024;
+
+function readRecentCompleteLines(filePath: string, lines: number): string[] {
+	let fd: number | undefined;
+	try {
+		fd = fs.openSync(filePath, "r");
+		const snapshotSize = fs.fstatSync(fd).size;
+		if (snapshotSize === 0) return [];
+
+		const windowStart = Math.max(0, snapshotSize - TAIL_SUBAGENT_MAX_READ_BYTES);
+		const readStart = windowStart > 0 ? windowStart - 1 : 0;
+		const buffer = Buffer.allocUnsafe(snapshotSize - readStart);
+		let bytesRead = 0;
+		while (bytesRead < buffer.length) {
+			const count = fs.readSync(
+				fd,
+				buffer,
+				bytesRead,
+				buffer.length - bytesRead,
+				readStart + bytesRead,
+			);
+			if (count === 0) break;
+			bytesRead += count;
+		}
+		const snapshot = buffer.subarray(0, bytesRead);
+		const completeEnd = snapshot.lastIndexOf(0x0a);
+		if (completeEnd < 0) return [];
+
+		let completeStart = 0;
+		if (readStart > 0) {
+			if (snapshot[0] === 0x0a) completeStart = 1;
+			else {
+				const firstNewline = snapshot.indexOf(0x0a);
+				if (firstNewline < 0) return [];
+				completeStart = firstNewline + 1;
+			}
+		}
+		if (completeEnd < completeStart) return [];
+		return snapshot
+			.subarray(completeStart, completeEnd)
+			.toString("utf-8")
+			.split("\n")
+			.map((line) => line.endsWith("\r") ? line.slice(0, -1) : line)
+			.filter((line) => line.length > 0)
+			.slice(-lines);
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
+		throw error;
+	} finally {
+		if (fd !== undefined) fs.closeSync(fd);
+	}
 }
 
 function reconcileStore(parentId: string): ReconcileResult {
@@ -1211,7 +1313,108 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 		},
 	};
 
+	const listTool: ToolDefinition<typeof ListSubagentsParams, ToolDetails> = {
+		name: "list_subagents",
+		label: "List subagents",
+		description:
+			"List persisted subagents for the current parent session and their latest status.",
+		parameters: ListSubagentsParams,
+		async execute(
+			_toolCallId,
+			_params: Record<string, never>,
+			_signal,
+			_onUpdate,
+			ctx,
+		) {
+			const { records } = reconcileStore(parentSessionId(ctx));
+			const subagents = records.map((record) => ({
+				id: record.id,
+				running: record.running,
+			}));
+			return {
+				content: [{ type: "text", text: JSON.stringify(subagents, null, 2) }],
+				details: { subagents },
+			};
+		},
+		renderCall(_args, theme) {
+			return new Text(
+				theme.fg("toolTitle", theme.bold("list_subagents")),
+				0,
+				0,
+			);
+		},
+	};
+
+	const statusTool: ToolDefinition<
+		typeof GetSubagentStatusParams,
+		ToolDetails
+	> = {
+		name: "get_subagent_status",
+		label: "Get subagent status",
+		description:
+			"Get one snapshot of a subagent's status and result path. Running subagents still notify you on completion; do not poll this tool.",
+		parameters: GetSubagentStatusParams,
+		async execute(
+			_toolCallId,
+			params: GetSubagentStatusParamsLike,
+			_signal,
+			_onUpdate,
+			ctx,
+		) {
+			const record = findRecord(parentSessionId(ctx), params.id);
+			if (!record) throw new Error(`Unknown subagent id: ${params.id}`);
+			return formatStatus(record);
+		},
+		renderCall(args, theme) {
+			return new Text(
+				`${theme.fg("toolTitle", theme.bold("get_subagent_status "))}${theme.fg("accent", args.id)}`,
+				0,
+				0,
+			);
+		},
+	};
+
+	const tailTool: ToolDefinition<typeof TailSubagentParams, ToolDetails> = {
+		name: "tail_subagent",
+		label: "Tail subagent",
+		description:
+			"Read one snapshot of recent complete NDJSON lines from a subagent's stdout log. A trailing line still being written is omitted.",
+		parameters: TailSubagentParams,
+		async execute(
+			_toolCallId,
+			params: TailSubagentParamsLike,
+			_signal,
+			_onUpdate,
+			ctx,
+		) {
+			const record = findRecord(parentSessionId(ctx), params.id);
+			if (!record) throw new Error(`Unknown subagent id: ${params.id}`);
+			const refreshed = refreshRecordFromDisk(record);
+			const lines = readRecentCompleteLines(
+				refreshed.stdoutFile,
+				params.lines ?? TAIL_SUBAGENT_DEFAULT_LINES,
+			);
+			return {
+				content: [{
+					type: "text",
+					text: lines.join("\n") || "No complete stdout lines.",
+				}],
+				details: { id: refreshed.id, running: refreshed.running, lines },
+			};
+		},
+		renderCall(args, theme) {
+			return new Text(
+				`${theme.fg("toolTitle", theme.bold("tail_subagent "))}${theme.fg("accent", args.id)}`,
+				0,
+				0,
+			);
+		},
+	};
+
 	pi.registerTool(spawnTool);
+	pi.registerTool(listTool);
+	pi.registerTool(statusTool);
+	pi.registerTool(tailTool);
 
 	if (typeof pi.on === "function") {
 		pi.on("session_start", (_event, ctx) => {
